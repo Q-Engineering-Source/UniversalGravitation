@@ -1,0 +1,83 @@
+import java.security.MessageDigest
+import java.util.zip.ZipFile
+
+// A development-named jar is already MCP mapped. Do not feed it through an SRG
+// dependency remapper, bundle it, or compile against CHB's mutable output folder.
+def identityFile = file('gradle/chb-artifact.properties')
+def identity = new Properties()
+identityFile.withInputStream { identity.load(it) }
+def artifactDirectory = file(providers.gradleProperty('chb_artifact_dir').getOrElse(
+        new File(gradle.gradleUserHomeDir, "artifacts/UG-CHB-CAPSULE-V1/${identity.candidate}").path))
+def developmentJar = new File(artifactDirectory, identity.getProperty('development.file'))
+def runtimeJar = new File(artifactDirectory, identity.getProperty('runtime.file'))
+
+def verifyChbArtifacts = tasks.register('verifyChbArtifacts') {
+    group = 'verification'
+    description = 'Verify both immutable CHB handoff artifacts before compilation or consumption.'
+    inputs.file(identityFile)
+    doLast {
+        [development: developmentJar, runtime: runtimeJar].each { side, artifact ->
+            if (!artifact.isFile()) {
+                throw new GradleException("Missing pinned CHB ${side} artifact: ${artifact}. "
+                        + 'Obtain the exact handoff; chb_artifact_dir may relocate it but cannot change its identity.')
+            }
+            def digest = MessageDigest.getInstance('SHA-256')
+            artifact.withInputStream { stream ->
+                byte[] buffer = new byte[8192]
+                int count
+                while ((count = stream.read(buffer)) != -1) digest.update(buffer, 0, count)
+            }
+            def hash = HexFormat.of().withUpperCase().formatHex(digest.digest())
+            if (artifact.length() != identity.getProperty("${side}.bytes").toLong()
+                    || hash != identity.getProperty("${side}.sha256")) {
+                throw new GradleException("Pinned CHB ${side} artifact identity mismatch: ${artifact}; SHA-256 ${hash}")
+            }
+            logger.lifecycle("Verified CHB ${side}: ${artifact.name}, ${artifact.length()} bytes, SHA-256 ${hash}")
+        }
+    }
+}
+
+dependencies {
+    // Separate required Mod on development classpaths; jar/remapJar never bundle implementation dependencies.
+    implementation files(developmentJar)
+}
+tasks.named('compileJava').configure { dependsOn verifyChbArtifacts }
+tasks.named('compileTestJava').configure { dependsOn verifyChbArtifacts }
+tasks.named('test').configure {
+    dependsOn verifyChbArtifacts
+    systemProperty 'unigrav.test.chbArtifact', developmentJar.absolutePath
+}
+
+def runtimeConsumption = tasks.register('chbRuntimeTest', Test) {
+    group = 'verification'
+    description = 'Run UG public-entry consumer tests against the exact remapped CHB runtime jar.'
+    dependsOn tasks.named('testClasses'), verifyChbArtifacts
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath.filter { it.canonicalFile != developmentJar.canonicalFile } + files(runtimeJar)
+    filter { includeTestsMatching 'wi.unigrav.core.collision.ChbCapsuleContractTest' }
+    useJUnitPlatform()
+    systemProperty 'java.awt.headless', 'true'
+    systemProperty 'unigrav.test.chbArtifact', runtimeJar.absolutePath
+    javaLauncher.set(javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(25) })
+}
+
+def releaseTask = tasks.named(enable_shadow.toBoolean() ? 'remapShadowJar' : 'remapJar')
+tasks.register('verifyChbPackaging') {
+    group = 'verification'
+    dependsOn releaseTask, verifyChbArtifacts
+    inputs.file(releaseTask.flatMap { it.archiveFile })
+    doLast {
+        new ZipFile(releaseTask.get().archiveFile.get().asFile).withCloseable { archive ->
+            if (archive.getEntry('wi/unigrav/core/collision/ChbDependency.class') == null) {
+                throw new GradleException('UG release is missing its CHB runtime contract guard')
+            }
+            archive.entries().each { entry ->
+                if (entry.name.startsWith('dev/crlhitbox/') || entry.name.endsWith('.jar')) {
+                    throw new GradleException("UG release must not bundle dependency content: ${entry.name}")
+                }
+            }
+        }
+        logger.lifecycle('Verified CHB remains a separate required artifact, not bundled into UG')
+    }
+}
+tasks.named('check').configure { dependsOn runtimeConsumption, tasks.named('verifyChbPackaging') }

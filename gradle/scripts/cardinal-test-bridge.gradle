@@ -1,0 +1,96 @@
+import java.util.zip.ZipFile
+import org.objectweb.asm.ClassReader
+import org.objectweb.asm.ClassWriter
+import org.objectweb.asm.Opcodes
+import org.objectweb.asm.tree.*
+
+buildscript {
+    // Reuse the root's already-resolved tool dependencies; the applied script has its own classloader.
+    dependencies { classpath files(rootProject.buildscript.configurations.classpath) }
+}
+
+// Plain JUnit has no launch/Mixin transformer. Execute the actual mapped Block and BlockSlime
+// methods with the same seven scoped field hooks used in production, on the TEST classpath only.
+// This does not prove the production Mixin/refmap applies; dedicated/GPU remain separate gates.
+def bridgeOutput = layout.buildDirectory.dir('test-native-cardinal-bridge')
+def bridge = tasks.register('prepareCardinalTestBridge') {
+    dependsOn tasks.named('compileJava')
+    inputs.files(sourceSets.main.compileClasspath)
+    inputs.file(file('gradle/scripts/cardinal-test-bridge.gradle'))
+    outputs.dir(bridgeOutput)
+    doLast {
+        def expected = [
+            'net/minecraft/block/Block': ['onLanded:motionY:181': 1],
+            'net/minecraft/block/BlockSlime': [
+                'onLanded:motionY:180': 3, 'onLanded:motionY:181': 2,
+                'onEntityWalk:motionY:180': 2,
+                'onEntityWalk:motionX:180': 1, 'onEntityWalk:motionX:181': 1,
+                'onEntityWalk:motionZ:180': 1, 'onEntityWalk:motionZ:181': 1]
+        ]
+        expected.each { String owner, Map counts ->
+            def matches = []
+            sourceSets.main.compileClasspath.files.findAll { it.isFile() && it.name.endsWith('.jar') }.each { file ->
+                new ZipFile(file).withCloseable { zip ->
+                    def entry = zip.getEntry(owner + '.class')
+                    if (entry != null) matches.add(zip.getInputStream(entry).withCloseable { it.bytes })
+                }
+            }
+            if (matches.size() != 1) throw new GradleException("Expected one mapped ${owner}, found ${matches.size()}")
+            def node = new ClassNode()
+            new ClassReader((byte[]) matches[0]).accept(node, 0)
+            def observed = [:].withDefault { 0 }
+            def helpers = new LinkedHashMap<String, MethodNode>()
+            node.methods.toList().each { method ->
+                if (!(method.name in ['onLanded', 'onEntityWalk'])) return
+                method.instructions.toArray().each { insn ->
+                    if (!(insn instanceof FieldInsnNode) || insn.owner != 'net/minecraft/entity/Entity'
+                            || !(insn.name in ['motionX', 'motionY', 'motionZ']) || insn.desc != 'D') return
+                    String key = "${method.name}:${insn.name}:${insn.opcode}"
+                    if (!counts.containsKey(key)) throw new GradleException("Unexpected native block motion access ${owner}/${key}")
+                    observed[key]++
+                    boolean write = insn.opcode == Opcodes.PUTFIELD
+                    String axis = insn.name.substring(6)
+                    String name = 'unigrav$headless$' + (write ? 'write' : 'read') + axis
+                    String descriptor = write ? '(Lnet/minecraft/entity/Entity;D)V' : '(Lnet/minecraft/entity/Entity;)D'
+                    if (!helpers.containsKey(name)) {
+                        String hook = 'wi/unigrav/core/player/CardinalBlockMotion'
+                        String axisType = hook + '$Axis'
+                        def helper = new MethodNode(Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC,
+                                name, descriptor, null, null)
+                        def code = helper.instructions
+                        def nativePath = new LabelNode()
+                        code.add(new VarInsnNode(Opcodes.ALOAD, 0))
+                        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, hook, 'active', '(Lnet/minecraft/entity/Entity;)Z', false))
+                        code.add(new JumpInsnNode(Opcodes.IFEQ, nativePath))
+                        code.add(new VarInsnNode(Opcodes.ALOAD, 0))
+                        code.add(new FieldInsnNode(Opcodes.GETSTATIC, axisType, axis, 'L' + axisType + ';'))
+                        if (write) code.add(new VarInsnNode(Opcodes.DLOAD, 1))
+                        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, hook, write ? 'write' : 'read',
+                                '(Lnet/minecraft/entity/Entity;L' + axisType + ';' + (write ? 'D)V' : ')D'), false))
+                        code.add(new InsnNode(write ? Opcodes.RETURN : Opcodes.DRETURN))
+                        code.add(nativePath)
+                        code.add(new FrameNode(Opcodes.F_SAME, 0, null, 0, null))
+                        code.add(new VarInsnNode(Opcodes.ALOAD, 0))
+                        if (write) code.add(new VarInsnNode(Opcodes.DLOAD, 1))
+                        code.add(new FieldInsnNode(insn.opcode, insn.owner, insn.name, insn.desc))
+                        code.add(new InsnNode(write ? Opcodes.RETURN : Opcodes.DRETURN))
+                        helpers[name] = helper
+                    }
+                    method.instructions.set(insn, new MethodInsnNode(Opcodes.INVOKESTATIC, owner, name, descriptor, false))
+                }
+            }
+            if (observed != counts) throw new GradleException("Native block hook count mismatch for ${owner}: ${observed}")
+            node.methods.addAll(helpers.values())
+            // Existing methods keep their original frames: each substitution has identical stack effect.
+            def writer = new ClassWriter(ClassWriter.COMPUTE_MAXS)
+            node.accept(writer)
+            def output = bridgeOutput.get().file(owner + '.class').asFile
+            output.parentFile.mkdirs()
+            output.bytes = writer.toByteArray()
+        }
+    }
+}
+tasks.named('test', Test).configure {
+    dependsOn bridge
+    classpath = files(bridgeOutput) + classpath
+}

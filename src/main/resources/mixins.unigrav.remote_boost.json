@@ -1,0 +1,29 @@
+{
+  "required": true,
+  "minVersion": "0.8.7",
+  "package": "wi.unigrav.mixin",
+  "refmap": "mixins.unigrav.remote_boost.refmap.json",
+  "target": "@env(DEFAULT)",
+  "compatibilityLevel": "JAVA_25",
+  "injectors": {
+    "defaultRequire": 1
+  },
+  "mixins": [
+    "BlockLandingPhysicsMixin",
+    "BlockSlimePhysicsMixin",
+    "EntityVelocityPhysicsMixin",
+    "ExplosionPhysicsMixin",
+    "EntityLivingBasePhysicsMixin",
+    "EntityPlayerPoseMixin",
+    "EntityPlayerEquipmentMixin",
+    "InventoryPlayerEquipmentMixin",
+    "NetHandlerPlayServerMixin",
+    "EntityTrackerEntryMixin",
+    "ChunkFloorMutationMixin"
+  ],
+  "server": [],
+  "client": [
+    "EntityPlayerSPPhysicsMixin",
+    "NetHandlerPlayClientMixin"
+  ]
+}

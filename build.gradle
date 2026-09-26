@@ -1,0 +1,439 @@
+plugins {
+    id 'java'
+    id 'java-library'
+    id 'maven-publish'
+    id 'com.gradleup.shadow' version '9.5.1'
+    id 'org.jetbrains.gradle.plugin.idea-ext' version '1.4.1'
+    id 'xyz.wagyourtail.unimined' version '1.4.27-kappa'
+    id 'net.kyori.blossom' version '2.2.0'
+}
+
+import org.jetbrains.gradle.ext.Gradle
+import groovy.json.JsonSlurper
+import java.util.zip.ZipFile
+import org.objectweb.asm.ClassReader
+import org.objectweb.asm.tree.ClassNode
+import org.objectweb.asm.tree.MethodInsnNode
+
+ext {
+    //noinspection GroovyAssignabilityCheck
+    access_transformer_locations = "${mod_id}_at.cfg"
+}
+
+version = mod_version
+group = root_package
+
+// Workaround: the Gradle test worker receives its classpath through a JDK
+// @argfile, which the java launcher decodes in the platform default charset
+// (e.g. GBK on zh-CN Windows) while Gradle writes it as UTF-8. With a
+// non-ASCII project path the worker then cannot resolve the project's own
+// classpath entries and every test class fails with ClassNotFoundException.
+// Redirect the build directory to an ASCII path in that case.
+if (!projectDir.absolutePath.matches(/\p{ASCII}+/)) {
+    def asciiBuildDir = "${System.getProperty('user.home')}/.gradle-ascii-builds/${project.name}"
+    logger.warn("Non-ASCII project path detected; using ASCII build dir: ${asciiBuildDir}")
+    layout.buildDirectory = file(asciiBuildDir)
+}
+
+base {
+    archivesName = mod_id
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+    if (generate_sources_jar.toBoolean()) {
+        withSourcesJar()
+    }
+    if (generate_javadocs_jar.toBoolean()) {
+        withJavadocJar()
+    }
+}
+
+configurations {
+    contain
+    implementation.extendsFrom(contain)
+    modCompileOnly
+    compileOnly.extendsFrom(modCompileOnly)
+    modRuntimeOnly
+    runtimeOnly.extendsFrom(modRuntimeOnly)
+}
+
+def remapTaskName = enable_shadow.toBoolean() ? "remapShadowJar" : "remapJar"
+
+//noinspection GroovyAssignabilityCheck
+unimined.minecraft {
+    version "1.12.2"
+
+    mappings {
+        mcp("stable", "39-1.12")
+    }
+
+    cleanroom {
+        if (use_access_transformer.toBoolean()) {
+            accessTransformer "${rootProject.projectDir}/src/main/resources/$access_transformer_locations"
+        }
+        loader "0.6.8-alpha"
+        runs.all {
+            args += ['--username', minecraft_username]
+            // Development runs target MCP names. The generated refmap remains in
+            // the packaged JAR for SRG production loading, but must not be used
+            // against MCP-named development classes.
+            systemProperty('mixin.env.disableRefMap', 'true')
+            def extraArgs = extra_jvm_args
+            if (extraArgs != null && !extraArgs.trim().isEmpty()) {
+                jvmArgs += extraArgs.split { "\\s+" }.toList()
+            }
+            if (enable_foundation_debug.toBoolean()) {
+                systemProperty("foundation.dump", "true")
+                systemProperty("foundation.verbose", "true")
+            }
+            if (is_coremod.toBoolean()) {
+                systemProperty("fml.coreMods.load", coremod_plugin_class_name)
+            }
+            return
+        }
+    }
+
+    defaultRemapJar = false
+
+    String jarTaskName = enable_shadow.toBoolean() ? "shadowJar" : "jar"
+
+    remap(tasks.named(jarTaskName).get()) {
+        // Unimined's built-in base Mixin remapper rewrites the generated refmap
+        // together with the release JAR from development MCP to production SRG.
+        mixinRemap {
+            enableBaseMixin()
+            enableMixinExtra()
+        }
+    }
+
+    mods {
+        remap(configurations.modCompileOnly)
+        remap(configurations.modRuntimeOnly)
+    }
+}
+
+dependencies {
+    if (use_asset_mover.toBoolean()) {
+        implementation "com.cleanroommc:assetmover:${asset_mover_version}"
+    }
+    if (enable_junit_testing.toBoolean()) {
+        testImplementation 'org.junit.jupiter:junit-jupiter:6.0.3'
+        testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    }
+}
+
+apply from: 'gradle/scripts/dependencies.gradle'
+apply from: 'gradle/scripts/chb.gradle'
+
+// The Mixin AP emits a development-MCP refmap. The remapJar configuration above
+// rewrites that resource for production SRG, while development runs deliberately
+// disable refmap use because their targets retain MCP names.
+def mixinConfigFile = file('src/main/resources/mixins.unigrav.remote_boost.json')
+def mixinRefMapName = new JsonSlurper().parse(mixinConfigFile).refmap
+if (!(mixinRefMapName instanceof String) || mixinRefMapName.isBlank()) {
+    throw new GradleException('Remote boost Mixin config must name its refmap')
+}
+def mixinRefMap = layout.buildDirectory.file("tmp/mixins/${mixinRefMapName}")
+def mixinSrg = layout.buildDirectory.file('tmp/mixins/mixins.unigrav.remote_boost.srg')
+def gradleUserHome = providers.environmentVariable('GRADLE_USER_HOME')
+        .getOrElse(System.getProperty('user.home') + '/.gradle')
+def mcpSrg = file("${gradleUserHome}/caches/minecraft/de/oceanlabs/mcp/mcp_stable/39/rfg_srgs/mcp-srg.srg")
+
+tasks.named('compileJava', JavaCompile).configure {
+    def mcpSrgFile = mcpSrg.absoluteFile
+    inputs.file(mcpSrgFile)
+    inputs.file(mixinConfigFile)
+    outputs.files(mixinSrg, mixinRefMap)
+    options.compilerArgs.addAll(
+            "-AreobfSrgFile=${mcpSrgFile.absolutePath}",
+            "-AoutSrgFile=${mixinSrg.get().asFile.absolutePath}",
+            "-AoutRefMapFile=${mixinRefMap.get().asFile.absolutePath}")
+}
+
+processResources {
+    rename '(.+_at.cfg)', 'META-INF/$1'
+}
+
+sourceSets {
+    main {
+        blossom {
+            javaSources {
+                property('mod_id', mod_id)
+                property('mod_name', mod_name)
+                property('mod_version', mod_version)
+                property('package', root_package)
+            }
+            resources {
+                property('mod_id', mod_id)
+                property('mod_name', mod_name)
+                property('mod_version', mod_version)
+                property('mod_description', mod_description)
+                property('mod_authors', mod_authors.toString().split(',').findAll { !it.isBlank() }.collect { "\"${it.strip()}\"" }.join(', '))
+                property('mod_credits', mod_credits)
+                property('mod_url', mod_url)
+                property('mod_update_json', mod_update_json)
+                property('mod_logo_path', mod_logo_path)
+            }
+        }
+    }
+    test {
+        // JUnit normally sees only the project's pure-Java dependencies. These
+        // tests also exercise actual mapped Block state and model-rotation
+        // behavior, so reuse Unimined's already-resolved main mapping only for
+        // test compilation/execution. This adds no production dependency or
+        // packaged runtime artifact.
+        compileClasspath += main.compileClasspath
+        runtimeClasspath += main.compileClasspath
+    }
+}
+
+idea {
+    module {
+        inheritOutputDirs = true
+    }
+    project {
+        settings {
+            runConfigurations {
+                '1. Build'(Gradle) {
+                    taskNames = ["build"]
+                }
+                '2. Run Client'(Gradle) {
+                    taskNames = ["runClient"]
+                }
+                '3. Run Server'(Gradle) {
+                    taskNames = ["runServer"]
+                }
+            }
+            compiler.javac {
+                afterEvaluate {
+                    javacAdditionalOptions = '-encoding utf8'
+                    moduleJavacAdditionalOptions = [
+                            (project.name + '.main'): tasks.compileJava.options.compilerArgs.collect { "\"${it}\"" }.join(' ')
+                    ]
+                }
+            }
+            taskTriggers {
+                afterSync tasks.named("genSources")
+            }
+        }
+    }
+}
+
+if (!enable_shadow.toBoolean()) {
+    shadowJar.enabled = false
+}
+
+compileJava {
+    sourceCompatibility = targetCompatibility = JavaVersion.VERSION_25
+}
+
+jar {
+    archiveClassifier = 'dev'
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from(mixinRefMap)
+    if (configurations.contain.size() > 0) {
+        into('/') {
+            from configurations.contain
+        }
+    }
+    doFirst {
+        manifest {
+            def attribute_map = [:]
+            attribute_map['ModType'] = "CRL"
+            if (configurations.contain.size() > 0) {
+                attribute_map['ContainedDeps'] = configurations.contain.collect { it.name }.join(' ')
+                attribute_map['NonModDeps'] = true
+            }
+            if (is_coremod.toBoolean()) {
+                attribute_map['FMLCorePlugin'] = coremod_plugin_class_name
+                if (coremod_includes_mod.toBoolean()) {
+                    attribute_map['FMLCorePluginContainsFMLMod'] = true
+                }
+            }
+            if (use_access_transformer.toBoolean()) {
+                attribute_map['FMLAT'] = access_transformer_locations
+            }
+            attributes(attribute_map)
+        }
+    }
+    finalizedBy(tasks.named(remapTaskName).get())
+}
+
+
+shadowJar {
+    //noinspection GroovyAssignabilityCheck,GroovyAccessibility
+    configurations = [project.configurations.shadow]
+    archiveClassifier = "shadow"
+}
+
+
+tasks.named(remapTaskName).configure {
+    doFirst {
+        logging.captureStandardOutput LogLevel.INFO
+    }
+    doLast {
+        logging.captureStandardOutput LogLevel.QUIET
+    }
+}
+
+// Resolve the production resource link, not merely any entry containing "refmap".
+// This catches a packaged-name mismatch before the real dedicated Mixin apply gate.
+tasks.register('verifyRemoteBoostPackaging') {
+    dependsOn tasks.named(remapTaskName)
+    inputs.file(tasks.named(remapTaskName).flatMap { it.archiveFile })
+    doLast {
+        def releaseFile = tasks.named(remapTaskName).get().archiveFile.get().asFile
+        new ZipFile(releaseFile).withCloseable { archive ->
+            def configEntry = archive.getEntry('mixins.unigrav.remote_boost.json')
+            if (configEntry == null) throw new GradleException('Release Mixin config is missing')
+            def config = archive.getInputStream(configEntry).withCloseable {
+                new JsonSlurper().parse(it)
+            }
+            def refmapEntry = archive.getEntry(config.refmap as String)
+            if (refmapEntry == null) {
+                throw new GradleException("Release cannot resolve Mixin refmap ${config.refmap}")
+            }
+            def refmap = archive.getInputStream(refmapEntry).withCloseable {
+                new JsonSlurper().parse(it)
+            }
+            def requiredMixins = (config.mixins + config.client).collect {
+                config.'package'.replace('.', '/') + '/' + it
+            }
+            requiredMixins.each { mixin ->
+                // The pose wrapper uses pinned MCP/SRG selectors rather than a refmap; verify its bytecode below.
+                if (mixin != 'wi/unigrav/mixin/EntityPlayerPoseMixin' && !refmap.mappings[mixin]) {
+                    throw new GradleException("Release refmap has no mappings for ${mixin}")
+                }
+            }
+            def poseEntry = archive.getEntry('wi/unigrav/mixin/EntityPlayerPoseMixin.class')
+            if (poseEntry == null) throw new GradleException('Native pose Mixin class missing')
+            def poseNode = new ClassNode()
+            archive.getInputStream(poseEntry).withCloseable {
+                new ClassReader(it).accept(poseNode, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES)
+            }
+            def poseWrappers = poseNode.methods.collectMany { method ->
+                ((method.visibleAnnotations ?: []) + (method.invisibleAnnotations ?: []))
+                        .findAll { it.desc == 'Lcom/llamalad7/mixinextras/injector/wrapmethod/WrapMethod;' }
+                        .collect { annotation -> [method: method, annotation: annotation] }
+            }
+            if (poseWrappers.size() != 1) throw new GradleException('Expected exactly one native pose wrapper')
+            def poseValues = poseWrappers[0].annotation.values.collate(2).collectEntries { [(it[0]): it[1]] }
+            if (poseValues.method?.size() != 2
+                    || poseValues.method.toSet() != ['updateSize()V', 'func_184808_cD()V'].toSet()
+                    || poseValues.remap != false || poseValues.require != 1 || poseValues.allow != 1) {
+                throw new GradleException('Native pose wrapper must retain exact MCP/SRG selectors and one-target guards')
+            }
+            def poseCalls = poseWrappers[0].method.instructions.toArray().findAll {
+                it instanceof MethodInsnNode && it.owner == 'wi/unigrav/proxy/IProxy' && it.name == 'runNativePose'
+                        && it.desc == '(Lnet/minecraft/entity/EntityLivingBase;Ljava/lang/Runnable;)V'
+            }
+            if (poseCalls.size() != 1) throw new GradleException('Native pose wrapper must call the tested boundary once')
+            // Structural release linkage, not proof that FML applied the Mixin at runtime.
+            def routerClass = archive.getEntry('wi/unigrav/mixin/NetHandlerPlayServerMixin.class')
+            if (routerClass == null) throw new GradleException('Player packet lifetime Mixin class missing')
+            def node = new ClassNode()
+            archive.getInputStream(routerClass).withCloseable {
+                new ClassReader(it).accept(node, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES)
+            }
+            def wrappers = node.methods.collectMany { method ->
+                ((method.visibleAnnotations ?: []) + (method.invisibleAnnotations ?: []))
+                        .findAll { it.desc == 'Lcom/llamalad7/mixinextras/injector/wrapmethod/WrapMethod;' }
+                        .collect { annotation -> [method: method, annotation: annotation] }
+            }
+            if (wrappers.size() != 1) throw new GradleException('Expected exactly one packet lifetime wrapper')
+            def values = wrappers[0].annotation.values.collate(2).collectEntries { [(it[0]): it[1]] }
+            def selectors = [
+                    'processPlayer(Lnet/minecraft/network/play/client/CPacketPlayer;)V',
+                    'func_147347_a(Lnet/minecraft/network/play/client/CPacketPlayer;)V'
+            ] as Set
+            if (values.method?.size() != 2 || values.method.toSet() != selectors
+                    || values.remap != false || values.require != 1 || values.allow != 1) {
+                throw new GradleException('Packet wrapper must retain exact MCP/SRG selectors and one-target guards')
+            }
+            def owner = 'wi/unigrav/core/player/PlayerMovementRouter'
+            def packetCalls = wrappers[0].method.instructions.toArray().findAll {
+                it instanceof MethodInsnNode && it.owner == owner && it.name == 'runPacket'
+                        && it.desc == '(Lnet/minecraft/network/NetHandlerPlayServer;Ljava/lang/Runnable;Ljava/util/function/BooleanSupplier;)V'
+            }
+            if (packetCalls.size() != 1) throw new GradleException('Packet wrapper must call the tested lifetime once')
+            if (node.methods.any { method -> method.instructions.toArray().any {
+                it instanceof MethodInsnNode && it.owner == owner && it.name == 'finish'
+            } }) throw new GradleException('Manual packet finish would compete with the outer lifetime')
+            logger.lifecycle('Verified release packet lifetime wrapper: exact MCP/SRG selectors, one finisher')
+            logger.lifecycle("Verified release Mixin resource link: ${config.refmap}")
+        }
+    }
+}
+tasks.named('check').configure { dependsOn tasks.named('verifyRemoteBoostPackaging') }
+
+// Verify the production AT link and SRG identities, not merely compilation against development access.
+tasks.register('verifyCardinalFinalizerPackaging') {
+    group = 'verification'
+    dependsOn tasks.named(remapTaskName)
+    inputs.file(tasks.named(remapTaskName).flatMap { it.archiveFile })
+    doLast {
+        def expectedMembers = [
+                'field_70150_b', 'field_191959_ay', 'field_190534_ay', 'field_70134_J',
+                'func_184231_a(DZLnet/minecraft/block/state/IBlockState;Lnet/minecraft/util/math/BlockPos;)V',
+                'func_70041_e_()Z', 'func_180429_a(Lnet/minecraft/util/math/BlockPos;Lnet/minecraft/block/Block;)V',
+                'func_145775_I()V', 'func_70081_e(I)V', 'func_190531_bD()I',
+                'func_184184_Z()Lnet/minecraft/util/SoundEvent;', 'func_191957_ae()Z', 'func_191954_d(F)F',
+                'func_70101_b(FF)V'
+        ].collect { 'public net.minecraft.entity.Entity ' + it }.toSet()
+        expectedMembers.addAll([
+                'public net.minecraft.entity.EntityLivingBase func_70629_bd()V',
+                'public net.minecraft.entity.EntityLivingBase func_180466_bG()V',
+                'public net.minecraft.entity.EntityLivingBase func_189749_co()F',
+                'public net.minecraft.entity.EntityLivingBase func_184588_d(I)Lnet/minecraft/util/SoundEvent;',
+                'public net.minecraft.entity.EntityLivingBase func_175134_bD()F',
+                'public net.minecraft.entity.player.EntityPlayer func_184588_d(I)Lnet/minecraft/util/SoundEvent;'
+        ])
+        new ZipFile(tasks.named(remapTaskName).get().archiveFile.get().asFile).withCloseable { archive ->
+            def manifestEntry = archive.getEntry('META-INF/MANIFEST.MF')
+            if (manifestEntry == null) throw new GradleException('Release manifest missing')
+            def manifest = archive.getInputStream(manifestEntry).withCloseable { new java.util.jar.Manifest(it) }
+            if (manifest.mainAttributes.getValue('FMLAT') != 'unigrav_at.cfg') {
+                throw new GradleException('Release must declare its exact cardinal finalizer AT')
+            }
+            // Forge resolves each FMLAT manifest token relative to META-INF/.
+            def at = archive.getEntry('META-INF/' + manifest.mainAttributes.getValue('FMLAT'))
+            if (at == null) throw new GradleException('Declared cardinal finalizer AT missing')
+            def lines = archive.getInputStream(at).withCloseable { it.getText('UTF-8').readLines() }
+                    .collect { it.split('#', 2)[0].trim().replaceAll(/\s+/, ' ') }.findAll { !it.isEmpty() }
+            if (lines.size() != expectedMembers.size() || lines.toSet() != expectedMembers) {
+                throw new GradleException('Release cardinal finalizer AT differs from the exact SRG allowlist: ' + lines)
+            }
+            logger.lifecycle("Verified cardinal finalizer AT: ${expectedMembers.size()} exact SRG members, no wildcard")
+        }
+    }
+}
+tasks.named('check').configure { dependsOn tasks.named('verifyCardinalFinalizerPackaging') }
+
+compileTestJava {
+    sourceCompatibility = targetCompatibility = JavaVersion.VERSION_25
+}
+
+test {
+    useJUnitPlatform()
+    // HUD layout previews use BufferedImage only; never open a graphics window.
+    systemProperty 'java.awt.headless', 'true'
+    javaLauncher.set(javaToolchains.launcherFor {
+        languageVersion = JavaLanguageVersion.of(25)
+    })
+    if (show_testing_output.toBoolean()) {
+        testLogging {
+            showStandardStreams = true
+        }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+apply from: 'gradle/scripts/publishing.gradle'
+apply from: 'gradle/scripts/extra.gradle'
+apply from: 'gradle/scripts/cardinal-test-bridge.gradle'

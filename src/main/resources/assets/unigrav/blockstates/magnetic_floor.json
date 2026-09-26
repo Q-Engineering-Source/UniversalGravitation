@@ -1,0 +1,10 @@
+{
+  "variants": {
+    "facing=up": { "model": "unigrav:magnetic_floor" },
+    "facing=down": { "model": "unigrav:magnetic_floor", "x": 180 },
+    "facing=north": { "model": "unigrav:magnetic_floor", "x": 90 },
+    "facing=south": { "model": "unigrav:magnetic_floor", "x": 270 },
+    "facing=east": { "model": "unigrav:magnetic_floor", "x": 90, "y": 90 },
+    "facing=west": { "model": "unigrav:magnetic_floor", "x": 90, "y": 270 }
+  }
+}

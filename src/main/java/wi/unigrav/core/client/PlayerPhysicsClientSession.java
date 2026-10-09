@@ -35,6 +35,35 @@ public final class PlayerPhysicsClientSession {
                 && actor.dimension == snapshot.scope().dimension() && !PlayerKinematics.requiresNative(actor)) return;
         original.run();
     }
+
+    /** Known pose callbacks still update their mod state while the physical mirror owns geometry. */
+    public void runNativePose(EntityPlayer actor, Runnable original) {
+        Objects.requireNonNull(actor, "actor");
+        Objects.requireNonNull(original, "original");
+        if (!drivesMotion() || !actor.getUniqueID().equals(snapshot.scope().playerId())
+                || actor.dimension != snapshot.scope().dimension() || PlayerKinematics.requiresNative(actor)) {
+            original.run();
+            return;
+        }
+        Object expectedLifetime = lifetime;
+        var accepted = snapshot;
+        var correction = nativeTeleportId;
+        RuntimeException failure = null;
+        try {
+            original.run();
+        } catch (RuntimeException cause) {
+            failure = cause;
+        }
+        try {
+            if (lifetime == expectedLifetime && snapshot == accepted && nativeTeleportId.equals(correction)
+                    && drivesMotion() && !PlayerKinematics.requiresNative(actor))
+                PlayerPhysicsClientMirror.install(actor, accepted);
+        } catch (RuntimeException cleanup) {
+            if (failure == null) throw cleanup;
+            failure.addSuppressed(cleanup);
+        }
+        if (failure != null) throw failure;
+    }
     private final Predicate<PlayerPhysicalSnapshot> install;
     private final Runnable retireLegacy;
     private final Runnable enterNative;
@@ -52,6 +81,7 @@ public final class PlayerPhysicsClientSession {
     private PlayerPhysicalSnapshot.Scope custodyScope;
     private long delegationProposal;
     private OptionalInt nativeTeleportId = OptionalInt.empty();
+    private boolean nativeCorrectionPending;
 
     public PlayerPhysicsClientSession(Predicate<PlayerPhysicalSnapshot> install, Runnable retireLegacy, Runnable enterNative) {
         this.install = Objects.requireNonNull(install, "install");
@@ -71,6 +101,7 @@ public final class PlayerPhysicsClientSession {
                 submitted = null;
                 attempted = null;
                 nativeTeleportId = OptionalInt.empty();
+                nativeCorrectionPending = false;
             }
             offered = packet;
             if (snapshot != null && !snapshot.scope().equals(packet.scope())) snapshot = null;
@@ -109,6 +140,8 @@ public final class PlayerPhysicsClientSession {
             custodyScope = next.scope();
             nativeDelegated = false;
             incomingSequence = packet.sequence();
+            // Only this successfully installed packet crossed the current correction fence.
+            nativeCorrectionPending = false;
             return observed(StateDisposition.APPLIED, true);
         } finally {
             applying = false;
@@ -147,10 +180,21 @@ public final class PlayerPhysicsClientSession {
     /** Protocol custody survives native delegation so retired UG writers cannot restart. */
     public boolean owns() { return snapshot != null || nativeDelegated; }
     public boolean drivesMotion() { return snapshot != null && !nativeDelegated; }
+    /** Snapshot eligible for read-only model presentation, separate from retained custody. */
+    public Optional<PlayerPhysicalSnapshot> presentationSnapshot() {
+        return snapshot != null && !nativeDelegated && !applying && !nativeCorrectionPending
+                ? Optional.of(snapshot) : Optional.empty();
+    }
+    public float physicalEyeHeight(EntityPlayer actor, float nativeHeight) {
+        return drivesMotion() && actor.getUniqueID().equals(snapshot.scope().playerId())
+                && actor.dimension == snapshot.scope().dimension() && !PlayerKinematics.requiresNative(actor)
+                ? (float) snapshot.placement().shape().dimensions().eyeHeight() : nativeHeight;
+    }
     /** Keep custody while vanilla applies its correction; only states for that exact native ID may follow. */
     public void nativeCorrection(int teleportId) {
         if (teleportId < 0) throw new IllegalArgumentException("Negative native teleport ID");
         nativeTeleportId = OptionalInt.of(teleportId);
+        nativeCorrectionPending = true;
     }
     public Optional<PlayerPhysicalSnapshot> snapshot() { return Optional.ofNullable(snapshot); }
     public void reset() {
@@ -167,6 +211,7 @@ public final class PlayerPhysicsClientSession {
         incomingSequence = -1;
         outgoingSequence = 0;
         nativeTeleportId = OptionalInt.empty();
+        nativeCorrectionPending = false;
     }
     public CPacketPlayer prepare(CPacketPlayer packet, Vec3d transport, float yaw, float pitch,
                                 boolean remoteCustody, Optional<BoostProtocol.StateApplication> application,

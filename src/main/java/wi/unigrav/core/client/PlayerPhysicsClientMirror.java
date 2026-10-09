@@ -17,16 +17,24 @@ public final class PlayerPhysicsClientMirror {
         if (!player.getUniqueID().equals(snapshot.scope().playerId())) return Rejection.PLAYER_ID;
         if (player.dimension != snapshot.scope().dimension()) return Rejection.DIMENSION;
         if (!(snapshot.placement().shape() instanceof PlayerBodyShape.Cardinal shape)) return Rejection.SHAPE;
-        if (shape.dimensions().width() != player.width) return Rejection.WIDTH;
-        if (shape.dimensions().height() != player.height
-                && !(player.width == .6F && nativeHeight(player.height) && nativeHeight(shape.dimensions().height())))
-            return Rejection.HEIGHT;
+        // Only native float dimensions can be projected without changing the accepted shape.
+        // The session has already checked the connection, scope, sequence and correction fence.
+        if ((double) (float) shape.dimensions().width() != shape.dimensions().width()) return Rejection.WIDTH;
+        if ((double) (float) shape.dimensions().height() != shape.dimensions().height()) return Rejection.HEIGHT;
         return Rejection.NONE;
     }
-
-    private static boolean nativeHeight(double height) {
-        // updateSize uses float constants; compare their exact promoted values, not rounded decimal doubles.
-        return height == (double) .6F || height == (double) 1.65F || height == (double) 1.8F;
+    /** Read-only check for an already installed mirror; it never repairs or reinstalls geometry. */
+    public static boolean matchesAcceptedPresentationGeometry(EntityPlayer player, PlayerPhysicalSnapshot snapshot) {
+        if (rejection(player, snapshot) != Rejection.NONE) return false;
+        var dimensions = snapshot.placement().shape().dimensions();
+        var transport = snapshot.placement().transport();
+        var accepted = snapshot.placement().bounds();
+        AxisAlignedBB current = player.getEntityBoundingBox();
+        return player.width == (float) dimensions.width() && player.height == (float) dimensions.height()
+                && player.posX == transport.x() && player.posY == transport.y() && player.posZ == transport.z()
+                && current.minX == accepted.min().x() && current.minY == accepted.min().y()
+                && current.minZ == accepted.min().z() && current.maxX == accepted.max().x()
+                && current.maxY == accepted.max().y() && current.maxZ == accepted.max().z();
     }
     public static boolean install(EntityPlayer player, PlayerPhysicalSnapshot snapshot) {
         if (rejection(player, snapshot) != Rejection.NONE) return false;
@@ -35,7 +43,12 @@ public final class PlayerPhysicsClientMirror {
         var velocity = snapshot.worldVelocity();
         // The server already collision-checked this native pose. A local sneak/glide edge may lead or
         // lag it by a tick; adopt the accepted dimensions and bounds together instead of losing movement.
+        player.width = (float) snapshot.placement().shape().dimensions().width();
         player.height = (float) snapshot.placement().shape().dimensions().height();
+        // Forge stores the base eye; its native getter subtracts the sneak offset.
+        // Aqua's independent getter is projected at the client proxy boundary below.
+        float eye = (float) snapshot.placement().shape().dimensions().eyeHeight();
+        player.eyeHeight = player.isSneaking() || player.height == 1.65F ? eye + .08F : eye;
         // Do not call setPosition: its nominal box rebuild would discard accepted collision geometry.
         player.prevPosX = player.posX;
         player.prevPosY = player.posY;

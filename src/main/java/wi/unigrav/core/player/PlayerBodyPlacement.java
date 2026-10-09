@@ -107,6 +107,31 @@ public final class PlayerBodyPlacement {
         return transport;
     }
 
+    /** Resize proposal about the accepted foot face; collision and provenance remain with the owner. */
+    public PlayerBodyPlacement proposeDimensionsAtFeet(PlayerBodyShape.Dimensions dimensions) {
+        if (!(shape instanceof PlayerBodyShape.Cardinal cardinal))
+            throw new IllegalStateException("foot-anchored resize requires a cardinal body");
+        Vec3d feet = physicalFeet().orElseThrow();
+        double r = dimensions.width() / 2;
+        double h = dimensions.height();
+        Aabb box = switch (cardinal.frame()) {
+            case Y_POS -> new Aabb(new Vec3d(feet.x() - r, feet.y(), feet.z() - r),
+                    new Vec3d(feet.x() + r, feet.y() + h, feet.z() + r));
+            case Y_NEG -> new Aabb(new Vec3d(feet.x() - r, feet.y() - h, feet.z() - r),
+                    new Vec3d(feet.x() + r, feet.y(), feet.z() + r));
+            case X_POS -> new Aabb(new Vec3d(feet.x(), feet.y() - r, feet.z() - r),
+                    new Vec3d(feet.x() + h, feet.y() + r, feet.z() + r));
+            case X_NEG -> new Aabb(new Vec3d(feet.x() - h, feet.y() - r, feet.z() - r),
+                    new Vec3d(feet.x(), feet.y() + r, feet.z() + r));
+            case Z_POS -> new Aabb(new Vec3d(feet.x() - r, feet.y() - r, feet.z()),
+                    new Vec3d(feet.x() + r, feet.y() + r, feet.z() + h));
+            case Z_NEG -> new Aabb(new Vec3d(feet.x() - r, feet.y() - r, feet.z() - h),
+                    new Vec3d(feet.x() + r, feet.y() + r, feet.z()));
+        };
+        Vec3d mirror = new Vec3d(box.center().x(), box.min().y(), box.center().z());
+        return fromCardinalBounds(box, mirror, attitude, new PlayerBodyShape.Cardinal(cardinal.frame(), dimensions));
+    }
+
     /** Existing 70/490 speed corridor uses accepted proxy-minY, not centre/eye/support Y. */
     public double corridorY() {
         return bounds().min().y();

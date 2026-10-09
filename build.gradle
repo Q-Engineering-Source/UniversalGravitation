@@ -14,6 +14,7 @@ import java.util.zip.ZipFile
 import org.objectweb.asm.ClassReader
 import org.objectweb.asm.tree.ClassNode
 import org.objectweb.asm.tree.MethodInsnNode
+import org.objectweb.asm.tree.LdcInsnNode
 
 ext {
     //noinspection GroovyAssignabilityCheck
@@ -190,6 +191,8 @@ sourceSets {
     }
 }
 
+apply from: 'gradle/scripts/knok-seat-test.gradle'
+
 idea {
     module {
         inheritOutputDirs = true
@@ -304,7 +307,10 @@ tasks.register('verifyRemoteBoostPackaging') {
             }
             requiredMixins.each { mixin ->
                 // The pose wrapper uses pinned MCP/SRG selectors rather than a refmap; verify its bytecode below.
-                if (mixin != 'wi/unigrav/mixin/EntityPlayerPoseMixin' && !refmap.mappings[mixin]) {
+                if (!(mixin in ['wi/unigrav/mixin/EntityPlayerPoseMixin',
+                                'wi/unigrav/mixin/EntityPlayerEyeMixin',
+                                'wi/unigrav/mixin/AquaPlayerGeometryMixin',
+                                'wi/unigrav/mixin/ArtemisPlayerGeometryMixin']) && !refmap.mappings[mixin]) {
                     throw new GradleException("Release refmap has no mappings for ${mixin}")
                 }
             }
@@ -331,6 +337,105 @@ tasks.register('verifyRemoteBoostPackaging') {
                         && it.desc == '(Lnet/minecraft/entity/EntityLivingBase;Ljava/lang/Runnable;)V'
             }
             if (poseCalls.size() != 1) throw new GradleException('Native pose wrapper must call the tested boundary once')
+            def eyeEntry = archive.getEntry('wi/unigrav/mixin/EntityPlayerEyeMixin.class')
+            if (eyeEntry == null) throw new GradleException('Physical eye wrapper missing')
+            def eyeNode = new ClassNode()
+            archive.getInputStream(eyeEntry).withCloseable {
+                new ClassReader(it).accept(eyeNode, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES)
+            }
+            def eyeWrappers = eyeNode.methods.collectMany { method ->
+                ((method.visibleAnnotations ?: []) + (method.invisibleAnnotations ?: []))
+                        .findAll { it.desc == 'Lcom/llamalad7/mixinextras/injector/wrapmethod/WrapMethod;' }
+                        .collect { annotation -> [method: method, values: annotation.values.collate(2).collectEntries { [(it[0]): it[1]] }] }
+            }
+            if (eyeWrappers.size() != 1 || eyeWrappers[0].values.method.toSet() != ['getEyeHeight()F', 'func_70047_e()F'].toSet()
+                    || eyeWrappers[0].values.remap != false || eyeWrappers[0].values.require != 1 || eyeWrappers[0].values.allow != 1)
+                throw new GradleException('Physical eye must wrap every native/Aqua return with one exact target')
+            def eyeCalls = eyeWrappers[0].method.instructions.toArray().findAll {
+                it instanceof MethodInsnNode && it.owner == 'wi/unigrav/proxy/IProxy' && it.name == 'physicalEyeHeight'
+                        && it.desc == '(Lnet/minecraft/entity/EntityLivingBase;F)F'
+            }
+            if (eyeCalls.size() != 1) throw new GradleException('Physical eye must project through its side proxy once')
+            if (config.plugin != 'wi.unigrav.compat.PlayerGeometryMixinPlugin'
+                    || archive.getEntry('wi/unigrav/compat/PlayerGeometryMixinPlugin.class') == null) {
+                throw new GradleException('Optional geometry ABI plugin is missing from the release configuration')
+            }
+            def lateEntry = archive.getEntry('mixins.unigrav.geometry_compat.json')
+            if (lateEntry == null) throw new GradleException('Late geometry Mixin config missing')
+            def lateConfig = archive.getInputStream(lateEntry).withCloseable { new JsonSlurper().parse(it) }
+            if (lateConfig.'package' != 'wi.unigrav.mixin.compat'
+                    || lateConfig.plugin != config.plugin || lateConfig.refmap != config.refmap
+                    || lateConfig.mixins != ['ArtemisPlayerGeometryMixin'])
+                throw new GradleException('Late geometry Mixin target/resource link differs')
+            def lateLoaderEntry = archive.getEntry('wi/unigrav/compat/UnigravGeometryMixinLoader.class')
+            if (lateLoaderEntry == null) throw new GradleException('Geometry late loader missing')
+            def lateLoaderNode = new ClassNode()
+            archive.getInputStream(lateLoaderEntry).withCloseable {
+                new ClassReader(it).accept(lateLoaderNode, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES)
+            }
+            if (!lateLoaderNode.interfaces.contains('zone/rong/mixinbooter/ILateMixinLoader')
+                    || !lateLoaderNode.methods.find { it.name == 'getMixinConfigs' && it.desc == '()Ljava/util/List;' }
+                    ?.instructions?.toArray()?.any { it instanceof LdcInsnNode && it.cst == 'mixins.unigrav.geometry_compat.json' })
+                throw new GradleException('Geometry loader must queue the verified late config')
+            [
+                    AquaPlayerGeometryMixin: ['recalculateSize()V'],
+                    ArtemisPlayerGeometryMixin: [
+                            'onPlayerTick(Lnet/minecraftforge/fml/common/gameevent/TickEvent$PlayerTickEvent;)V',
+                            'onLivingUpdate(Lnet/minecraftforge/event/entity/living/LivingEvent$LivingUpdateEvent;)V']
+            ].each { className, expected ->
+                def entry = archive.getEntry(className == 'ArtemisPlayerGeometryMixin'
+                        ? "wi/unigrav/mixin/compat/${className}.class" : "wi/unigrav/mixin/${className}.class")
+                if (entry == null) throw new GradleException("Optional geometry Mixin missing: ${className}")
+                def geometryNode = new ClassNode()
+                archive.getInputStream(entry).withCloseable {
+                    new ClassReader(it).accept(geometryNode, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES)
+                }
+                def geometryWrappers = geometryNode.methods.collectMany { method ->
+                    ((method.visibleAnnotations ?: []) + (method.invisibleAnnotations ?: []))
+                            .findAll { it.desc == 'Lcom/llamalad7/mixinextras/injector/wrapmethod/WrapMethod;' }
+                            .collect { annotation -> [method: method, values: annotation.values.collate(2).collectEntries { [(it[0]): it[1]] }] }
+                }
+                if (geometryWrappers.size() != expected.size()
+                        || geometryWrappers.collectMany { it.values.method }.toSet() != expected.toSet()
+                        || geometryWrappers.any { it.values.remap != false || it.values.require != 1 || it.values.allow != 1 })
+                    throw new GradleException("Optional geometry selectors/guards differ: ${className}")
+                geometryWrappers.each { wrapper ->
+                    def calls = wrapper.method.instructions.toArray().findAll {
+                        it instanceof MethodInsnNode && it.owner == 'wi/unigrav/proxy/IProxy' && it.name == 'runNativePose'
+                                && it.desc == '(Lnet/minecraft/entity/EntityLivingBase;Ljava/lang/Runnable;)V'
+                    }
+                    if (calls.size() != 1) throw new GradleException("Geometry wrapper must call its tested boundary once: ${className}")
+                }
+                if (className == 'AquaPlayerGeometryMixin') {
+                    def mixinAnnotation = ((geometryNode.visibleAnnotations ?: []) + (geometryNode.invisibleAnnotations ?: []))
+                            .find { it.desc == 'Lorg/spongepowered/asm/mixin/Mixin;' }
+                    def mixinValues = mixinAnnotation.values.collate(2).collectEntries { [(it[0]): it[1]] }
+                    if (mixinValues.priority != 1001)
+                        throw new GradleException('Aqua growth injection must outrank its verified priority1000 merged method')
+                    def growthHooks = geometryNode.methods.collectMany { method ->
+                        ((method.visibleAnnotations ?: []) + (method.invisibleAnnotations ?: []))
+                                .findAll { it.desc == 'Lcom/llamalad7/mixinextras/injector/wrapoperation/WrapOperation;' }
+                                .collect { annotation -> [method: method, values: annotation.values.collate(2).collectEntries { [(it[0]): it[1]] }] }
+                    }
+                    def growthSelector = 'recalculateSize(Lcom/fuzs/aquaacrobatics/entity/EntitySize;Lcom/fuzs/aquaacrobatics/entity/EntitySize;)V'
+                    if (growthHooks.size() != 1 || growthHooks[0].values.method != [growthSelector]
+                            || growthHooks[0].values.remap != false || growthHooks[0].values.require != 1 || growthHooks[0].values.allow != 1)
+                        throw new GradleException('Aqua growth call-site selector/guards differ')
+                    def at = growthHooks[0].values.at
+                    if (at instanceof List) at = at[0]
+                    def atValues = at.values.collate(2).collectEntries { [(it[0]): it[1]] }
+                    def growthTarget = 'Lnet/minecraft/entity/player/EntityPlayer;move(Lnet/minecraft/entity/MoverType;DDD)V'
+                    if (atValues.value != 'INVOKE' || atValues.target != growthTarget || atValues.remap != true
+                            || refmap.mappings['wi/unigrav/mixin/AquaPlayerGeometryMixin'][growthTarget]
+                            != 'Lnet/minecraft/entity/player/EntityPlayer;func_70091_d(Lnet/minecraft/entity/MoverType;DDD)V')
+                        throw new GradleException('Aqua growth move must resolve its exact native call site')
+                    def calls = growthHooks[0].method.instructions.toArray().findAll {
+                        it instanceof MethodInsnNode && it.owner == 'wi/unigrav/proxy/IProxy' && it.name == 'runPoseMove'
+                                && it.desc == '(Lnet/minecraft/entity/EntityLivingBase;Lnet/minecraft/entity/MoverType;Ldev/crlhitbox/api/geometry/Vec3d;Ljava/util/function/Consumer;)V'
+                    }
+                    if (calls.size() != 1) throw new GradleException('Aqua growth wrapper must use one tested movement boundary')
+                }
+            }
             // Structural release linkage, not proof that FML applied the Mixin at runtime.
             def routerClass = archive.getEntry('wi/unigrav/mixin/NetHandlerPlayServerMixin.class')
             if (routerClass == null) throw new GradleException('Player packet lifetime Mixin class missing')

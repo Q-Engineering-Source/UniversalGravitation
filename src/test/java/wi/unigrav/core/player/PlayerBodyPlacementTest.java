@@ -17,6 +17,22 @@ class PlayerBodyPlacementTest {
     private static final PlayerBodyShape.Dimensions DIMENSIONS = new PlayerBodyShape.Dimensions(0.5, 2, 1.75);
 
     @Test
+    void cardinalAcceptsLoggedSwimmingDimensionsWithoutInventingCapsuleGeometry() {
+        var dimensions = new PlayerBodyShape.Dimensions(
+                0.6000000238418579, 0.5999999642372131, 0.4000000059604645);
+        var bounds = new Aabb(new Vec3d(-dimensions.width() / 2, 65, -dimensions.width() / 2),
+                new Vec3d(dimensions.width() / 2, 65 + dimensions.height(), dimensions.width() / 2));
+        var placement = PlayerBodyPlacement.fromCardinalBounds(bounds, new Vec3d(0, 65, 0),
+                CardinalFrame.Y_POS.attitude(), new PlayerBodyShape.Cardinal(CardinalFrame.Y_POS, dimensions));
+        assertEquals(bounds, placement.bounds());
+        assertEquals(65, placement.physicalFeet().orElseThrow().y());
+        assertEquals(dimensions.height(), placement.shape().dimensions().height());
+        assertThrows(IllegalArgumentException.class, () -> new PlayerBodyShape.FreeCapsule(dimensions));
+        assertThrows(IllegalArgumentException.class, placement::capsule);
+        assertThrows(IllegalArgumentException.class, () -> CapsulePlacementMath.pose(placement));
+    }
+
+    @Test
     void actualCardinalAnchorsUseAllSixRetainedFacesAndCapsuleStillNeedsFit() {
         var dimensions = new PlayerBodyShape.Dimensions(0.6F, 1.8F, 1.62F);
         var local = new Aabb(new Vec3d(-0.30000001192092896, 0.001, -0.30000001192092896),
@@ -200,12 +216,15 @@ class PlayerBodyPlacementTest {
 
     @Test
     void invalidDimensionsAndAttitudesFailInsteadOfInventingAUsablePlayer() {
-        double[][] bad = {{0, 2, 1}, {-1, 2, 1}, {3, 2, 1}, {0.5, 2, -1}, {0.5, 2, Double.POSITIVE_INFINITY},
+        double[][] bad = {{0, 2, 1}, {-1, 2, 1}, {0.5, 0, 1}, {0.5, -1, 1}, {0.5, 2, -1}, {0.5, 2, Double.POSITIVE_INFINITY},
                 {Double.NaN, 2, 1}, {0.5, Double.POSITIVE_INFINITY, 1}, {0.5, 2, Double.NaN}, {Double.MIN_VALUE, 2, 1}};
         for (double[] input : bad) {
             assertThrows(IllegalArgumentException.class,
                     () -> new PlayerBodyShape.Dimensions(input[0], input[1], input[2]));
         }
+        var shortWide = new PlayerBodyShape.Dimensions(3, 2, 1);
+        assertFalse(shortWide.supportsCapsule());
+        assertThrows(IllegalArgumentException.class, () -> new PlayerBodyShape.FreeCapsule(shortWide));
         assertThrows(IllegalArgumentException.class, () -> new Rotation3d(0, 0, 0, 0));
         assertThrows(NullPointerException.class, () -> new PlayerBodyPlacement(null, Rotation3d.identity(),
                 new PlayerBodyShape.FreeCapsule(DIMENSIONS)));

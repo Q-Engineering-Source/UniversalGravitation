@@ -25,6 +25,7 @@ import neofontrender.addons.api.camera.CameraApi;
 import neofontrender.addons.api.flight.FlightApi;
 import neofontrender.addons.api.flight.FlightAttitude;
 import neofontrender.addons.api.flight.FlightBodyPose;
+import neofontrender.addons.api.flight.FlightVector;
 import neofontrender.addons.api.flight.FlightCameraTracking;
 import neofontrender.addons.api.flight.FlightCapability;
 import neofontrender.addons.api.flight.FlightDecision;
@@ -41,6 +42,7 @@ import neofontrender.addons.api.input.InputFrameContext;
 import neofontrender.addons.api.input.InputRegistration;
 
 import wi.unigrav.Reference;
+import wi.unigrav.UnigravMod;
 import wi.unigrav.api.math.Vec3;
 import wi.unigrav.core.BodyPhysics;
 import wi.unigrav.core.EntityGravitySources;
@@ -48,17 +50,21 @@ import wi.unigrav.core.GravityEntityBinder;
 import wi.unigrav.core.TickDriver;
 import wi.unigrav.core.UnigravConfig;
 import wi.unigrav.core.client.ClientBoostRouting;
+import wi.unigrav.core.client.PlayerRenderPoseMirror;
 import wi.unigrav.core.client.PlayerPhysicsClient;
 import wi.unigrav.core.client.PlayerPhysicsClientPresentation;
 import wi.unigrav.core.client.PlayerPhysicsInput;
 import wi.unigrav.core.player.PlayerPhysicsProtocol;
+import wi.unigrav.core.player.PlayerKinematics;
+import wi.unigrav.core.player.PlayerRenderPoseProtocol;
 import wi.unigrav.core.client.ClientGravityTicker;
 import wi.unigrav.core.client.ClientKeyBindingState;
 import wi.unigrav.core.client.boost.RemoteBoostClient;
 
 /**
  * Direct client adapter from Universal Gravitation's zero-G state to Revo UI
- * Flight API v9 and Input API v1. Revo UI remains the sole owner of Minecraft
+ * Flight API v9+ and Input API v1. Model-up body presentation requires Flight API v10.
+ * Revo UI remains the sole owner of Minecraft
  * camera, input, picking, and rendering Mixins; this adapter owns one local
  * orientation and the player-anchored free-drift impulse derived from it.
  */
@@ -175,7 +181,7 @@ public final class RevoUiSixDofCamera implements AutoCloseable {
                     ID, PRIORITY, adapter::maneuver);
             adapter.trackingRegistration = FlightApi.registerCameraTrackingProvider(
                     ID, PRIORITY, adapter::tracking);
-            adapter.bodyPoseRegistration = FlightApi.registerBodyPoseProvider(
+            adapter.bodyPoseRegistration = SixDofBodyPresentation.registerModelUpBodyPoseProvider(
                     ID, PRIORITY, adapter::bodyPose);
             adapter.boostRegistration = ClientBoostRouting.register(adapter::boostPlan);
             adapter.physicalRegistration = ClientBoostRouting.registerPhysical(adapter::physicalControls);
@@ -197,6 +203,7 @@ public final class RevoUiSixDofCamera implements AutoCloseable {
         }
         if (event.phase == TickEvent.Phase.END) {
             applyRollAndDrift();
+            reportActivePose();
             return;
         }
         EntityPlayerSP player = minecraft.player;
@@ -362,15 +369,39 @@ public final class RevoUiSixDofCamera implements AutoCloseable {
             return null;
         }
         initializeFromPlayer(player);
-        return walkingPresentation(player, partialTicks).tracking();
+        return SixDofBodyPresentation.tracking(currentAttitude());
     }
 
     private FlightBodyPose bodyPose(AbstractClientPlayer player, float partialTicks) {
-        if (!(player instanceof EntityPlayerSP localPlayer) || !isActiveFor(localPlayer)) {
-            return null;
+        if (closed || player == null || player.world != minecraft.world || !player.isEntityAlive()
+                || player.isDead || PlayerKinematics.requiresNative(player)) return null;
+        if (!(player instanceof EntityPlayerSP localPlayer) || localPlayer != minecraft.player) {
+            return PlayerRenderPoseMirror.sample(player, partialTicks).orElse(null);
         }
-        initializeFromPlayer(localPlayer);
-        return walkingPresentation(localPlayer, partialTicks).body();
+        if (isActiveFor(localPlayer)) {
+            initializeFromPlayer(localPlayer);
+            return walkingPresentation(localPlayer, partialTicks).body();
+        }
+        var accepted = PlayerPhysicsClient.acceptedPresentation(localPlayer);
+        if (accepted.isEmpty()) return null;
+        var look = localPlayer.getLook(partialTicks);
+        return SixDofBodyPresentation.sampleCardinal(accepted.orElseThrow(),
+                new FlightVector(look.x, look.y, look.z), localPlayer.prevRenderYawOffset,
+                localPlayer.renderYawOffset, partialTicks).body();
+    }
+
+    /** Reports the already-integrated active camera sample, including first-person frames with no body render. */
+    private void reportActivePose() {
+        EntityPlayerSP player = minecraft.player;
+        if (closed || !isActiveFor(player)) return;
+        initializeFromPlayer(player);
+        SixDofBodyPresentation.FreePoseAttitudes pose = SixDofBodyPresentation.freePoseAttitudes(
+                currentAttitude(), PlayerPhysicsClient.bodyYawOffset(player, 0.0F));
+        PlayerRenderPoseMirror.reportFreePose(wireQuaternion(pose.body()), wireQuaternion(pose.head()));
+    }
+
+    private static PlayerRenderPoseProtocol.Quaternion wireQuaternion(FlightAttitude attitude) {
+        return new PlayerRenderPoseProtocol.Quaternion(attitude.x, attitude.y, attitude.z, attitude.w);
     }
 
     private SixDofBodyPresentation.Sample walkingPresentation(EntityPlayerSP player, float partialTicks) {

@@ -18,6 +18,8 @@ import wi.unigrav.core.client.ClientGIntent;
 import wi.unigrav.core.client.PlayerPhysicsClient;
 import wi.unigrav.core.player.GIntentProtocol;
 import wi.unigrav.core.player.PlayerPhysicsProtocol;
+import wi.unigrav.core.player.PlayerRenderPoseProtocol;
+import wi.unigrav.core.client.PlayerRenderPoseMirror;
 import wi.unigrav.core.client.ClientImpactDetector;
 import wi.unigrav.core.client.GravityDebugCommand;
 import wi.unigrav.core.client.GravityFieldRenderer;
@@ -26,6 +28,17 @@ import wi.unigrav.core.boost.BoostProtocol;
 import wi.unigrav.core.client.boost.RemoteBoostClient;
 
 public class ClientProxy extends CommonProxy {
+
+    @Override public void runNativePose(EntityLivingBase actor, Runnable original) {
+        if (actor.world.isRemote && actor instanceof EntityPlayerSP player)
+            PlayerPhysicsClient.runNativePose(player, original);
+        else super.runNativePose(actor, original);
+    }
+
+    @Override public float physicalEyeHeight(EntityLivingBase actor, float nativeHeight) {
+        return actor.world.isRemote && actor instanceof EntityPlayerSP player
+                ? PlayerPhysicsClient.physicalEyeHeight(player, nativeHeight) : nativeHeight;
+    }
 
     @Override public void runLegacyMotion(EntityLivingBase actor, Runnable original) {
         if (actor.world.isRemote && actor instanceof EntityPlayerSP player)
@@ -43,6 +56,7 @@ public class ClientProxy extends CommonProxy {
         RemoteBoostClient.install();
         ClientGIntent.install();
         PlayerPhysicsClient.install();
+        PlayerRenderPoseMirror.INSTANCE.install();
         // Client-side Δv application for the local player (single-player
         // consistency with the integrated server).
         MinecraftForge.EVENT_BUS.register(new ClientGravityTicker(UnigravMod.entityBinder));
@@ -74,6 +88,11 @@ public class ClientProxy extends CommonProxy {
     @Override
     public void receivePlayerPhysics(PlayerPhysicsProtocol.Packet packet, INetHandler handler) {
         PlayerPhysicsClient.receive(packet, handler);
+    }
+
+    @Override
+    public void receivePlayerRenderPose(PlayerRenderPoseProtocol.Packet packet, INetHandler handler) {
+        PlayerRenderPoseMirror.INSTANCE.receive(packet, handler);
     }
 
     @Optional.Method(modid = REVO_UI_MOD_ID)

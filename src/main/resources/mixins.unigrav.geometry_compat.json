@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "minVersion": "0.8.7",
+  "package": "wi.unigrav.mixin.compat",
+  "plugin": "wi.unigrav.compat.PlayerGeometryMixinPlugin",
+  "refmap": "mixins.unigrav.remote_boost.refmap.json",
+  "target": "@env(DEFAULT)",
+  "compatibilityLevel": "JAVA_25",
+  "mixins": ["ArtemisPlayerGeometryMixin"],
+  "server": [],
+  "client": [],
+  "injectors": {"defaultRequire": 1}
+}

@@ -177,8 +177,8 @@ public final class PlayerPhysicsStep {
         if (!propulsion) {
             if (freeDrift) {
                 // Read-only sweep: its endpoint is never installed and cannot grant onGround or jump authority.
-                var footRequest = new CardinalMovementResolver.Request(CardinalFrame.Y_POS, actor.getEntityBoundingBox(),
-                        new Vec3d(0, -ZERO_G_FOOT_REACH - 1.0e-7, 0), MoverType.PLAYER, false, false, 0);
+                var footRequest = new CardinalMovementResolver.Request(frame, actor.getEntityBoundingBox(),
+                        frame.toWorld(new Vec3d(0, -ZERO_G_FOOT_REACH - 1.0e-7, 0)), MoverType.PLAYER, false, false, 0);
                 var foot = WorldCollisionCandidates.resolveCardinal(world, actor, accepted, footRequest, SCAN, MOVE);
                 if (foot.worldFailure().isPresent()) {
                     var failure = foot.worldFailure().orElseThrow();
@@ -190,8 +190,9 @@ public final class PlayerPhysicsStep {
                         && -contact.nativeResolvedLocalDelta().y() <= ZERO_G_FOOT_REACH;
                 nearFootLocomotion = withinReach;
                 if (withinReach) {
-                    Vec3d input = controls.translation();
-                    Vec3 tangent = new Vec3(velocity.x(), 0, velocity.z());
+                    Vec3d input = frame.toLocal(controls.translation());
+                    Vec3d localVelocity = frame.toLocal(new Vec3d(velocity.x(), velocity.y(), velocity.z()));
+                    Vec3 tangent = new Vec3(localVelocity.x(), 0, localVelocity.z());
                     boolean sprinting = controls.sprint() && !controls.sneak()
                             && (actor.capabilities.isCreativeMode || actor.getFoodStats().getFoodLevel() > 6);
                     double targetSpeed = (sprinting ? ZERO_G_SPRINT_SPEED : ZERO_G_WALK_SPEED)
@@ -201,7 +202,8 @@ public final class PlayerPhysicsStep {
                     double change = drive.norm();
                     // Contact-limited friction may brake toward the selected gait, never snap existing speed.
                     if (change > ZERO_G_WALK_ACCELERATION * dt) drive = drive.scale(ZERO_G_WALK_ACCELERATION * dt / change);
-                    velocity = velocity.add(drive);
+                    Vec3d worldDrive = frame.toWorld(new Vec3d(drive.x(), drive.y(), drive.z()));
+                    velocity = velocity.add(new Vec3(worldDrive.x(), worldDrive.y(), worldDrive.z()));
                 }
                 // A retained native flag is not sustained support in a region with no standing constraint.
                 actor.onGround = false;
@@ -269,15 +271,29 @@ public final class PlayerPhysicsStep {
                         : flying ? actor.capabilities.getFlySpeed() * (actor.isSprinting() ? 2 : 1) : actor.jumpMovementFactor;
                 float yaw = actor.rotationYaw * 0.017453292F;
                 float sin = MathHelper.sin(yaw), cos = MathHelper.cos(yaw);
-                float inputScale = controls.sneak() && !flying ? 0.98F * 0.3F : 0.98F;
-                float worldX = (float) controls.translation().x() * inputScale;
-                float worldZ = (float) controls.translation().z() * inputScale;
+                double keyboardTravelGain = controls.keyboardTravelGain();
                 if (frame == CardinalFrame.Y_POS) {
-                    actor.moveRelative(worldX * cos + worldZ * sin, 0, worldZ * cos - worldX * sin, coefficient);
+                    float worldX = (float) (controls.translation().x() * keyboardTravelGain);
+                    float worldZ = (float) (controls.translation().z() * keyboardTravelGain);
+                    float strafe = worldX * cos + worldZ * sin;
+                    float forward = worldZ * cos - worldX * sin;
+                    if (controls.sneak() && !flying) {
+                        strafe = (float) (strafe * 0.3D);
+                        forward = (float) (forward * 0.3D);
+                    }
+                    strafe *= 0.98F;
+                    forward *= 0.98F;
+                    actor.moveRelative(strafe, 0, forward, coefficient);
                 } else {
                     Vec3d input = frame.toLocal(controls.translation());
-                    float right = (float) input.x() * inputScale;
-                    float forward = (float) input.z() * inputScale;
+                    float right = (float) (input.x() * keyboardTravelGain);
+                    float forward = (float) (input.z() * keyboardTravelGain);
+                    if (controls.sneak() && !flying) {
+                        right = (float) (right * 0.3D);
+                        forward = (float) (forward * 0.3D);
+                    }
+                    right *= 0.98F;
+                    forward *= 0.98F;
                     float lengthSquared = right * right + forward * forward;
                     if (lengthSquared >= 1.0e-4F) {
                         float scale = coefficient / Math.max(1, MathHelper.sqrt(lengthSquared));

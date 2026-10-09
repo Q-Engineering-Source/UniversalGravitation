@@ -2,6 +2,7 @@ package wi.unigrav.core.floor;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -23,6 +24,8 @@ import net.minecraft.entity.passive.EntityPig;
 import net.minecraft.network.play.client.CPacketPlayer;
 import net.minecraft.network.play.client.CPacketConfirmTeleport;
 import net.minecraft.network.play.server.SPacketPlayerPosLook;
+import net.minecraft.network.NetworkManager;
+import net.minecraft.network.EnumPacketDirection;
 import net.minecraft.init.Bootstrap;
 import net.minecraft.init.Items;
 import net.minecraft.stats.StatList;
@@ -40,7 +43,11 @@ import net.minecraft.world.GameType;
 import net.minecraft.world.WorldServer;
 import net.minecraft.world.World;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.ChunkPos;
 import net.minecraft.util.math.AxisAlignedBB;
+import net.minecraft.world.chunk.Chunk;
+import net.minecraft.util.EnumFacing;
+import net.minecraftforge.common.DimensionManager;
 import net.minecraftforge.event.world.ChunkEvent;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
 import net.minecraftforge.fml.common.gameevent.PlayerEvent;
@@ -52,6 +59,13 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.core.LogEvent;
+import org.apache.logging.log4j.core.appender.AbstractAppender;
+import org.apache.logging.log4j.core.config.Property;
+import wi.unigrav.core.player.CardinalFrame;
+import wi.unigrav.core.player.PlayerBodyShape;
 import wi.unigrav.core.player.GIntentProtocol;
 import wi.unigrav.core.player.GIntentServer;
 import wi.unigrav.core.player.PlayerPhysicalSnapshot;
@@ -59,6 +73,8 @@ import wi.unigrav.core.player.PlayerPhysicsProtocol;
 import wi.unigrav.core.player.PlayerPhysicsServer;
 import wi.unigrav.core.player.PlayerMovementRouter;
 import wi.unigrav.core.player.NativePlayerMovement;
+import wi.unigrav.core.player.PlayerRenderPoseProtocol;
+import wi.unigrav.core.player.PlayerRenderPoseTracker;
 import wi.unigrav.core.boost.RemoteBoostServer;
 import wi.unigrav.core.boost.BoostProtocol;
 import wi.unigrav.core.UnigravConfig;
@@ -67,6 +83,7 @@ import wi.unigrav.core.GravityEntityBinder;
 import wi.unigrav.core.GravityMode;
 import wi.unigrav.core.BodyPhysics;
 import wi.unigrav.core.client.boost.RemoteApplicationFixture;
+import wi.unigrav.core.client.PlayerPhysicsInput;
 import wi.unigrav.core.client.PlayerPhysicsClientSession;
 import wi.unigrav.core.client.PlayerPhysicsClientMirror;
 import wi.unigrav.core.client.PlayerPhysicsClientPresentation;
@@ -78,6 +95,853 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class PlayerPhysicsServerIntegrationTest {
     @BeforeAll static void bootstrap() { Bootstrap.register(); }
+
+    @Test void renderPoseReconcilesActualTrackerMembershipAndRotatesViewerRealmOnWorldRequest(@TempDir Path directory) {
+        try (var fixture = new Fixture(directory)) {
+            fixture.adoptOrdinary();
+            EntityPlayerMP viewer = fixture.world.serverPlayer(new UUID(0, 9721));
+            EmbeddedChannel viewerChannel = new EmbeddedChannel(viewer.connection.netManager);
+            ArrayList<RenderSend> sends = new ArrayList<>();
+            var tracker = new PlayerRenderPoseTracker(fixture.physics, fixture.intent, fixture.remote,
+                    (recipient, packet) -> sends.add(new RenderSend(recipient, packet)));
+            NativeObserverMembership nativeMembership = null;
+            try {
+                assertTrue(fixture.world.world().spawnEntity(fixture.player));
+                assertTrue(fixture.world.world().spawnEntity(viewer));
+                nativeMembership = prepareNativeObserverMembership(fixture, viewer, fixture.player);
+
+                registerRenderPoseConnection(tracker, fixture.player);
+                registerRenderPoseConnection(tracker, viewer);
+                UUID ownerToken = UUID.randomUUID();
+                UUID viewerToken = UUID.randomUUID();
+                tracker.receive(PlayerRenderPoseProtocol.Packet.hello(ownerToken, 1), fixture.player.connection);
+                tracker.receive(PlayerRenderPoseProtocol.Packet.hello(viewerToken, 1), viewer.connection);
+                tracker.reconcileWorld(fixture.world.world());
+
+                var initialWelcome = sends.stream().map(RenderSend::packet)
+                        .filter(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.WELCOME
+                                && packet.connectionToken().equals(viewerToken))
+                        .findFirst().orElseThrow();
+                var initialPose = sends.stream().map(RenderSend::packet)
+                        .filter(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.POSE
+                                && packet.connectionToken().equals(viewerToken)
+                                && packet.playerId().equals(fixture.player.getUniqueID()))
+                        .findFirst().orElseThrow();
+                assertEquals(1, initialWelcome.worldRequestGeneration());
+                assertEquals(initialWelcome.viewerRealm(), initialPose.viewerRealm());
+                assertEquals(PlayerRenderPoseProtocol.Mode.CARDINAL, initialPose.mode());
+
+                int sourceUpdates = fixture.world.positionUpdates(fixture.player);
+                var acceptedBeforeHeading = fixture.physics.presentationAccepted(fixture.player.connection).orElseThrow();
+                float nativeBodyYaw = 37;
+                fixture.player.rotationYaw = nativeBodyYaw;
+                fixture.player.renderYawOffset = nativeBodyYaw;
+                fixture.world.world().setTotalWorldTime(fixture.world.world().getTotalWorldTime() + 1);
+                tracker.reconcileWorld(fixture.world.world());
+                var headingPose = sends.stream().map(RenderSend::packet)
+                        .filter(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.POSE
+                                && packet.connectionToken().equals(viewerToken)
+                                && packet.playerId().equals(fixture.player.getUniqueID()))
+                        .reduce((first, second) -> second).orElseThrow();
+                var body = new neofontrender.addons.api.flight.FlightAttitude(headingPose.body().x(),
+                        headingPose.body().y(), headingPose.body().z(), headingPose.body().w());
+                var cardinal = (PlayerBodyShape.Cardinal) acceptedBeforeHeading.placement().shape();
+                var frameUp = cardinal.frame().up();
+                double worldHeadingX = -Math.sin(Math.toRadians(nativeBodyYaw));
+                double worldHeadingZ = Math.cos(Math.toRadians(nativeBodyYaw));
+                double upProjection = frameUp.x() * worldHeadingX + frameUp.z() * worldHeadingZ;
+                double expectedX = worldHeadingX - frameUp.x() * upProjection;
+                double expectedY = -frameUp.y() * upProjection;
+                double expectedZ = worldHeadingZ - frameUp.z() * upProjection;
+                double expectedLength = Math.sqrt(expectedX * expectedX + expectedY * expectedY + expectedZ * expectedZ);
+                assertTrue(expectedLength > 1e-6, "test yaw must have a usable tangent in the accepted frame");
+                assertEquals(expectedX / expectedLength, body.forward().x, 1e-9,
+                        "native body yaw rotates the cardinal body tangent X");
+                assertEquals(expectedY / expectedLength, body.forward().y, 1e-9,
+                        "native body yaw rotates the cardinal body tangent Y");
+                assertEquals(expectedZ / expectedLength, body.forward().z, 1e-9,
+                        "native body yaw rotates the cardinal body tangent Z");
+                assertEquals(frameUp.x(), body.up().x, 1e-9);
+                assertEquals(frameUp.y(), body.up().y, 1e-9);
+                assertEquals(frameUp.z(), body.up().z, 1e-9);
+                assertEquals(acceptedBeforeHeading, fixture.physics.presentationAccepted(fixture.player.connection).orElseThrow(),
+                        "render sampling must not mutate physical acceptance");
+                assertEquals(sourceUpdates, fixture.world.positionUpdates(fixture.player),
+                        "render sampling must not move or install physical geometry");
+
+                long realmBeforeRequest = headingPose.viewerRealm();
+                tracker.receive(PlayerRenderPoseProtocol.Packet.hello(viewerToken, 2), viewer.connection);
+                var advancedWelcome = sends.stream().map(RenderSend::packet)
+                        .filter(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.WELCOME
+                                && packet.connectionToken().equals(viewerToken))
+                        .reduce((first, second) -> second).orElseThrow();
+                assertEquals(2, advancedWelcome.worldRequestGeneration());
+                assertTrue(advancedWelcome.viewerRealm() > realmBeforeRequest,
+                        "a rebuilt client World rotates the remote cache realm even when server actor/world are unchanged");
+                int afterAdvancedWelcome = sends.size();
+                tracker.receive(PlayerRenderPoseProtocol.Packet.hello(viewerToken, 1), viewer.connection);
+                assertEquals(afterAdvancedWelcome, sends.size(), "an old HELLO cannot roll back viewer realm or reseed stale caches");
+                tracker.receive(PlayerRenderPoseProtocol.Packet.hello(viewerToken, 2), viewer.connection);
+                var repeatedWelcome = sends.stream().map(RenderSend::packet)
+                        .filter(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.WELCOME
+                                && packet.connectionToken().equals(viewerToken))
+                        .reduce((first, second) -> second).orElseThrow();
+                assertEquals(advancedWelcome.viewerRealm(), repeatedWelcome.viewerRealm(),
+                        "same-generation retry stays on the exact current realm");
+
+                for (int tick = 0; tick < 3; tick++) {
+                    fixture.world.world().setTotalWorldTime(fixture.world.world().getTotalWorldTime() + 1);
+                    tracker.reconcileWorld(fixture.world.world());
+                }
+                assertFalse(sends.stream().map(RenderSend::packet)
+                                .anyMatch(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.REMOVE
+                                        && packet.connectionToken().equals(viewerToken)),
+                        "actual tracker membership keeps the pose alive across repeated server reconciles");
+                assertTrue(fixture.world.world().getEntityTracker().getTrackingPlayers(fixture.player).contains(viewer));
+            } finally {
+                tracker.stop();
+                if (nativeMembership != null) nativeMembership.close();
+                viewerChannel.finishAndReleaseAll();
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(CardinalFrame.class)
+    void remoteCardinalBodyHeadingUsesTheActualAcceptedFrame(CardinalFrame target, @TempDir Path directory) {
+        var previousBinder = UnigravMod.entityBinder;
+        UnigravMod.entityBinder = new GravityEntityBinder();
+        try (var fixture = new Fixture(directory);
+             var binding = UnigravMod.entityBinder.bind(fixture.player, GravityMode.REPLACE)) {
+            double halfHeight = (double) 1.8F / 2;
+            double x = target == CardinalFrame.X_POS ? 8 + halfHeight
+                    : target == CardinalFrame.X_NEG ? 8 - halfHeight : 8.5;
+            double z = target == CardinalFrame.Z_POS ? 8 + halfHeight
+                    : target == CardinalFrame.Z_NEG ? 8 - halfHeight : 8.5;
+            fixture.player.setPosition(x, 65, z);
+            BlockPos source = new BlockPos(x, 64, z);
+            fixture.world.put(source, FloorBlocks.GRAVITY_FLOOR.getDefaultState()
+                    .withProperty(DirectionalFloorBlock.FACING, EnumFacing.UP));
+            BlockPos targetFloor = switch (target) {
+                case X_POS -> new BlockPos(7, 65, 8);
+                case X_NEG -> new BlockPos(8, 65, 8);
+                case Z_POS -> new BlockPos(8, 65, 7);
+                case Z_NEG -> new BlockPos(8, 65, 8);
+                case Y_NEG -> new BlockPos(8, 67, 8);
+                case Y_POS -> source;
+            };
+            if (target != CardinalFrame.Y_POS) {
+                EnumFacing targetFacing = switch (target) {
+                    case X_POS -> EnumFacing.EAST;
+                    case X_NEG -> EnumFacing.WEST;
+                    case Z_POS -> EnumFacing.SOUTH;
+                    case Z_NEG -> EnumFacing.NORTH;
+                    case Y_NEG -> EnumFacing.DOWN;
+                    case Y_POS -> EnumFacing.UP;
+                };
+                fixture.world.put(targetFloor, FloorBlocks.GRAVITY_FLOOR.getDefaultState()
+                        .withProperty(DirectionalFloorBlock.FACING, targetFacing));
+            }
+            FloorWorldFields.onChunkLoad(new ChunkEvent.Load(fixture.world.world().getChunk(0, 0)));
+            fixture.adoptOrdinary();
+            if (target != CardinalFrame.Y_POS) {
+                fixture.world.put(source, FloorBlocks.GRAVITY_FLOOR.getDefaultState()
+                        .withProperty(DirectionalFloorBlock.FACING, EnumFacing.DOWN));
+                FloorWorldFields.onChunkLoad(new ChunkEvent.Load(fixture.world.world().getChunk(0, 0)));
+                fixture.tick();
+            }
+            var accepted = fixture.physics.presentationAccepted(fixture.player.connection).orElseThrow();
+            assertEquals(target, ((PlayerBodyShape.Cardinal) accepted.placement().shape()).frame(),
+                    "the production physics server must accept the target frame before remote sampling");
+
+            EntityPlayerMP viewer = fixture.world.serverPlayer(new UUID(0, 9728 + target.ordinal()));
+            EmbeddedChannel viewerChannel = new EmbeddedChannel(viewer.connection.netManager);
+            ArrayList<RenderSend> sends = new ArrayList<>();
+            var tracker = new PlayerRenderPoseTracker(fixture.physics, fixture.intent, fixture.remote,
+                    (recipient, packet) -> sends.add(new RenderSend(recipient, packet)));
+            NativeObserverMembership nativeMembership = null;
+            try {
+                assertTrue(fixture.world.world().spawnEntity(fixture.player));
+                assertTrue(fixture.world.world().spawnEntity(viewer));
+                nativeMembership = prepareNativeObserverMembership(fixture, viewer, fixture.player);
+                registerRenderPoseConnection(tracker, fixture.player);
+                registerRenderPoseConnection(tracker, viewer);
+                UUID viewerToken = UUID.randomUUID();
+                tracker.receive(PlayerRenderPoseProtocol.Packet.hello(UUID.randomUUID(), 1), fixture.player.connection);
+                tracker.receive(PlayerRenderPoseProtocol.Packet.hello(viewerToken, 1), viewer.connection);
+                var beforeHeading = sends.stream().map(RenderSend::packet)
+                        .filter(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.POSE
+                                && packet.connectionToken().equals(viewerToken)
+                                && packet.playerId().equals(fixture.player.getUniqueID()))
+                        .reduce((first, second) -> second).orElseThrow();
+
+                var acceptedBeforeHeading = fixture.physics.presentationAccepted(fixture.player.connection).orElseThrow();
+                int sourceUpdates = fixture.world.positionUpdates(fixture.player);
+                float nativeBodyYaw = 37;
+                fixture.player.rotationYaw = nativeBodyYaw;
+                fixture.player.renderYawOffset = nativeBodyYaw;
+                fixture.world.world().setTotalWorldTime(fixture.world.world().getTotalWorldTime() + 1);
+                tracker.reconcileWorld(fixture.world.world());
+                var headingPose = sends.stream().map(RenderSend::packet)
+                        .filter(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.POSE
+                                && packet.connectionToken().equals(viewerToken)
+                                && packet.playerId().equals(fixture.player.getUniqueID()))
+                        .reduce((first, second) -> second).orElseThrow();
+                assertEquals(beforeHeading.lifetime(), headingPose.lifetime());
+                var body = new neofontrender.addons.api.flight.FlightAttitude(headingPose.body().x(),
+                        headingPose.body().y(), headingPose.body().z(), headingPose.body().w());
+                Vec3d up = target.up();
+                Vec3d nativeHeading = new Vec3d(-Math.sin(Math.toRadians(nativeBodyYaw)), 0,
+                        Math.cos(Math.toRadians(nativeBodyYaw)));
+                Vec3d tangent = nativeHeading.subtract(up.multiply(nativeHeading.dot(up)));
+                double tangentLength = Math.sqrt(tangent.lengthSquared());
+                assertTrue(tangentLength > 1e-6, "native yaw must give a usable frame tangent");
+                assertEquals(tangent.x() / tangentLength, body.forward().x, 1e-9,
+                        "native body yaw projects onto the accepted frame tangent X");
+                assertEquals(tangent.y() / tangentLength, body.forward().y, 1e-9,
+                        "native body yaw projects onto the accepted frame tangent Y");
+                assertEquals(tangent.z() / tangentLength, body.forward().z, 1e-9,
+                        "native body yaw projects onto the accepted frame tangent Z");
+                assertEquals(up.x(), body.up().x, 1e-9);
+                assertEquals(up.y(), body.up().y, 1e-9);
+                assertEquals(up.z(), body.up().z, 1e-9);
+                assertEquals(acceptedBeforeHeading, fixture.physics.presentationAccepted(fixture.player.connection).orElseThrow(),
+                        "remote sampling cannot mutate accepted physical state");
+                assertEquals(sourceUpdates, fixture.world.positionUpdates(fixture.player),
+                        "remote sampling cannot write geometry or position");
+            } finally {
+                tracker.stop();
+                if (nativeMembership != null) nativeMembership.close();
+                viewerChannel.finishAndReleaseAll();
+            }
+        } finally {
+            FloorWorldFields.clearAll();
+            UnigravMod.entityBinder = previousBinder;
+        }
+    }
+
+    @Test void freePoseReportsRequireTheCurrentServerIssuedLeaseAndWorldRequest(@TempDir Path directory) {
+        try (var fixture = new Fixture(directory, true, true)) {
+            EntityPlayerMP viewer = fixture.world.serverPlayer(new UUID(0, 9722));
+            EmbeddedChannel viewerChannel = new EmbeddedChannel(viewer.connection.netManager);
+            ArrayList<RenderSend> sends = new ArrayList<>();
+            var tracker = new PlayerRenderPoseTracker(fixture.physics, fixture.intent, fixture.remote,
+                    (recipient, packet) -> sends.add(new RenderSend(recipient, packet)));
+            NativeObserverMembership nativeMembership = null;
+            try {
+                assertTrue(fixture.world.world().spawnEntity(fixture.player));
+                assertTrue(fixture.world.world().spawnEntity(viewer));
+                nativeMembership = prepareNativeObserverMembership(fixture, viewer, fixture.player);
+
+                registerRenderPoseConnection(tracker, fixture.player);
+                registerRenderPoseConnection(tracker, viewer);
+                UUID ownerToken = UUID.randomUUID();
+                UUID viewerToken = UUID.randomUUID();
+                tracker.receive(PlayerRenderPoseProtocol.Packet.hello(ownerToken, 1), fixture.player.connection);
+                tracker.receive(PlayerRenderPoseProtocol.Packet.hello(viewerToken, 1), viewer.connection);
+                var firstLease = sends.stream().map(RenderSend::packet)
+                        .filter(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.FREE_LEASE
+                                && packet.connectionToken().equals(ownerToken) && packet.lifetime() > 0)
+                        .findFirst().orElseThrow(() -> new AssertionError(
+                                "server must issue the lease from real dedicated custody and active G intent"));
+                var oldReport = PlayerRenderPoseProtocol.Packet.freePose(ownerToken, firstLease.viewerRealm(),
+                        firstLease.dimension(), firstLease.worldEpoch(), firstLease.lifetime(), 1,
+                        new PlayerRenderPoseProtocol.Quaternion(0, 0, 0, 1),
+                        new PlayerRenderPoseProtocol.Quaternion(0, 0, 0, 1));
+                tracker.receive(oldReport, fixture.player.connection);
+                fixture.world.world().setTotalWorldTime(fixture.world.world().getTotalWorldTime() + 1);
+                tracker.reconcileWorld(fixture.world.world());
+                assertTrue(sends.stream().map(RenderSend::packet).anyMatch(packet ->
+                                packet.kind() == PlayerRenderPoseProtocol.Kind.POSE
+                                        && packet.connectionToken().equals(viewerToken)
+                                        && packet.playerId().equals(fixture.player.getUniqueID())
+                                        && packet.mode() == PlayerRenderPoseProtocol.Mode.FREE),
+                        "a unit pose is published only after the current server-issued lease admits it");
+
+                tracker.receive(PlayerRenderPoseProtocol.Packet.hello(ownerToken, 2), fixture.player.connection);
+                var renewedLease = sends.stream().map(RenderSend::packet)
+                        .filter(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.FREE_LEASE
+                                && packet.connectionToken().equals(ownerToken) && packet.lifetime() > 0)
+                        .reduce((first, second) -> second).orElseThrow();
+                assertTrue(renewedLease.viewerRealm() > firstLease.viewerRealm());
+                int beforeStaleReport = sends.size();
+                fixture.world.world().setTotalWorldTime(fixture.world.world().getTotalWorldTime() + 1);
+                tracker.receive(oldReport, fixture.player.connection);
+                tracker.reconcileWorld(fixture.world.world());
+                assertFalse(sends.subList(beforeStaleReport, sends.size()).stream().map(RenderSend::packet)
+                                .anyMatch(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.POSE
+                                        && packet.connectionToken().equals(viewerToken)
+                                        && packet.mode() == PlayerRenderPoseProtocol.Mode.FREE),
+                        "a report from a retired viewer realm and lease cannot reappear after a world request generation change");
+            } finally {
+                tracker.stop();
+                if (nativeMembership != null) nativeMembership.close();
+                viewerChannel.finishAndReleaseAll();
+            }
+        }
+    }
+
+    @Test void delayedDisconnectRetirementCannotEraseAReplacementViewerRealm(@TempDir Path directory) {
+        try (var fixture = new Fixture(directory)) {
+            fixture.adoptOrdinary();
+            EntityPlayerMP oldViewer = fixture.world.serverPlayer(new UUID(0, 9724));
+            EmbeddedChannel reusedChannel = new EmbeddedChannel(oldViewer.connection.netManager);
+            ArrayList<RenderSend> sends = new ArrayList<>();
+            var tracker = new PlayerRenderPoseTracker(fixture.physics, fixture.intent, fixture.remote,
+                    (recipient, packet) -> sends.add(new RenderSend(recipient, packet)));
+            NativeObserverMembership nativeMembership = null;
+            try {
+                assertTrue(fixture.world.world().spawnEntity(fixture.player));
+                assertTrue(fixture.world.world().spawnEntity(oldViewer));
+                nativeMembership = prepareNativeObserverMembership(fixture, oldViewer, fixture.player);
+
+                registerRenderPoseConnection(tracker, fixture.player);
+                registerRenderPoseConnection(tracker, oldViewer);
+                UUID ownerToken = UUID.randomUUID();
+                UUID oldViewerToken = UUID.randomUUID();
+                tracker.receive(PlayerRenderPoseProtocol.Packet.hello(ownerToken, 1), fixture.player.connection);
+                tracker.receive(PlayerRenderPoseProtocol.Packet.hello(oldViewerToken, 1), oldViewer.connection);
+                assertTrue(sends.stream().map(RenderSend::packet).anyMatch(packet ->
+                                packet.kind() == PlayerRenderPoseProtocol.Kind.POSE
+                                        && packet.connectionToken().equals(oldViewerToken)
+                                        && packet.playerId().equals(fixture.player.getUniqueID())),
+                        "the old connection first owns a real tracked presentation pair");
+
+                var reusedManager = oldViewer.connection.netManager;
+                tracker.onDisconnect(new FMLNetworkEvent.ServerDisconnectionFromClientEvent(reusedManager));
+                nativeMembership.detachViewer();
+
+                EntityPlayerMP replacement = fixture.world.serverPlayer(oldViewer.getUniqueID());
+                assertTrue(fixture.world.world().spawnEntity(replacement));
+                var replacementHandler = new NetHandlerPlayServer(fixture.world.world().getMinecraftServer(),
+                        reusedManager, replacement);
+                replacement.connection = replacementHandler;
+                reusedManager.setNetHandler(replacementHandler);
+                nativeMembership.attachViewer(replacement);
+                registerRenderPoseConnection(tracker, replacement);
+                UUID replacementToken = UUID.randomUUID();
+                tracker.receive(PlayerRenderPoseProtocol.Packet.hello(replacementToken, 1), replacementHandler);
+                var replacementPose = sends.stream().map(RenderSend::packet)
+                        .filter(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.POSE
+                                && packet.connectionToken().equals(replacementToken)
+                                && packet.playerId().equals(fixture.player.getUniqueID()))
+                        .findFirst().orElseThrow(() -> new AssertionError(
+                                "the replacement realm is seeded from actual tracking membership"));
+                int poseCountBeforeRetirementDrain = (int) sends.stream().map(RenderSend::packet)
+                        .filter(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.POSE
+                                && packet.connectionToken().equals(replacementToken)).count();
+
+                fixture.world.world().setTotalWorldTime(fixture.world.world().getTotalWorldTime() + 1);
+                tracker.reconcileWorld(fixture.world.world());
+
+                var replacementPoses = sends.stream().map(RenderSend::packet)
+                        .filter(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.POSE
+                                && packet.connectionToken().equals(replacementToken)).toList();
+                assertEquals(poseCountBeforeRetirementDrain, replacementPoses.size(),
+                        "draining a delayed old disconnect must preserve the replacement viewer's active pair");
+                assertEquals(replacementPose.lifetime(), replacementPoses.getLast().lifetime(),
+                        "old cleanup cannot replace the new presentation lifetime");
+                assertFalse(sends.stream().map(RenderSend::packet).anyMatch(packet ->
+                                packet.kind() == PlayerRenderPoseProtocol.Kind.REMOVE
+                                        && packet.connectionToken().equals(replacementToken)
+                                        && packet.playerId().equals(fixture.player.getUniqueID())),
+                        "old viewer retirement cannot remove the replacement realm's cache entry");
+            } finally {
+                tracker.stop();
+                if (nativeMembership != null) nativeMembership.close();
+                reusedChannel.finishAndReleaseAll();
+            }
+        }
+    }
+
+    @Test void freePoseLeaseRevocationFencesAReportFromThePriorRemoteModePermit(@TempDir Path directory) {
+        try (var fixture = new Fixture(directory, true, true)) {
+            EntityPlayerMP viewer = fixture.world.serverPlayer(new UUID(0, 9725));
+            EmbeddedChannel viewerChannel = new EmbeddedChannel(viewer.connection.netManager);
+            ArrayList<RenderSend> sends = new ArrayList<>();
+            var tracker = new PlayerRenderPoseTracker(fixture.physics, fixture.intent, fixture.remote,
+                    (recipient, packet) -> sends.add(new RenderSend(recipient, packet)));
+            NativeObserverMembership nativeMembership = null;
+            try {
+                assertTrue(fixture.world.world().spawnEntity(fixture.player));
+                assertTrue(fixture.world.world().spawnEntity(viewer));
+                nativeMembership = prepareNativeObserverMembership(fixture, viewer, fixture.player);
+
+                registerRenderPoseConnection(tracker, fixture.player);
+                registerRenderPoseConnection(tracker, viewer);
+                UUID ownerToken = UUID.randomUUID();
+                UUID viewerToken = UUID.randomUUID();
+                tracker.receive(PlayerRenderPoseProtocol.Packet.hello(ownerToken, 1), fixture.player.connection);
+                tracker.receive(PlayerRenderPoseProtocol.Packet.hello(viewerToken, 1), viewer.connection);
+                var viewerWelcome = sends.stream().map(RenderSend::packet)
+                        .filter(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.WELCOME
+                                && packet.connectionToken().equals(viewerToken))
+                        .findFirst().orElseThrow();
+                var firstLease = sends.stream().map(RenderSend::packet)
+                        .filter(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.FREE_LEASE
+                                && packet.connectionToken().equals(ownerToken) && packet.lifetime() > 0)
+                        .findFirst().orElseThrow(() -> new AssertionError(
+                                "active personal G and actual remote custody issue the first lease"));
+                var priorGReport = PlayerRenderPoseProtocol.Packet.freePose(ownerToken, firstLease.viewerRealm(),
+                        firstLease.dimension(), firstLease.worldEpoch(), firstLease.lifetime(), 1,
+                        new PlayerRenderPoseProtocol.Quaternion(0, 0, 0, 1),
+                        new PlayerRenderPoseProtocol.Quaternion(0, 0, 0, 1));
+                tracker.receive(priorGReport, fixture.player.connection);
+
+                fixture.remote.receive(BoostProtocol.modeRequest(fixture.nonce, fixture.epoch, 2,
+                        fixture.player.dimension, false), fixture.player.connection);
+                fixture.world.world().setTotalWorldTime(fixture.world.world().getTotalWorldTime() + 1);
+                tracker.reconcileWorld(fixture.world.world());
+                assertTrue(sends.stream().map(RenderSend::packet).anyMatch(packet ->
+                                packet.kind() == PlayerRenderPoseProtocol.Kind.FREE_LEASE
+                                        && packet.connectionToken().equals(ownerToken) && packet.lifetime() == 0),
+                        "the live remote G mode revocation clears the active FREE lease");
+
+                fixture.remote.receive(BoostProtocol.modeRequest(fixture.nonce, fixture.epoch, 3,
+                        fixture.player.dimension, true), fixture.player.connection);
+                fixture.world.world().setTotalWorldTime(fixture.world.world().getTotalWorldTime() + 1);
+                tracker.reconcileWorld(fixture.world.world());
+                var currentLease = sends.stream().map(RenderSend::packet)
+                        .filter(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.FREE_LEASE
+                                && packet.connectionToken().equals(ownerToken) && packet.lifetime() > 0)
+                        .reduce((first, second) -> second).orElseThrow();
+                assertEquals(firstLease.viewerRealm(), currentLease.viewerRealm(),
+                        "changing G permission keeps the same client-world realm");
+                assertTrue(currentLease.lifetime() > firstLease.lifetime(),
+                        "a restored permit receives a new server-issued report lifetime");
+                int beforeOldEpochReport = sends.size();
+                tracker.receive(priorGReport, fixture.player.connection);
+                fixture.world.world().setTotalWorldTime(fixture.world.world().getTotalWorldTime() + 1);
+                tracker.reconcileWorld(fixture.world.world());
+                assertFalse(sends.subList(beforeOldEpochReport, sends.size()).stream().map(RenderSend::packet)
+                                .anyMatch(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.POSE
+                                        && packet.connectionToken().equals(viewerToken)
+                                        && packet.mode() == PlayerRenderPoseProtocol.Mode.FREE),
+                        "a delayed report from the revoked G permit cannot restore a FREE pose");
+
+                tracker.receive(PlayerRenderPoseProtocol.Packet.freePose(ownerToken, currentLease.viewerRealm(),
+                        currentLease.dimension(), currentLease.worldEpoch(), currentLease.lifetime(), 1,
+                        new PlayerRenderPoseProtocol.Quaternion(0, 0, 0, 1),
+                        new PlayerRenderPoseProtocol.Quaternion(0, 0, 0, 1)), fixture.player.connection);
+                fixture.world.world().setTotalWorldTime(fixture.world.world().getTotalWorldTime() + 1);
+                int beforeResumedPresentation = sends.size();
+                tracker.reconcileWorld(fixture.world.world());
+                var resumedPresentation = sends.subList(beforeResumedPresentation, sends.size()).stream()
+                        .map(RenderSend::packet)
+                        .filter(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.POSE
+                                && packet.connectionToken().equals(viewerToken)
+                                && packet.playerId().equals(fixture.player.getUniqueID())
+                                && packet.entityId() == fixture.player.getEntityId()
+                                && packet.viewerRealm() == viewerWelcome.viewerRealm()
+                                && packet.dimension() == currentLease.dimension()
+                                && packet.worldEpoch() == currentLease.worldEpoch()
+                                && packet.mode() == PlayerRenderPoseProtocol.Mode.FREE
+                                && packet.lifetime() > 0
+                                && packet.sequence() > 0)
+                        .reduce((first, second) -> second)
+                        .orElseThrow(() -> new AssertionError(
+                                "the current lease resumes reports after the revoked report is fenced"));
+                long presentationLifetime = resumedPresentation.lifetime();
+
+                long firstHeartbeatTick = fixture.world.world().getTotalWorldTime();
+                for (int tick = 1; tick <= 45; tick++) {
+                    fixture.world.world().setTotalWorldTime(firstHeartbeatTick + tick);
+                    tracker.receive(PlayerRenderPoseProtocol.Packet.freePose(ownerToken, currentLease.viewerRealm(),
+                            currentLease.dimension(), currentLease.worldEpoch(), currentLease.lifetime(), tick + 1L,
+                            new PlayerRenderPoseProtocol.Quaternion(0, 0, 0, 1),
+                            new PlayerRenderPoseProtocol.Quaternion(0, 0, 0, 1)), fixture.player.connection);
+                    tracker.reconcileWorld(fixture.world.world());
+                }
+                var staticFreeHeartbeats = sends.stream().map(RenderSend::packet)
+                        .filter(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.POSE
+                                && packet.connectionToken().equals(viewerToken)
+                                && packet.playerId().equals(fixture.player.getUniqueID())
+                                && packet.mode() == PlayerRenderPoseProtocol.Mode.FREE
+                                && packet.lifetime() == presentationLifetime)
+                        .toList();
+                assertTrue(fixture.world.world().getTotalWorldTime() - firstHeartbeatTick > 40,
+                        "the unchanged free pose remains continuously refreshed beyond the mirror TTL");
+                assertTrue(staticFreeHeartbeats.size() >= 5,
+                        "a static FREE pose must receive bounded heartbeat updates before its client cache expires");
+                for (int index = 1; index < staticFreeHeartbeats.size(); index++) {
+                    assertTrue(staticFreeHeartbeats.get(index).sequence() > staticFreeHeartbeats.get(index - 1).sequence(),
+                            "each same-lifetime heartbeat advances the presentation sequence");
+                    assertEquals(presentationLifetime,
+                            staticFreeHeartbeats.get(index).lifetime(),
+                            "static FREE heartbeats preserve the current presentation lifetime");
+                }
+            } finally {
+                tracker.stop();
+                if (nativeMembership != null) nativeMembership.close();
+                viewerChannel.finishAndReleaseAll();
+            }
+        }
+    }
+
+    @Test void integratedGravityFieldFailureDoesNotBecomeFreePermissionOrStopOtherSubjects(@TempDir Path directory) {
+        var previousBinder = UnigravMod.entityBinder;
+        boolean previousCamera = UnigravConfig.sixDofCamera;
+        UnigravMod.entityBinder = new GravityEntityBinder();
+        UnigravConfig.sixDofCamera = true;
+        try (var fixture = new Fixture(directory, false, false, null, false);
+             var ownerBinding = UnigravMod.entityBinder.bind(fixture.player, GravityMode.REPLACE)) {
+            fixture.adoptOrdinary();
+            EntityPlayerMP observer = fixture.world.serverPlayer(new UUID(0, 9723));
+            observer.interactionManager.setGameType(GameType.CREATIVE);
+            try (var observerBinding = UnigravMod.entityBinder.bind(observer, GravityMode.REPLACE)) {
+                EmbeddedChannel observerChannel = new EmbeddedChannel(observer.connection.netManager);
+                try {
+                    assertTrue(fixture.world.world().spawnEntity(fixture.player));
+                    assertTrue(fixture.world.world().spawnEntity(observer));
+                    var connected = new FMLNetworkEvent.ServerConnectionFromClientEvent(observer.connection.netManager);
+                    var gRegistration = new FMLNetworkEvent.CustomPacketRegistrationEvent<>(observer.connection.netManager,
+                            Set.of(GIntentProtocol.CHANNEL, PlayerPhysicsProtocol.CHANNEL), "REGISTER",
+                            Side.SERVER, INetHandlerPlayServer.class);
+                    fixture.intent.onConnection(connected);
+                    fixture.intent.onRegistration(gRegistration);
+                    fixture.intent.onServerTick(new TickEvent.ServerTickEvent(TickEvent.Phase.START));
+                    var offer = fixture.gReplies.stream().filter(packet ->
+                            packet.key().playerId().equals(observer.getUniqueID())).findFirst().orElseThrow();
+                    fixture.intent.receive(new GIntentProtocol.Packet(GIntentProtocol.Kind.HELLO, offer.key(), 0,
+                            GIntentProtocol.State.UNKNOWN), observer.connection);
+                    fixture.intent.receive(new GIntentProtocol.Packet(GIntentProtocol.Kind.INTENT, offer.key(), 1,
+                            GIntentProtocol.State.ON), observer.connection);
+
+                    NativeObserverMembership nativeMembership = null;
+                    ArrayList<RenderSend> sends = new ArrayList<>();
+                    var tracker = new PlayerRenderPoseTracker(fixture.physics, fixture.intent, fixture.remote,
+                            (recipient, packet) -> sends.add(new RenderSend(recipient, packet)));
+                    var expectedFailure = new IllegalStateException("test gravity field failed");
+                    try (var field = GravityFields.get().registerContribution("test",
+                            "ugpose-failure-" + UUID.randomUUID(), (position, time) -> { throw expectedFailure; });
+                         var errors = new RenderPoseErrorCapture()) {
+                        try {
+                            nativeMembership = prepareNativeObserverMembership(fixture, observer, fixture.player);
+                            registerRenderPoseConnection(tracker, fixture.player);
+                            registerRenderPoseConnection(tracker, observer);
+                            tracker.receive(PlayerRenderPoseProtocol.Packet.hello(UUID.randomUUID(), 1), fixture.player.connection);
+                            UUID observerToken = UUID.randomUUID();
+                            tracker.receive(PlayerRenderPoseProtocol.Packet.hello(observerToken, 1), observer.connection);
+                            tracker.reconcileWorld(fixture.world.world());
+
+                            assertFalse(sends.stream().map(RenderSend::packet).anyMatch(packet ->
+                                            packet.kind() == PlayerRenderPoseProtocol.Kind.FREE_LEASE
+                                                    && packet.playerId().equals(fixture.player.getUniqueID())
+                                                    && packet.lifetime() > 0),
+                                    "an exception from natural-field evaluation cannot be treated as zero-G permission");
+                            assertTrue(sends.stream().map(RenderSend::packet).anyMatch(packet ->
+                                            packet.kind() == PlayerRenderPoseProtocol.Kind.FREE_LEASE
+                                                    && packet.playerId().equals(observer.getUniqueID())
+                                                    && packet.lifetime() > 0),
+                                    "one actor's field failure does not prevent a later eligible subject from receiving its lease");
+                            assertEquals(1, errors.events().size(), "persistent identical failure is diagnosed once at its subject boundary");
+                            var failureLog = errors.events().getFirst();
+                            assertSame(expectedFailure, failureLog.getThrown(), "the original field exception and stack are retained");
+                            assertTrue(failureLog.getMessage().getFormattedMessage().contains(fixture.player.getUniqueID().toString()));
+                            assertTrue(failureLog.getMessage().getFormattedMessage().contains("free-pose permission evaluation"));
+                        } finally {
+                            tracker.stop();
+                            if (nativeMembership != null) nativeMembership.close();
+                        }
+                    }
+                } finally {
+                    observerChannel.finishAndReleaseAll();
+                }
+            }
+        } finally {
+            UnigravMod.entityBinder = previousBinder;
+            UnigravConfig.sixDofCamera = previousCamera;
+        }
+    }
+
+    @Test void startTrackingPublicationFailureIsContainedToItsSubjectAndNextSubjectProceeds(@TempDir Path directory) {
+        var previousBinder = UnigravMod.entityBinder;
+        boolean previousCamera = UnigravConfig.sixDofCamera;
+        UnigravMod.entityBinder = new GravityEntityBinder();
+        UnigravConfig.sixDofCamera = false;
+        try (var fixture = new Fixture(directory, false, false, null, false);
+             var failedOwnerBinding = UnigravMod.entityBinder.bind(fixture.player, GravityMode.REPLACE)) {
+            EntityPlayerMP nextOwner = fixture.world.serverPlayer(new UUID(0, 9726));
+            EntityPlayerMP viewer = fixture.world.serverPlayer(new UUID(0, 9727));
+            try (var nextOwnerBinding = UnigravMod.entityBinder.bind(nextOwner, GravityMode.REPLACE)) {
+                var nativeWorld = fixture.world.world();
+                var entityTracker = nativeWorld.getEntityTracker();
+                var chunkMap = nativeWorld.getPlayerChunkMap();
+                entityTracker.setViewDistance(3);
+                chunkMap.setPlayerViewRadius(3);
+                for (int chunkX = -3; chunkX <= 3; chunkX++) {
+                    for (int chunkZ = -3; chunkZ <= 3; chunkZ++) {
+                        fixture.world.installColumn(chunkX, chunkZ);
+                    }
+                }
+                fixture.player.setPosition(8.5, 65, 8.5);
+                nextOwner.setPosition(8.5, 65, 8.5);
+                viewer.setPosition(8.5, 65, 8.5);
+                EmbeddedChannel nextOwnerChannel = new EmbeddedChannel(nextOwner.connection.netManager);
+                EmbeddedChannel viewerChannel = new EmbeddedChannel(viewer.connection.netManager);
+                boolean viewerInChunkMap = false;
+                try {
+                    assertTrue(nativeWorld.spawnEntity(fixture.player));
+                    assertTrue(nativeWorld.spawnEntity(nextOwner));
+                    assertTrue(nativeWorld.spawnEntity(viewer));
+
+                    chunkMap.addPlayer(viewer);
+                    viewerInChunkMap = true;
+                    Chunk watchedChunk = nativeWorld.getChunkProvider().getLoadedChunk(0, 0);
+                    assertNotNull(watchedChunk, "the fixture must install the watched chunk column");
+                    watchedChunk.setTerrainPopulated(true);
+                    watchedChunk.setLightPopulated(true);
+                    watchedChunk.onTick(true);
+                    var watchedEntry = chunkMap.getEntry(0, 0);
+                    assertNotNull(watchedEntry, "the real player chunk map must create the viewer's center entry");
+                    assertTrue(watchedEntry.sendToPlayers(), "the real loaded and populated chunk must be sent to its viewer");
+                    assertTrue(chunkMap.isPlayerWatchingChunk(viewer, 0, 0),
+                            "EntityTracker visibility requires an actual sent chunk watcher");
+
+                    entityTracker.track(fixture.player, 64, 1, true);
+                    entityTracker.track(nextOwner, 64, 1, true);
+                    entityTracker.updateVisibility(viewer);
+                    assertTrue(entityTracker.getTrackingPlayers(fixture.player).contains(viewer));
+                    assertTrue(entityTracker.getTrackingPlayers(nextOwner).contains(viewer));
+
+                    ArrayList<RenderSend> sends = new ArrayList<>();
+                    var expectedFailure = new IllegalStateException("render observer transport unavailable");
+                    AtomicBoolean failNextOwnerLease = new AtomicBoolean(true);
+                    var tracker = new PlayerRenderPoseTracker(fixture.physics, fixture.intent, fixture.remote,
+                            (recipient, packet) -> {
+                                if (recipient == fixture.player && packet.kind() == PlayerRenderPoseProtocol.Kind.FREE_LEASE
+                                        && packet.lifetime() > 0 && failNextOwnerLease.compareAndSet(true, false))
+                                    throw expectedFailure;
+                                sends.add(new RenderSend(recipient, packet));
+                            });
+                    try (var errors = new RenderPoseErrorCapture()) {
+                        try {
+                            registerRenderPoseConnection(tracker, fixture.player);
+                            registerRenderPoseConnection(tracker, nextOwner);
+                            registerRenderPoseConnection(tracker, viewer);
+                            UUID failedOwnerToken = UUID.randomUUID();
+                            tracker.receive(PlayerRenderPoseProtocol.Packet.hello(failedOwnerToken, 1), fixture.player.connection);
+                            UUID nextOwnerToken = UUID.randomUUID();
+                            UUID viewerToken = UUID.randomUUID();
+                            tracker.receive(PlayerRenderPoseProtocol.Packet.hello(nextOwnerToken, 1), nextOwner.connection);
+                            tracker.receive(PlayerRenderPoseProtocol.Packet.hello(viewerToken, 1), viewer.connection);
+
+                            UnigravConfig.sixDofCamera = true;
+                            assertDoesNotThrow(() -> tracker.onStartTracking(
+                                        new net.minecraftforge.event.entity.player.PlayerEvent.StartTracking(viewer, fixture.player)),
+                                    "one tracking publication failure must be contained at its subject boundary");
+
+                            tracker.onStartTracking(new net.minecraftforge.event.entity.player.PlayerEvent.StartTracking(viewer, nextOwner));
+                            assertTrue(sends.stream().map(RenderSend::packet).anyMatch(packet ->
+                                        packet.kind() == PlayerRenderPoseProtocol.Kind.FREE_LEASE
+                                                && packet.connectionToken().equals(nextOwnerToken)
+                                                && packet.playerId().equals(nextOwner.getUniqueID())
+                                                && packet.lifetime() > 0),
+                                    "a later real tracked subject still receives its independent eligible lease");
+
+                            tracker.onStartTracking(new net.minecraftforge.event.entity.player.PlayerEvent.StartTracking(viewer, fixture.player));
+                            var recoveredOwnerLease = sends.stream().map(RenderSend::packet)
+                                    .filter(packet -> packet.kind() == PlayerRenderPoseProtocol.Kind.FREE_LEASE
+                                            && packet.connectionToken().equals(failedOwnerToken)
+                                            && packet.playerId().equals(fixture.player.getUniqueID())
+                                            && packet.lifetime() > 0)
+                                    .reduce((first, second) -> second).orElseThrow();
+                            int beforeRecoveredReport = sends.size();
+                            tracker.receive(PlayerRenderPoseProtocol.Packet.freePose(failedOwnerToken,
+                                    recoveredOwnerLease.viewerRealm(), recoveredOwnerLease.dimension(),
+                                    recoveredOwnerLease.worldEpoch(), recoveredOwnerLease.lifetime(), 1,
+                                    new PlayerRenderPoseProtocol.Quaternion(0, 0, 0, 1),
+                                    new PlayerRenderPoseProtocol.Quaternion(0, 0, 0, 1)), fixture.player.connection);
+                            tracker.onStartTracking(new net.minecraftforge.event.entity.player.PlayerEvent.StartTracking(viewer, fixture.player));
+                            assertTrue(sends.subList(beforeRecoveredReport, sends.size()).stream().map(RenderSend::packet).anyMatch(packet ->
+                                            packet.kind() == PlayerRenderPoseProtocol.Kind.POSE
+                                                    && packet.connectionToken().equals(viewerToken)
+                                                    && packet.playerId().equals(fixture.player.getUniqueID())
+                                                    && packet.entityId() == fixture.player.getEntityId()
+                                                    && packet.dimension() == recoveredOwnerLease.dimension()
+                                                    && packet.worldEpoch() == recoveredOwnerLease.worldEpoch()
+                                                    && packet.mode() == PlayerRenderPoseProtocol.Mode.FREE
+                                                    && packet.lifetime() > 0
+                                                    && packet.sequence() > 0),
+                                    "the failed subject can renew its lease, submit a current report, and recover a real viewer pose");
+                            assertEquals(1, errors.events().size(), "the failed tracking subject has one authoritative diagnostic");
+                            var event = errors.events().getFirst();
+                            assertSame(expectedFailure, event.getThrown(), "the outbound failure and original stack are retained");
+                            assertTrue(event.getMessage().getFormattedMessage().contains("tracking-start presentation"));
+                            assertTrue(event.getMessage().getFormattedMessage().contains(fixture.player.getUniqueID().toString()));
+                        } finally {
+                            tracker.stop();
+                        }
+                    }
+                } finally {
+                    if (viewerInChunkMap) {
+                        entityTracker.removePlayerFromTrackers(viewer);
+                        chunkMap.removePlayer(viewer);
+                    }
+                    viewerChannel.finishAndReleaseAll();
+                    nextOwnerChannel.finishAndReleaseAll();
+                }
+            }
+        } finally {
+            UnigravMod.entityBinder = previousBinder;
+            UnigravConfig.sixDofCamera = previousCamera;
+        }
+    }
+
+    private static void registerRenderPoseConnection(PlayerRenderPoseTracker tracker, EntityPlayerMP player) {
+        tracker.onConnection(new FMLNetworkEvent.ServerConnectionFromClientEvent(player.connection.netManager));
+        tracker.onRegistration(new FMLNetworkEvent.CustomPacketRegistrationEvent<>(player.connection.netManager,
+                Set.of(PlayerRenderPoseProtocol.CHANNEL), "REGISTER", Side.SERVER, INetHandlerPlayServer.class));
+    }
+
+    private static NativeObserverMembership prepareNativeObserverMembership(Fixture fixture,
+                                                                             EntityPlayerMP viewer,
+                                                                             EntityPlayerMP... subjects) {
+        WorldServer world = fixture.world.world();
+        var entityTracker = world.getEntityTracker();
+        var chunkMap = world.getPlayerChunkMap();
+        entityTracker.setViewDistance(3);
+        chunkMap.setPlayerViewRadius(3);
+        for (int chunkX = viewer.chunkCoordX - 3; chunkX <= viewer.chunkCoordX + 3; chunkX++) {
+            for (int chunkZ = viewer.chunkCoordZ - 3; chunkZ <= viewer.chunkCoordZ + 3; chunkZ++) {
+                fixture.world.installColumn(chunkX, chunkZ);
+            }
+        }
+        for (EntityPlayerMP subject : subjects) {
+            fixture.world.installColumn(subject.chunkCoordX, subject.chunkCoordZ);
+        }
+
+        boolean viewerAdded = false;
+        try {
+            chunkMap.addPlayer(viewer);
+            viewerAdded = true;
+            Set<Long> preparedChunks = new HashSet<>();
+            for (EntityPlayerMP subject : subjects) {
+                int chunkX = subject.chunkCoordX;
+                int chunkZ = subject.chunkCoordZ;
+                long key = ChunkPos.asLong(chunkX, chunkZ);
+                if (preparedChunks.add(key)) {
+                    Chunk watchedChunk = world.getChunkProvider().getLoadedChunk(chunkX, chunkZ);
+                    assertNotNull(watchedChunk, "the observer fixture must install each tracked subject's real chunk");
+                    watchedChunk.setTerrainPopulated(true);
+                    watchedChunk.setLightPopulated(true);
+                    watchedChunk.onTick(true);
+                    var entry = chunkMap.getEntry(chunkX, chunkZ);
+                    assertNotNull(entry, "the real player chunk map must create the observer's subject entry");
+                    if (!entry.isSentToPlayers()) assertTrue(entry.sendToPlayers());
+                    assertTrue(entry.isSentToPlayers());
+                }
+                assertTrue(chunkMap.isPlayerWatchingChunk(viewer, chunkX, chunkZ),
+                        "the viewer must be an actual watcher of the subject's sent chunk");
+                entityTracker.track(subject, 64, 1, true);
+            }
+            entityTracker.updateVisibility(viewer);
+            for (EntityPlayerMP subject : subjects) {
+                assertTrue(entityTracker.getTrackingPlayers(subject).contains(viewer),
+                        "the observer must be a real member of each vanilla EntityTracker entry");
+            }
+            return new NativeObserverMembership(world, subjects, viewer);
+        } catch (RuntimeException | Error failure) {
+            if (viewerAdded) {
+                try {
+                    entityTracker.removePlayerFromTrackers(viewer);
+                    chunkMap.removePlayer(viewer);
+                } catch (RuntimeException | Error cleanup) {
+                    if (cleanup != failure) failure.addSuppressed(cleanup);
+                }
+            }
+            throw failure;
+        }
+    }
+
+    private static final class NativeObserverMembership implements AutoCloseable {
+        private final WorldServer world;
+        private final List<EntityPlayerMP> subjects;
+        private EntityPlayerMP viewer;
+
+        private NativeObserverMembership(WorldServer world, EntityPlayerMP[] subjects, EntityPlayerMP viewer) {
+            this.world = world;
+            this.subjects = List.of(subjects);
+            this.viewer = viewer;
+        }
+
+        private void detachViewer() {
+            if (viewer == null) return;
+            world.getEntityTracker().removePlayerFromTrackers(viewer);
+            world.getPlayerChunkMap().removePlayer(viewer);
+            viewer = null;
+        }
+
+        private void attachViewer(EntityPlayerMP replacement) {
+            if (viewer != null) throw new IllegalStateException("native observer must be detached before replacement");
+            world.getPlayerChunkMap().addPlayer(replacement);
+            viewer = replacement;
+            world.getEntityTracker().updateVisibility(replacement);
+            for (EntityPlayerMP subject : subjects) {
+                assertTrue(world.getPlayerChunkMap().isPlayerWatchingChunk(replacement,
+                                subject.chunkCoordX, subject.chunkCoordZ),
+                        "replacement viewer must resume watching the actual subject chunk");
+                assertTrue(world.getEntityTracker().getTrackingPlayers(subject).contains(replacement),
+                        "replacement viewer must join each real tracker entry");
+            }
+        }
+
+        @Override public void close() { detachViewer(); }
+    }
+
+    private record RenderSend(EntityPlayerMP recipient, PlayerRenderPoseProtocol.Packet packet) { }
+
+    @Test void presentationAdmissionRejectsNativeDelegation(@TempDir Path directory) {
+        try (var fixture = new Fixture(directory)) {
+            fixture.adoptOrdinary();
+            assertTrue(fixture.physics.presentationAccepted(fixture.player.connection).isPresent());
+            fixture.player.noClip = true;
+            assertTrue(fixture.physics.accepted(fixture.player.connection).isPresent(),
+                    "protocol custody remains distinct from render eligibility");
+            assertTrue(fixture.physics.presentationAccepted(fixture.player.connection).isEmpty(),
+                    "native-required actors must not receive a Cardinal presentation");
+        }
+    }
+
+    @Test void presentationAdmissionRejectsAcceptedGeometryDrift(@TempDir Path directory) {
+        try (var fixture = new Fixture(directory)) {
+            fixture.adoptOrdinary();
+            var accepted = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            fixture.player.setPosition(fixture.player.posX + 0.25, fixture.player.posY, fixture.player.posZ);
+            assertTrue(fixture.physics.accepted(fixture.player.connection).isPresent(),
+                    "the physical protocol snapshot is retained until its owner reconciles");
+            assertTrue(fixture.physics.presentationAccepted(fixture.player.connection).isEmpty(),
+                    "render admission must not publish stale accepted geometry");
+            assertFalse(PlayerPhysicsClientMirror.matchesAcceptedPresentationGeometry(fixture.player, accepted));
+        }
+    }
+
+    @Test void presentationAdmissionRejectsPendingCorrectionAndSameManagerHandlerAlias(@TempDir Path directory) {
+        try (var fixture = new Fixture(directory)) {
+            fixture.adoptOrdinary();
+            int teleportId = fixture.teleport(9, 65, 8);
+            assertTrue(fixture.physics.accepted(fixture.player.connection).isPresent(),
+                    "native correction does not discard the accepted protocol snapshot");
+            assertTrue(fixture.physics.presentationAccepted(fixture.player.connection).isEmpty(),
+                    "a pending native correction has no stable render presentation");
+            fixture.player.connection.processConfirmTeleport(new CPacketConfirmTeleport(teleportId));
+            fixture.physics.confirmNativeTeleport(fixture.player.connection, teleportId, true);
+            assertTrue(fixture.physics.presentationAccepted(fixture.player.connection).isPresent(),
+                    "a successfully reconciled native correction restores presentation eligibility");
+            var other = fixture.world.serverPlayer(new UUID(0, 1201));
+            var primary = fixture.player.connection;
+            var alias = new NetHandlerPlayServer(fixture.player.getServer(), primary.netManager, other);
+            primary.netManager.setNetHandler(primary);
+            try {
+                assertTrue(fixture.physics.presentationAccepted(alias).isEmpty(),
+                        "a different handler sharing the owner manager cannot borrow its presentation");
+                assertTrue(fixture.physics.presentationAccepted(primary).isPresent(),
+                        "the exact current handler retains the accepted presentation");
+            } finally {
+                primary.netManager.setNetHandler(primary);
+            }
+        }
+    }
 
     @ParameterizedTest
     @CsvSource({"0,false,true", "0.125,false,true", "0.25,false,true", "0.25,true,true",
@@ -94,7 +958,7 @@ class PlayerPhysicsServerIntegrationTest {
             var owned = fixture.adoptOrdinary();
             for (int tick = 0; tick < 25; tick++) {
                 fixture.input(owned, tick + 3, new PlayerPhysicsProtocol.Controls(new Vec3d(0, 0, 1),
-                        new Vec3d(0, 0, 1), false, false, sprint, false, 5));
+                        new Vec3d(0, 0, 1), false, false, sprint, false, 5, Math.sqrt(2.0)));
                 fixture.tick();
                 assertEquals(65 + gap, fixture.player.posY, 1e-9, "reach is not attraction or snapping");
                 assertFalse(fixture.player.onGround, "near-foot drive must not forge native ground contact");
@@ -416,6 +1280,322 @@ class PlayerPhysicsServerIntegrationTest {
     }
 
     @ParameterizedTest
+    @CsvSource({"0.6,0,false", "0.6,0,true", "0,1.8,false", "0,1.8,true",
+            "NaN,1.8,false", "NaN,1.8,true", "0.6,Infinity,false", "0.6,Infinity,true"})
+    void failedCorrectionDelegatesAndResumesAfterValidGeometryReturns(float invalidWidth, float invalidHeight,
+            boolean failedPublication, @TempDir Path directory) {
+        var previousBinder = UnigravMod.entityBinder;
+        UnigravMod.entityBinder = new GravityEntityBinder();
+        try (var fixture = new Fixture(directory);
+             var binding = UnigravMod.entityBinder.bind(fixture.player, GravityMode.REPLACE)) {
+            FloorWorldFields.onChunkLoad(new ChunkEvent.Load(fixture.world.world().getChunk(0, 0)));
+            fixture.adoptOrdinary();
+            var before = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            int id = fixture.teleport(12, 65, 8);
+            fixture.player.connection.processConfirmTeleport(new CPacketConfirmTeleport(id));
+            fixture.player.width = invalidWidth;
+            fixture.player.height = invalidHeight;
+            fixture.physicsReplies.clear();
+            fixture.failNative = failedPublication;
+            var failure = assertThrows(IllegalArgumentException.class,
+                    () -> fixture.physics.confirmNativeTeleport(fixture.player.connection, id, true));
+            fixture.failNative = false;
+            if (failedPublication) assertSame(fixture.sendFailure, failure.getSuppressed()[0]);
+            assertTrue(fixture.physics.owns(fixture.player), "failed correction retains custody and its budget");
+            assertFalse(fixture.physics.drivesMotion(fixture.player), "stale geometry cannot keep the movement writer");
+            if (!failedPublication) assertEquals(PlayerPhysicsProtocol.Kind.NATIVE, fixture.physicsReplies.getLast().kind());
+            assertTrue(fixture.physicsReplies.stream().noneMatch(packet -> packet.kind() == PlayerPhysicsProtocol.Kind.STATE));
+            assertEquals(12, fixture.player.posX, "recovery must not overwrite the native teleport");
+            resizeFields(fixture.player, .6F, 1.8F, 1.62F);
+            fixture.tick();
+            var offer = fixture.physicsReplies.getLast();
+            assertEquals(PlayerPhysicsProtocol.Kind.OFFER, offer.kind());
+            assertEquals(before.scope(), offer.scope());
+            fixture.physics.receive(apply(offer.scope(), offer.offerSequence(), 3), fixture.player.connection);
+            fixture.move(.05);
+            fixture.tick();
+            fixture.physics.receive(apply(offer.scope(), offer.offerSequence(), 4), fixture.player.connection);
+            fixture.move(.05);
+            assertTrue(fixture.physics.drivesMotion(fixture.player), "valid native completions resume the same owner");
+            var resumed = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            assertEquals(before.scope(), resumed.scope());
+            assertTrue(resumed.revision() > before.revision());
+            fixture.physics.confirmNativeTeleport(fixture.player.connection, id, true);
+            assertEquals(resumed, fixture.physics.accepted(fixture.player.connection).orElseThrow(), "old ACK cannot reanchor resumed custody");
+            fixture.tick();
+            assertTrue(fixture.player.posX > resumed.placement().transport().x(), "resumed writer actually advances");
+        } finally {
+            FloorWorldFields.clearAll();
+            UnigravMod.entityBinder = previousBinder;
+        }
+    }
+
+    @Test void unsupportedNonYNativeCorrectionRecoversWithoutUnexpectedFailure(@TempDir Path directory) {
+        var previousBinder = UnigravMod.entityBinder;
+        UnigravMod.entityBinder = new GravityEntityBinder();
+        try (var fixture = new Fixture(directory);
+             var binding = UnigravMod.entityBinder.bind(fixture.player, GravityMode.REPLACE);
+             var errors = new AckErrorCapture()) {
+            double half = (double) 1.8F / 2;
+            fixture.player.setPosition(8 + half, 65, 8.5);
+            var source = new BlockPos(8, 64, 8);
+            fixture.world.put(source, FloorBlocks.GRAVITY_FLOOR.getDefaultState()
+                    .withProperty(DirectionalFloorBlock.FACING, EnumFacing.UP));
+            fixture.world.put(new BlockPos(7, 65, 8), FloorBlocks.GRAVITY_FLOOR.getDefaultState()
+                    .withProperty(DirectionalFloorBlock.FACING, EnumFacing.EAST));
+            FloorWorldFields.onChunkLoad(new ChunkEvent.Load(fixture.world.world().getChunk(0, 0)));
+            fixture.adoptOrdinary();
+            fixture.world.put(source, FloorBlocks.GRAVITY_FLOOR.getDefaultState()
+                    .withProperty(DirectionalFloorBlock.FACING, EnumFacing.DOWN));
+            FloorWorldFields.onChunkLoad(new ChunkEvent.Load(fixture.world.world().getChunk(0, 0)));
+            fixture.tick();
+            var before = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            assertEquals(CardinalFrame.X_POS,
+                    ((PlayerBodyShape.Cardinal) before.placement().shape()).frame());
+
+            int id = fixture.teleport(12, 65, 8);
+            fixture.player.connection.processConfirmTeleport(new CPacketConfirmTeleport(id));
+            fixture.physicsReplies.clear();
+            RuntimeException confirmationFailure = null;
+            try {
+                fixture.physics.confirmNativeTeleport(fixture.player.connection, id, true);
+            } catch (RuntimeException failure) {
+                confirmationFailure = failure;
+            }
+            var recovered = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            var recoveryReplies = new ArrayList<>(fixture.physicsReplies);
+            double recoveredNativeX = fixture.player.posX;
+            boolean delegatedAfterRecovery = !fixture.physics.drivesMotion(fixture.player);
+            var recoveredErrorEvents = errors.events();
+            fixture.physicsReplies.clear();
+            fixture.tick();
+            var offer = fixture.physicsReplies.getLast();
+            fixture.physics.receive(apply(offer.scope(), offer.offerSequence(), 3), fixture.player.connection);
+            fixture.move(.05);
+            fixture.tick();
+            fixture.physics.receive(apply(offer.scope(), offer.offerSequence(), 4), fixture.player.connection);
+            fixture.move(.05);
+            var finalConfirmationFailure = confirmationFailure;
+
+            assertAll(
+                    () -> assertNull(finalConfirmationFailure,
+                            "an acknowledged correction unsupported by the current frame is an expected native recovery"),
+                    () -> assertTrue(recoveredErrorEvents.isEmpty(),
+                            "unsupported geometry is a known native handoff, not an unexpected ERROR"),
+                    () -> assertEquals(before, recovered, "recovery cannot publish a stale or invented accepted geometry"),
+                    () -> assertTrue(fixture.physics.owns(fixture.player), "recovery retains owner custody and budget"),
+                    () -> assertTrue(delegatedAfterRecovery,
+                            "native movement owns the actor until fresh completions and APPLY arrive"),
+                    () -> assertEquals(List.of(PlayerPhysicsProtocol.Kind.NATIVE),
+                            recoveryReplies.stream().map(packet -> packet.kind()).toList()),
+                    () -> assertTrue(recoveryReplies.stream().noneMatch(packet -> packet.kind() == PlayerPhysicsProtocol.Kind.STATE)),
+                    () -> assertEquals(12, recoveredNativeX, 0, "native endpoint is not overwritten by old accepted placement"),
+                    () -> assertTrue(fixture.physics.drivesMotion(fixture.player),
+                            "native completions plus fresh APPLY resume the retained owner"));
+        } finally {
+            FloorWorldFields.clearAll();
+            UnigravMod.entityBinder = previousBinder;
+        }
+    }
+
+    @Test void staleConfirmationCannotReanchorRespawnedOwner(@TempDir Path directory) {
+        try (var fixture = new Fixture(directory)) {
+            fixture.adoptOrdinary();
+            var old = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            int oldId = fixture.teleport(12, 65, 8);
+            fixture.player.connection.processConfirmTeleport(new CPacketConfirmTeleport(oldId));
+            fixture.physics.onRespawn(new PlayerEvent.PlayerRespawnEvent(fixture.player, false));
+            fixture.physicsReplies.clear();
+            fixture.adoptOrdinary();
+            var fresh = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            assertNotEquals(old.scope(), fresh.scope());
+            int freshId = fixture.teleport(14, 65, 8);
+            assertNotEquals(oldId, freshId);
+            fixture.physicsReplies.clear();
+            fixture.physics.confirmNativeTeleport(fixture.player.connection, oldId, true);
+            assertEquals(fresh, fixture.physics.accepted(fixture.player.connection).orElseThrow());
+            fixture.tick();
+            assertEquals(14, fixture.player.posX, "old ACK cannot clear the new native correction wait");
+            assertTrue(fixture.physicsReplies.isEmpty(), "no pre-correction STATE from an old lifetime");
+            fixture.player.connection.processConfirmTeleport(new CPacketConfirmTeleport(freshId));
+            fixture.physics.confirmNativeTeleport(fixture.player.connection, freshId, true);
+            var corrected = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            assertEquals(fresh.scope(), corrected.scope());
+            assertEquals(14, corrected.placement().transport().x());
+            assertTrue(corrected.revision() > fresh.revision());
+        }
+    }
+
+    @Test void retiredConnectionAckCannotClearReconnectedOwnersPendingCorrection(@TempDir Path directory) {
+        var previousBinder = UnigravMod.entityBinder;
+        UnigravMod.entityBinder = new GravityEntityBinder();
+        try (var fixture = new Fixture(directory)) {
+            fixture.adoptOrdinary();
+            var oldHandler = fixture.player.connection;
+            var oldSnapshot = fixture.physics.accepted(oldHandler).orElseThrow();
+            int oldId = fixture.teleport(12, 65, 8);
+            var logout = new PlayerEvent.PlayerLoggedOutEvent(fixture.player);
+            fixture.intent.onLogout(logout);
+            fixture.physics.onLogout(logout);
+            var disconnected = new FMLNetworkEvent.ServerDisconnectionFromClientEvent(oldHandler.netManager);
+            fixture.intent.onDisconnect(disconnected);
+            fixture.physics.onDisconnect(disconnected);
+
+            var reconnectedPlayer = fixture.world.serverPlayer(fixture.player.getUniqueID());
+            reconnectedPlayer.setPosition(8.5, 65, 8.5);
+            var newHandler = reconnectedPlayer.connection;
+            var newChannel = new EmbeddedChannel(newHandler.netManager);
+            try (var binding = UnigravMod.entityBinder.bind(reconnectedPlayer, GravityMode.REPLACE)) {
+                var connected = new FMLNetworkEvent.ServerConnectionFromClientEvent(newHandler.netManager);
+                var registered = new FMLNetworkEvent.CustomPacketRegistrationEvent<>(newHandler.netManager,
+                        Set.of(GIntentProtocol.CHANNEL, PlayerPhysicsProtocol.CHANNEL), "REGISTER", Side.SERVER,
+                        INetHandlerPlayServer.class);
+                fixture.intent.onConnection(connected);
+                fixture.physics.onConnection(connected);
+                fixture.intent.onRegistration(registered);
+                fixture.physics.onRegistration(registered);
+                fixture.gReplies.clear();
+                fixture.intent.onServerTick(new TickEvent.ServerTickEvent(TickEvent.Phase.START));
+                var newGOffer = fixture.gReplies.getLast();
+                fixture.intent.receive(new GIntentProtocol.Packet(GIntentProtocol.Kind.HELLO, newGOffer.key(), 0,
+                        GIntentProtocol.State.UNKNOWN), newHandler);
+                fixture.intent.receive(new GIntentProtocol.Packet(GIntentProtocol.Kind.INTENT, newGOffer.key(), 1,
+                        GIntentProtocol.State.OFF), newHandler);
+
+                fixture.physicsReplies.clear();
+                fixture.physics.onServerTick(new TickEvent.ServerTickEvent(TickEvent.Phase.START));
+                var offer = fixture.physicsReplies.getLast();
+                assertEquals(PlayerPhysicsProtocol.Kind.OFFER, offer.kind());
+                fixture.physics.receive(apply(offer.scope(), offer.offerSequence(), 1), newHandler);
+                move(fixture, reconnectedPlayer, newHandler, 0, 0, 0);
+                fixture.tick();
+                fixture.physics.receive(apply(offer.scope(), offer.offerSequence(), 2), newHandler);
+                move(fixture, reconnectedPlayer, newHandler, 0, 0, 0);
+                var newOwner = fixture.physics.accepted(newHandler).orElseThrow();
+                assertNotEquals(oldSnapshot.scope(), newOwner.scope());
+
+                newHandler.setPlayerLocation(14, 65, 8, 0, 0);
+                newChannel.runPendingTasks();
+                SPacketPlayerPosLook correction = null;
+                Object outbound;
+                while ((outbound = newChannel.readOutbound()) != null)
+                    if (outbound instanceof SPacketPlayerPosLook packet) correction = packet;
+                assertNotNull(correction, "new connection must issue a real vanilla correction");
+                int newId = correction.getTeleportId();
+                fixture.physics.observeNativeTeleport(newHandler, newId);
+                var beforeOldAck = fixture.physics.accepted(newHandler).orElseThrow();
+
+                oldHandler.processConfirmTeleport(new CPacketConfirmTeleport(oldId));
+                fixture.physics.confirmNativeTeleport(oldHandler, oldId, true);
+                fixture.physicsReplies.clear();
+                fixture.tick();
+
+                assertEquals(beforeOldAck, fixture.physics.accepted(newHandler).orElseThrow(),
+                        "a retired manager's ACK cannot clear or re-anchor the new connection's owner");
+                assertEquals(14, reconnectedPlayer.posX, 0, "the old ACK cannot overwrite the reconnected actor endpoint");
+                assertTrue(fixture.physicsReplies.isEmpty(), "the new scope remains fenced until its own ACK");
+
+                newHandler.processConfirmTeleport(new CPacketConfirmTeleport(newId));
+                fixture.physics.confirmNativeTeleport(newHandler, newId, true);
+                var corrected = fixture.physics.accepted(newHandler).orElseThrow();
+                assertEquals(beforeOldAck.scope(), corrected.scope());
+                assertTrue(corrected.revision() > beforeOldAck.revision());
+                assertEquals(14, corrected.placement().transport().x());
+            } finally {
+                newChannel.finishAndReleaseAll();
+            }
+        } finally {
+            UnigravMod.entityBinder = previousBinder;
+        }
+    }
+
+    @Test void dimensionRetirementAndNewScopeIgnoreTheOldTeleportAck(@TempDir Path directory) {
+        try (var fixture = new Fixture(directory)) {
+            fixture.adoptOrdinary();
+            var oldSnapshot = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            int oldId = fixture.teleport(12, 65, 8);
+
+            DimensionManager.initDimension(1);
+            var destination = DimensionManager.getWorld(1);
+            assertNotNull(destination, "the fixture must own an actual registered destination WorldServer");
+            var destinationChunk = new Chunk(destination, 0, 0);
+            destinationChunk.markLoaded(true);
+            destination.getChunkProvider().loadedChunks.put(ChunkPos.asLong(0, 0), destinationChunk);
+
+            fixture.player.world = destination;
+            fixture.player.dimension = destination.provider.getDimension();
+            fixture.player.setPosition(8.5, 65, 8.5);
+            var change = new PlayerEvent.PlayerChangedDimensionEvent(fixture.player, 0, 1);
+            fixture.intent.onDimensionChange(change);
+            fixture.physics.onDimensionChange(change);
+            fixture.intent.onServerTick(new TickEvent.ServerTickEvent(TickEvent.Phase.START));
+            fixture.gOffer = fixture.gReplies.getLast();
+            fixture.intent.receive(new GIntentProtocol.Packet(GIntentProtocol.Kind.HELLO, fixture.gOffer.key(), 0,
+                    GIntentProtocol.State.UNKNOWN), fixture.player.connection);
+            fixture.intent.receive(new GIntentProtocol.Packet(GIntentProtocol.Kind.INTENT, fixture.gOffer.key(), 1,
+                    GIntentProtocol.State.OFF), fixture.player.connection);
+            fixture.physicsReplies.clear();
+            fixture.tick();
+            var dimensionOffer = fixture.physicsReplies.getLast();
+            assertEquals(PlayerPhysicsProtocol.Kind.OFFER, dimensionOffer.kind());
+            assertEquals(1, dimensionOffer.scope().dimension());
+            assertNotEquals(oldSnapshot.scope(), dimensionOffer.scope());
+
+            var freshOwner = fixture.adoptOrdinary();
+            assertEquals(1, freshOwner.scope().dimension());
+            assertNotEquals(oldSnapshot.scope(), freshOwner.scope());
+            int freshId = fixture.teleport(14, 65, 8);
+            var beforeOldAck = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            fixture.physicsReplies.clear();
+            fixture.player.connection.processConfirmTeleport(new CPacketConfirmTeleport(oldId));
+            fixture.physics.confirmNativeTeleport(fixture.player.connection, oldId, false);
+            fixture.tick();
+
+            assertEquals(beforeOldAck, fixture.physics.accepted(fixture.player.connection).orElseThrow(),
+                    "an old dimension's ACK cannot clear or re-anchor the new scope's correction wait");
+            assertEquals(14, fixture.player.posX, 0, "the old ACK cannot overwrite the new native endpoint");
+            assertTrue(fixture.physicsReplies.isEmpty(), "no STATE may be emitted while the new ACK remains pending");
+
+            fixture.player.connection.processConfirmTeleport(new CPacketConfirmTeleport(freshId));
+            fixture.physics.confirmNativeTeleport(fixture.player.connection, freshId, true);
+            var corrected = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            assertEquals(beforeOldAck.scope(), corrected.scope());
+            assertTrue(corrected.revision() > beforeOldAck.revision());
+            assertEquals(14, corrected.placement().transport().x());
+        } finally {
+            WorldServer destination = DimensionManager.getWorld(1);
+            if (destination != null) DimensionManager.setWorld(1, null, destination.getMinecraftServer());
+        }
+    }
+
+    @Test void confirmedTeleportWithLoggedSwimmingHeightContinuesOwnedMotion(@TempDir Path directory) {
+        var previousBinder = UnigravMod.entityBinder;
+        UnigravMod.entityBinder = new GravityEntityBinder();
+        try (var fixture = new Fixture(directory);
+             var binding = UnigravMod.entityBinder.bind(fixture.player, GravityMode.REPLACE)) {
+            FloorWorldFields.onChunkLoad(new ChunkEvent.Load(fixture.world.world().getChunk(0, 0)));
+            fixture.adoptOrdinary();
+            var before = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            double mass = UnigravMod.entityBinder.bodyPhysicsOf(fixture.player).massKg();
+            fixture.physics.addImpulse(fixture.player, new Vec3(mass * 2, 0, 0));
+            fixture.player.height = 0.5999999642372131F;
+            int id = fixture.teleport(12, 65, 8);
+            fixture.player.connection.processConfirmTeleport(new CPacketConfirmTeleport(id));
+            assertDoesNotThrow(() -> fixture.physics.confirmNativeTeleport(fixture.player.connection, id, true));
+            var corrected = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            assertEquals(before.scope(), corrected.scope());
+            assertEquals((double) fixture.player.height, corrected.placement().shape().dimensions().height());
+            fixture.tick();
+            assertEquals(12.1, fixture.player.posX, 1e-6, "consumed ACK must not strand pending movement");
+            fixture.tick();
+            assertTrue(fixture.player.posX > 12.1, "the same lifetime must keep advancing without kill");
+        } finally {
+            FloorWorldFields.clearAll();
+            UnigravMod.entityBinder = previousBinder;
+        }
+    }
+
+    @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void nativeTeleportReanchorsSameOwnerAndPreservesQueuedImpulse(boolean failedPublication, @TempDir Path directory) {
         var previousBinder = UnigravMod.entityBinder;
@@ -454,6 +1634,72 @@ class PlayerPhysicsServerIntegrationTest {
         } finally {
             FloorWorldFields.clearAll();
             UnigravMod.entityBinder = previousBinder;
+        }
+    }
+
+    @Test void ackStatePublicationFailureLogsOneCompleteDiagnostic(@TempDir Path directory) {
+        try (var fixture = new Fixture(directory);
+             var errors = new AckErrorCapture()) {
+            fixture.adoptOrdinary();
+            int id = fixture.teleport(12, 65, 8);
+            fixture.player.connection.processConfirmTeleport(new CPacketConfirmTeleport(id));
+            fixture.failState = true;
+            var failure = assertThrows(IllegalStateException.class,
+                    () -> fixture.physics.confirmNativeTeleport(fixture.player.connection, id, true));
+            fixture.failState = false;
+
+            var corrected = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            var captured = errors.events();
+            assertEquals(12, corrected.placement().transport().x(),
+                    "STATE publication failure happens after the ACK was committed");
+            assertSame(fixture.sendFailure, failure);
+            assertEquals(1, captured.size(), "the ACK responsibility boundary logs exactly once");
+            if (captured.size() != 1) return;
+            var event = captured.getFirst();
+            String diagnostic = event.getMessage().getFormattedMessage();
+            assertAll(
+                    () -> assertSame(failure, event.getThrown(),
+                            "diagnostic keeps the exact publication exception and stack"),
+                    () -> assertEquals(0, failure.getSuppressed().length),
+                    () -> assertTrue(event.getThrownProxy().getStackTrace().length > 0),
+                    () -> assertTrue(diagnostic.contains("stage=publish STATE")),
+                    () -> assertTrue(diagnostic.contains("session=" + corrected.scope().sessionId())),
+                    () -> assertTrue(diagnostic.contains("scope=" + corrected.scope())),
+                    () -> assertTrue(diagnostic.contains("dimension=0")),
+                    () -> assertTrue(diagnostic.contains("teleportId=" + id)));
+        }
+    }
+
+    @Test void ackRecoveryPublicationDiagnosticIncludesSuppressedFailure(@TempDir Path directory) {
+        try (var fixture = new Fixture(directory);
+             var errors = new AckErrorCapture()) {
+            fixture.adoptOrdinary();
+            int id = fixture.teleport(12, 65, 8);
+            fixture.player.connection.processConfirmTeleport(new CPacketConfirmTeleport(id));
+            fixture.player.width = 0;
+            fixture.failNative = true;
+            var failure = assertThrows(IllegalArgumentException.class,
+                    () -> fixture.physics.confirmNativeTeleport(fixture.player.connection, id, true));
+            fixture.failNative = false;
+
+            var captured = errors.events();
+            assertEquals(1, captured.size(), "failed recovery publication is attached before one log");
+            if (captured.size() != 1) return;
+            var event = captured.getFirst();
+            String diagnostic = event.getMessage().getFormattedMessage();
+            assertAll(
+                    () -> assertSame(failure, event.getThrown()),
+                    () -> assertTrue(event.getThrownProxy().getStackTrace().length > 0),
+                    () -> assertTrue(diagnostic.contains("stage=observe geometry")),
+                    () -> assertTrue(diagnostic.contains("outboundStage=publish NATIVE")),
+                    () -> assertTrue(diagnostic.contains("scope=" + fixture.physics.accepted(fixture.player.connection)
+                            .orElseThrow().scope())),
+                    () -> assertSame(fixture.sendFailure, failure.getSuppressed()[0]),
+                    () -> assertSame(fixture.sendFailure, event.getThrown().getSuppressed()[0]),
+                    () -> assertEquals(1, event.getThrownProxy().getSuppressedProxies().length,
+                            "the immutable Log4j event is created after publication failure is attached"),
+                    () -> assertEquals(fixture.sendFailure.getClass().getName(),
+                            event.getThrownProxy().getSuppressedProxies()[0].getName()));
         }
     }
 
@@ -992,6 +2238,176 @@ class PlayerPhysicsServerIntegrationTest {
     }
 
     @ParameterizedTest
+    @CsvSource({"0,1,1", "37,1,1", "0,-1,-1", "37,-1,1"})
+    void keyboardDiagonalSneakMatchesNativeTravelFromFirstInput(float yaw, double forward, double strafe,
+                                                                @TempDir Path directory) {
+        GravityEntityBinder previousBinder = UnigravMod.entityBinder;
+        UnigravMod.entityBinder = new GravityEntityBinder();
+        try (var fixture = new Fixture(directory);
+             var binding = UnigravMod.entityBinder.bind(fixture.player, GravityMode.REPLACE)) {
+            fixture.player.setPosition(8.5, 67, 8.5);
+            for (int x = 6; x <= 10; x++) for (int z = 6; z <= 15; z++)
+                fixture.world.put(new BlockPos(x, 64, z), FloorBlocks.GRAVITY_FLOOR.getDefaultState());
+            FloorWorldFields.onChunkLoad(new ChunkEvent.Load(fixture.world.world().getChunk(0, 0)));
+            var nativePlayer = fixture.world.serverPlayer(new UUID(0, 997));
+            nativePlayer.setPosition(8.5, 67, 12.5);
+            nativePlayer.setNoGravity(false);
+            var owned = fixture.adoptOrdinary();
+
+            for (int tick = 0; tick < 10; tick++) {
+                fixture.input(owned, tick + 3, PlayerPhysicsInput.keyboard(yaw, 0, 0,
+                        new Vec3(0, 0, 1), false, false, false, false));
+                nativePlayer.travel(0, 0, 0);
+                fixture.tick();
+            }
+            assertTrue(fixture.player.onGround, "UG reference must be settled before keyboard comparison");
+            assertTrue(nativePlayer.onGround, "vanilla reference must be settled before keyboard comparison");
+
+            var acceptedBefore = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            long revision = acceptedBefore.revision();
+            var initialShape = (PlayerBodyShape.Cardinal) acceptedBefore.placement().shape();
+            var initialDimensions = initialShape.dimensions();
+            double ugStartX = fixture.player.posX, ugStartY = fixture.player.posY, ugStartZ = fixture.player.posZ;
+            double nativeStartX = nativePlayer.posX, nativeStartY = nativePlayer.posY, nativeStartZ = nativePlayer.posZ;
+            fixture.player.rotationYaw = yaw;
+            nativePlayer.rotationYaw = yaw;
+            nativePlayer.setSneaking(true);
+            for (int tick = 0; tick < 6; tick++) {
+                boolean jump = tick == 0;
+                if (jump) nativePlayer.jump();
+                var controls = PlayerPhysicsInput.keyboard(yaw, forward, strafe,
+                        new Vec3(0, 0, 1), jump, true, false, false);
+                fixture.input(owned, tick + 13, controls);
+
+                // Independent 1.12.2 input/travel order: MovementInputFromOptions applies sneak to each
+                // local axis, EntityLivingBase applies .98F, then Entity.moveRelative normalizes.
+                float vanillaStrafe = (float) strafe;
+                float vanillaForward = (float) forward;
+                vanillaStrafe = (float) (vanillaStrafe * 0.3D);
+                vanillaForward = (float) (vanillaForward * 0.3D);
+                vanillaStrafe *= 0.98F;
+                vanillaForward *= 0.98F;
+                nativePlayer.travel(vanillaStrafe, 0, vanillaForward);
+                fixture.tick();
+
+                var acceptedAfter = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+                assertEquals(nativePlayer.posX - nativeStartX, fixture.player.posX - ugStartX, 1e-7,
+                        "native X delta at sneak tick " + tick);
+                assertEquals(nativePlayer.posY - nativeStartY, fixture.player.posY - ugStartY, 1e-7,
+                        "native Y delta at sneak tick " + tick);
+                assertEquals(nativePlayer.posZ - nativeStartZ, fixture.player.posZ - ugStartZ, 1e-7,
+                        "native Z delta at sneak tick " + tick);
+                assertEquals(nativePlayer.motionX, fixture.player.motionX, 1e-8,
+                        "native motion X at sneak tick " + tick);
+                assertEquals(nativePlayer.motionY, fixture.player.motionY, 1e-8,
+                        "native motion Y at sneak tick " + tick);
+                assertEquals(nativePlayer.motionZ, fixture.player.motionZ, 1e-8,
+                        "native motion Z at sneak tick " + tick);
+                assertEquals(revision + 1, acceptedAfter.revision(), "one accepted movement revision at sneak tick " + tick);
+                revision = acceptedAfter.revision();
+                var currentShape = (PlayerBodyShape.Cardinal) acceptedAfter.placement().shape();
+                assertEquals(initialShape.frame(), currentShape.frame(), "sneak input keeps the physical frame");
+                assertEquals(initialDimensions.width(), currentShape.dimensions().width(), 0,
+                        "the headless input path does not change collider width");
+                assertEquals(initialDimensions.height(), currentShape.dimensions().height(), 0,
+                        "the headless input path does not run a collider resize");
+                assertEquals((double) nativePlayer.getEyeHeight(), currentShape.dimensions().eyeHeight(), 1e-7,
+                        "captured eye height follows the native sneaking getter");
+            }
+        } finally {
+            FloorWorldFields.clearAll();
+            UnigravMod.entityBinder = previousBinder;
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"0,1,1", "37,1,1", "0,-1,-1", "37,-1,1"})
+    void keyboardDiagonalSneakToggleMatchesNativeTravel(float yaw, double forward, double strafe,
+                                                        @TempDir Path directory) {
+        GravityEntityBinder previousBinder = UnigravMod.entityBinder;
+        UnigravMod.entityBinder = new GravityEntityBinder();
+        try (var fixture = new Fixture(directory);
+             var binding = UnigravMod.entityBinder.bind(fixture.player, GravityMode.REPLACE)) {
+            fixture.player.setPosition(8.5, 67, 8.5);
+            for (int x = 6; x <= 10; x++) for (int z = 6; z <= 15; z++)
+                fixture.world.put(new BlockPos(x, 64, z), FloorBlocks.GRAVITY_FLOOR.getDefaultState());
+            FloorWorldFields.onChunkLoad(new ChunkEvent.Load(fixture.world.world().getChunk(0, 0)));
+            var nativePlayer = fixture.world.serverPlayer(new UUID(0, 998));
+            nativePlayer.setPosition(8.5, 67, 12.5);
+            nativePlayer.setNoGravity(false);
+            var owned = fixture.adoptOrdinary();
+
+            for (int tick = 0; tick < 10; tick++) {
+                fixture.input(owned, tick + 3, PlayerPhysicsInput.keyboard(yaw, 0, 0,
+                        new Vec3(0, 0, 1), false, false, false, false));
+                nativePlayer.travel(0, 0, 0);
+                fixture.tick();
+            }
+            assertTrue(fixture.player.onGround, "UG reference must be settled before keyboard comparison");
+            assertTrue(nativePlayer.onGround, "vanilla reference must be settled before keyboard comparison");
+
+            var settled = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            long revision = settled.revision();
+            var initialShape = (PlayerBodyShape.Cardinal) settled.placement().shape();
+            var initialDimensions = initialShape.dimensions();
+            double ugStartX = fixture.player.posX, ugStartY = fixture.player.posY, ugStartZ = fixture.player.posZ;
+            double nativeStartX = nativePlayer.posX, nativeStartY = nativePlayer.posY, nativeStartZ = nativePlayer.posZ;
+            for (int tick = 0; tick < 18; tick++) {
+                int phase = tick / 6;
+                boolean sneak = phase == 1;
+                boolean jump = tick == 12;
+                fixture.player.rotationYaw = yaw;
+                nativePlayer.rotationYaw = yaw;
+                if (jump) nativePlayer.jump();
+                nativePlayer.setSneaking(sneak);
+                var controls = PlayerPhysicsInput.keyboard(yaw, forward, strafe,
+                        new Vec3(0, 0, 1), jump, sneak, false, false);
+                fixture.input(owned, tick + 13, controls);
+
+                // Independent 1.12.2 input/travel order: MovementInputFromOptions applies sneak to each
+                // local axis, EntityLivingBase applies .98F, then Entity.moveRelative normalizes.
+                float vanillaStrafe = (float) strafe;
+                float vanillaForward = (float) forward;
+                if (sneak) {
+                    vanillaStrafe = (float) (vanillaStrafe * 0.3D);
+                    vanillaForward = (float) (vanillaForward * 0.3D);
+                }
+                vanillaStrafe *= 0.98F;
+                vanillaForward *= 0.98F;
+                nativePlayer.travel(vanillaStrafe, 0, vanillaForward);
+                fixture.tick();
+
+                var acceptedAfter = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+                assertEquals(nativePlayer.posX - nativeStartX, fixture.player.posX - ugStartX, 1e-7,
+                        "native X delta at input tick " + tick);
+                assertEquals(nativePlayer.posY - nativeStartY, fixture.player.posY - ugStartY, 1e-7,
+                        "native Y delta at input tick " + tick);
+                assertEquals(nativePlayer.posZ - nativeStartZ, fixture.player.posZ - ugStartZ, 1e-7,
+                        "native Z delta at input tick " + tick);
+                assertEquals(nativePlayer.motionX, fixture.player.motionX, 1e-8,
+                        "native motion X at input tick " + tick);
+                assertEquals(nativePlayer.motionY, fixture.player.motionY, 1e-8,
+                        "native motion Y at input tick " + tick);
+                assertEquals(nativePlayer.motionZ, fixture.player.motionZ, 1e-8,
+                        "native motion Z at input tick " + tick);
+                assertEquals(revision + 1, acceptedAfter.revision(), "one accepted movement revision at input tick " + tick);
+                revision = acceptedAfter.revision();
+                var currentShape = (PlayerBodyShape.Cardinal) acceptedAfter.placement().shape();
+                assertEquals(initialShape.frame(), currentShape.frame(), "keyboard pose flags keep the physical frame");
+                assertEquals(initialDimensions.width(), currentShape.dimensions().width(), 0,
+                        "this headless input path does not change collider width");
+                assertEquals(initialDimensions.height(), currentShape.dimensions().height(), 0,
+                        "this headless input path does not run the native pose resize callback");
+                assertEquals((double) nativePlayer.getEyeHeight(), currentShape.dimensions().eyeHeight(), 1e-7,
+                        "captured eye height follows the current native sneak getter");
+            }
+        } finally {
+            FloorWorldFields.clearAll();
+            UnigravMod.entityBinder = previousBinder;
+        }
+    }
+
+    @ParameterizedTest
     @CsvSource({"false,false,false", "true,false,false", "false,true,false", "true,true,false", "false,false,true"})
     void creativeFlightRetainsNativeTravelWithoutGravityReference(boolean jump, boolean sneak, boolean sprint,
                                                                   @TempDir Path directory) {
@@ -1025,6 +2441,75 @@ class PlayerPhysicsServerIntegrationTest {
                 assertEquals(nativePlayer.motionY, fixture.player.motionY, 1e-8);
                 assertEquals(nativePlayer.motionZ, fixture.player.motionZ, 1e-8);
                 assertFalse(fixture.intent.observe(fixture.player).orElseThrow().active());
+            }
+        } finally {
+            FloorWorldFields.clearAll();
+            UnigravMod.entityBinder = previousBinder;
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"0,true,true", "37,true,false"})
+    void keyboardDiagonalCreativeFlightSneakMatchesNativeSpOrder(float yaw, boolean sneak, boolean jump,
+                                                                  @TempDir Path directory) {
+        GravityEntityBinder previousBinder = UnigravMod.entityBinder;
+        UnigravMod.entityBinder = new GravityEntityBinder();
+        try (var fixture = new Fixture(directory);
+             var binding = UnigravMod.entityBinder.bind(fixture.player, GravityMode.REPLACE)) {
+            fixture.player.interactionManager.setGameType(GameType.CREATIVE);
+            fixture.player.capabilities.isFlying = true;
+            fixture.player.setPosition(8.5, 67, 8.5);
+            FloorWorldFields.onChunkLoad(new ChunkEvent.Load(fixture.world.world().getChunk(0, 0)));
+            var nativePlayer = fixture.world.serverPlayer(new UUID(0, 999));
+            nativePlayer.interactionManager.setGameType(GameType.CREATIVE);
+            nativePlayer.capabilities.isFlying = true;
+            nativePlayer.setNoGravity(true);
+            nativePlayer.setPosition(8.5, 67, 12.5);
+            var owned = fixture.adoptOrdinary();
+            fixture.player.rotationYaw = yaw;
+            nativePlayer.rotationYaw = yaw;
+            double ugStartX = fixture.player.posX, ugStartY = fixture.player.posY, ugStartZ = fixture.player.posZ;
+            double nativeStartX = nativePlayer.posX, nativeStartY = nativePlayer.posY, nativeStartZ = nativePlayer.posZ;
+            long revision = fixture.physics.accepted(fixture.player.connection).orElseThrow().revision();
+
+            for (int tick = 0; tick < 5; tick++) {
+                boolean jumpThisTick = jump && tick == 0;
+                var controls = PlayerPhysicsInput.keyboard(yaw, 1, 1, new Vec3(0, 0, 1),
+                        jumpThisTick, sneak, false, false);
+                fixture.input(owned, tick + 3, controls);
+
+                // Headless native server reference follows the patched SP order: key sampling applies
+                // sneak *.3, creative SP restores / .3 and adds vertical flySpeed * 3, then living *.98.
+                float vanillaStrafe = 1.0F;
+                float vanillaForward = 1.0F;
+                if (sneak) {
+                    vanillaStrafe = (float) (vanillaStrafe * 0.3D);
+                    vanillaForward = (float) (vanillaForward * 0.3D);
+                    vanillaStrafe = (float) (vanillaStrafe / 0.3D);
+                    vanillaForward = (float) (vanillaForward / 0.3D);
+                    nativePlayer.motionY -= nativePlayer.capabilities.getFlySpeed() * 3.0F;
+                }
+                if (jumpThisTick) nativePlayer.motionY += nativePlayer.capabilities.getFlySpeed() * 3.0F;
+                vanillaStrafe *= 0.98F;
+                vanillaForward *= 0.98F;
+                nativePlayer.setSneaking(sneak);
+                nativePlayer.travel(vanillaStrafe, 0, vanillaForward);
+                fixture.tick();
+
+                assertEquals(nativePlayer.posX - nativeStartX, fixture.player.posX - ugStartX, 1e-7,
+                        "native creative-flight X delta at tick " + tick);
+                assertEquals(nativePlayer.posY - nativeStartY, fixture.player.posY - ugStartY, 1e-7,
+                        "native creative-flight Y delta at tick " + tick);
+                assertEquals(nativePlayer.posZ - nativeStartZ, fixture.player.posZ - ugStartZ, 1e-7,
+                        "native creative-flight Z delta at tick " + tick);
+                assertEquals(nativePlayer.motionX, fixture.player.motionX, 1e-8,
+                        "native creative-flight motion X at tick " + tick);
+                assertEquals(nativePlayer.motionY, fixture.player.motionY, 1e-8,
+                        "native creative-flight motion Y at tick " + tick);
+                assertEquals(nativePlayer.motionZ, fixture.player.motionZ, 1e-8,
+                        "native creative-flight motion Z at tick " + tick);
+                var accepted = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+                assertEquals(++revision, accepted.revision(), "one accepted keyboard movement per flight tick");
             }
         } finally {
             FloorWorldFields.clearAll();
@@ -1104,6 +2589,242 @@ class PlayerPhysicsServerIntegrationTest {
             FloorWorldFields.clearAll();
             UnigravMod.entityBinder = previousBinder;
         }
+    }
+
+    @Test void aquaStyleGrowthMoveDoesNotStrandOwnedMotion(@TempDir Path directory) {
+        var previousBinder = UnigravMod.entityBinder;
+        UnigravMod.entityBinder = new GravityEntityBinder();
+        try (var fixture = new Fixture(directory);
+             var binding = UnigravMod.entityBinder.bind(fixture.player, GravityMode.REPLACE)) {
+            fixture.player.setPosition(8.5, 70, 8.5);
+            FloorWorldFields.onChunkLoad(new ChunkEvent.Load(fixture.world.world().getChunk(0, 0)));
+            fixture.adoptOrdinary();
+            fixture.physics.runNativePose(fixture.player, () -> resizeFields(fixture.player, .3F, .9F, .81F));
+            var small = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            fixture.physics.runNativePose(fixture.player, () -> {
+                // Actual Aqua 1.15.4 order: preserve min corner, grow the box, move using old
+                // width minus new width, then assign width/height after the move returns.
+                var old = fixture.player.getEntityBoundingBox();
+                fixture.player.setEntityBoundingBox(new AxisAlignedBB(old.minX, old.minY, old.minZ,
+                        old.minX + (double) .6F, old.minY + (double) 1.8F, old.minZ + (double) .6F));
+                double delta = (double) (.3F - .6F);
+                new CommonProxy(fixture.physics).runPoseMove(fixture.player, MoverType.SELF,
+                        new Vec3d(delta, 0, delta), bounded -> fixture.player.move(MoverType.SELF,
+                                bounded.x(), bounded.y(), bounded.z()));
+                fixture.player.width = .6F;
+                fixture.player.height = 1.8F;
+                fixture.player.eyeHeight = 1.62F;
+            });
+            var grown = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            assertEquals(new Vec3d(fixture.player.posX, fixture.player.posY, fixture.player.posZ),
+                    grown.placement().transport(), "real Aqua growth movement needs an owned completion");
+            assertEquals((double) .6F, grown.placement().shape().dimensions().width());
+            assertNotEquals(small.placement().transport(), grown.placement().transport(),
+                    "the native permitted growth movement must not be erased");
+            fixture.tick();
+            fixture.tick();
+            assertTrue(fixture.physics.accepted(fixture.player.connection).orElseThrow().revision() > grown.revision());
+        } finally {
+            FloorWorldFields.clearAll();
+            UnigravMod.entityBinder = previousBinder;
+        }
+    }
+
+    @Test void controlledResizeFailurePreservesCauseAndContinuesOwnedMotion(@TempDir Path directory) {
+        var previousBinder = UnigravMod.entityBinder;
+        UnigravMod.entityBinder = new GravityEntityBinder();
+        try (var fixture = new Fixture(directory);
+             var binding = UnigravMod.entityBinder.bind(fixture.player, GravityMode.REPLACE)) {
+            fixture.player.setPosition(8.5, 70, 8.5);
+            FloorWorldFields.onChunkLoad(new ChunkEvent.Load(fixture.world.world().getChunk(0, 0)));
+            fixture.adoptOrdinary();
+            var before = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            var cause = new IllegalStateException("resize callback failed after changing geometry");
+            var thrown = assertThrows(IllegalStateException.class, () -> fixture.physics.runNativePose(
+                    fixture.player, () -> {
+                        resizeFields(fixture.player, .3F, .9F, .81F);
+                        throw cause;
+                    }));
+            assertSame(cause, thrown);
+            var resized = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            assertEquals((double) .3F, resized.placement().shape().dimensions().width());
+            assertEquals((double) .9F, resized.placement().shape().dimensions().height());
+            assertEquals(before.scope(), resized.scope());
+            assertEquals(before.placement().physicalFeet(), resized.placement().physicalFeet());
+            fixture.tick();
+            fixture.tick();
+            assertTrue(fixture.physics.accepted(fixture.player.connection).orElseThrow().revision() > resized.revision());
+            assertTrue(fixture.physics.drivesMotion(fixture.player));
+        } finally {
+            FloorWorldFields.clearAll();
+            UnigravMod.entityBinder = previousBinder;
+        }
+    }
+
+    @Test void controlledResizeExpansionBlockedByCeilingRecoversWithoutKill(@TempDir Path directory) {
+        var previousBinder = UnigravMod.entityBinder;
+        UnigravMod.entityBinder = new GravityEntityBinder();
+        try (var fixture = new Fixture(directory);
+             var binding = UnigravMod.entityBinder.bind(fixture.player, GravityMode.REPLACE)) {
+            fixture.player.setPosition(8.5, 70, 8.5);
+            FloorWorldFields.onChunkLoad(new ChunkEvent.Load(fixture.world.world().getChunk(0, 0)));
+            fixture.adoptOrdinary();
+            var proxy = new CommonProxy(fixture.physics);
+            proxy.runNativePose(fixture.player, () -> resizeFields(fixture.player, .3F, .9F, .81F));
+            var small = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            fixture.world.put(new BlockPos(8, 71, 8), Blocks.STONE.getDefaultState());
+            proxy.runNativePose(fixture.player, () -> aquaGrow(fixture.physics, fixture.player));
+            assertEquals(.3F, fixture.player.width, "blocked expansion must retain a viable collider");
+            assertEquals(.9F, fixture.player.height);
+            assertEquals(small.placement().bounds().max().y(), fixture.player.getEntityBoundingBox().maxY);
+            fixture.tick();
+            assertTrue(fixture.physics.accepted(fixture.player.connection).orElseThrow().revision() > small.revision());
+            fixture.world.put(new BlockPos(8, 71, 8), Blocks.AIR.getDefaultState());
+            proxy.runNativePose(fixture.player, () -> aquaGrow(fixture.physics, fixture.player));
+            assertEquals(.6F, fixture.player.width);
+            assertEquals(1.8F, fixture.player.height);
+            fixture.tick();
+            fixture.tick();
+            assertEquals(small.scope(), fixture.physics.accepted(fixture.player.connection).orElseThrow().scope());
+            assertTrue(fixture.physics.drivesMotion(fixture.player));
+        } finally {
+            FloorWorldFields.clearAll();
+            UnigravMod.entityBinder = previousBinder;
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(CardinalFrame.class)
+    void heightOnlyControlledPoseKeepsPhysicalFeetInEveryFrame(CardinalFrame target, @TempDir Path directory) {
+        var previousBinder = UnigravMod.entityBinder;
+        UnigravMod.entityBinder = new GravityEntityBinder();
+        try (var fixture = new Fixture(directory);
+             var binding = UnigravMod.entityBinder.bind(fixture.player, GravityMode.REPLACE)) {
+            double h = (double) 1.8F / 2;
+            double x = target == CardinalFrame.X_POS ? 8 + h : target == CardinalFrame.X_NEG ? 8 - h : 8.5;
+            double z = target == CardinalFrame.Z_POS ? 8 + h : target == CardinalFrame.Z_NEG ? 8 - h : 8.5;
+            fixture.player.setPosition(x, 65, z);
+            var source = new BlockPos(x, 64, z);
+            fixture.world.put(source, FloorBlocks.GRAVITY_FLOOR.getDefaultState().withProperty(DirectionalFloorBlock.FACING, EnumFacing.UP));
+            BlockPos targetFloor = switch (target) {
+                case X_POS -> new BlockPos(7, 65, 8);
+                case X_NEG -> new BlockPos(8, 65, 8);
+                case Z_POS -> new BlockPos(8, 65, 7);
+                case Z_NEG -> new BlockPos(8, 65, 8);
+                case Y_NEG -> new BlockPos(8, 67, 8);
+                case Y_POS -> source;
+            };
+            if (target != CardinalFrame.Y_POS)
+                fixture.world.put(targetFloor, FloorBlocks.GRAVITY_FLOOR.getDefaultState()
+                        .withProperty(DirectionalFloorBlock.FACING, switch (target) {
+                            case X_POS -> EnumFacing.EAST;
+                            case X_NEG -> EnumFacing.WEST;
+                            case Z_POS -> EnumFacing.SOUTH;
+                            case Z_NEG -> EnumFacing.NORTH;
+                            case Y_NEG -> EnumFacing.DOWN;
+                            case Y_POS -> EnumFacing.UP;
+                        }));
+            FloorWorldFields.onChunkLoad(new ChunkEvent.Load(fixture.world.world().getChunk(0, 0)));
+            fixture.adoptOrdinary();
+            if (target != CardinalFrame.Y_POS) {
+                fixture.world.put(source, FloorBlocks.GRAVITY_FLOOR.getDefaultState().withProperty(DirectionalFloorBlock.FACING, EnumFacing.DOWN));
+                FloorWorldFields.onChunkLoad(new ChunkEvent.Load(fixture.world.world().getChunk(0, 0)));
+                fixture.tick();
+            }
+            var before = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            assertEquals(target, ((PlayerBodyShape.Cardinal) before.placement().shape()).frame(), "use a real standing-reference adoption");
+            var feet = before.placement().physicalFeet().orElseThrow();
+            new CommonProxy(fixture.physics).runNativePose(fixture.player,
+                    () -> resizeFields(fixture.player, .6F, 1.65F, 1.62F));
+            var after = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            assertEquals((double) 1.65F, after.placement().shape().dimensions().height());
+            assertEquals(feet, after.placement().physicalFeet().orElseThrow(), "pose height alone cannot translate the foot anchor");
+            assertEquals(before.scope(), after.scope());
+            assertEquals(before.revision() + 1, after.revision());
+            new CommonProxy(fixture.physics).runNativePose(fixture.player,
+                    () -> resizeFields(fixture.player, .3F, .9F, .81F));
+            var resized = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            assertEquals(feet, resized.placement().physicalFeet().orElseThrow(), "width and height shrink keep the accepted foot anchor");
+            assertEquals((double) .3F, resized.placement().shape().dimensions().width());
+            var smallFeet = resized.placement().physicalFeet().orElseThrow();
+            fixture.physics.runNativePose(fixture.player, () -> aquaGrow(fixture.physics, fixture.player));
+            var grown = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            assertEquals((double) .6F, grown.placement().shape().dimensions().width());
+            assertEquals((double) 1.8F, grown.placement().shape().dimensions().height());
+            double half = ((double) .6F - (double) .3F) / 2;
+            var expectedFeet = smallFeet.add(target.toWorld(new Vec3d(-half, 0, -half)));
+            var actualFeet = grown.placement().physicalFeet().orElseThrow();
+            assertEquals(expectedFeet.x(), actualFeet.x(), 1e-12);
+            assertEquals(expectedFeet.y(), actualFeet.y(), 1e-12);
+            assertEquals(expectedFeet.z(), actualFeet.z(), 1e-12);
+            assertEquals(resized.revision() + 1, grown.revision(), "one growth move installs one pose successor");
+            fixture.tick();
+            assertTrue(fixture.physics.accepted(fixture.player.connection).orElseThrow().revision() > grown.revision());
+        } finally {
+            FloorWorldFields.clearAll();
+            UnigravMod.entityBinder = previousBinder;
+        }
+    }
+
+    @Test void repeatedGrowthInOneTickCannotRefillMovementCredit(@TempDir Path directory) {
+        double oldLimit = UnigravConfig.maxEntitySpeed;
+        UnigravConfig.maxEntitySpeed = 1;
+        try (var fixture = new Fixture(directory)) {
+            fixture.player.setPosition(8.5, 70, 8.5);
+            fixture.adoptOrdinary();
+            Vec3d first = null;
+            var start = new Vec3d(fixture.player.posX, fixture.player.posY, fixture.player.posZ);
+            for (int cycle = 0; cycle < 3; cycle++) {
+                fixture.physics.runNativePose(fixture.player, () -> resizeFields(fixture.player, .3F, .9F, .81F));
+                fixture.physics.runNativePose(fixture.player, () -> aquaGrow(fixture.physics, fixture.player));
+                var after = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+                assertEquals((double) .6F, after.placement().shape().dimensions().width());
+                var point = after.placement().transport();
+                if (cycle == 0) {
+                    first = point;
+                    assertEquals(.05, Math.hypot(point.x() - start.x(), point.z() - start.z()), 1e-12);
+                } else {
+                    assertEquals(first.x(), point.x(), 1e-12, "pose count cannot grant another tick of movement");
+                    assertEquals(first.z(), point.z(), 1e-12);
+                }
+            }
+        } finally { UnigravConfig.maxEntitySpeed = oldLimit; }
+    }
+
+    @Test void nestedControlledResizeInstallsOneSuccessor(@TempDir Path directory) {
+        try (var fixture = new Fixture(directory)) {
+            fixture.adoptOrdinary();
+            var before = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            var proxy = new CommonProxy(fixture.physics);
+            proxy.runNativePose(fixture.player, () -> proxy.runNativePose(fixture.player,
+                    () -> resizeFields(fixture.player, .3F, .9F, .81F)));
+            var after = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            assertEquals(before.revision() + 1, after.revision());
+            assertEquals((double) .3F, after.placement().shape().dimensions().width());
+            assertEquals(before.placement().physicalFeet(), after.placement().physicalFeet());
+        }
+    }
+
+    private static void aquaGrow(PlayerPhysicsServer physics, EntityPlayerMP player) {
+        var box = player.getEntityBoundingBox();
+        double delta = (double) (player.width - .6F);
+        player.setEntityBoundingBox(new AxisAlignedBB(box.minX, box.minY, box.minZ,
+                box.minX + (double) .6F, box.minY + (double) 1.8F, box.minZ + (double) .6F));
+        new CommonProxy(physics).runPoseMove(player, MoverType.SELF, new Vec3d(delta, 0, delta),
+                bounded -> player.move(MoverType.SELF, bounded.x(), bounded.y(), bounded.z()));
+        player.width = .6F;
+        player.height = 1.8F;
+        player.eyeHeight = 1.62F;
+    }
+
+    private static void resizeFields(EntityPlayerMP player, float width, float height, float eye) {
+        // The actual Artemis callback writes fields and an upright box without setSize or movement.
+        player.width = width;
+        player.height = height;
+        player.eyeHeight = eye;
+        double radius = (double) width / 2;
+        player.setEntityBoundingBox(new AxisAlignedBB(player.posX - radius, player.posY, player.posZ - radius,
+                player.posX + radius, player.posY + height, player.posZ + radius));
     }
 
     @Test void alreadySneakingGliderCanHandOffNativeMovement(@TempDir Path directory) {
@@ -1287,19 +3008,24 @@ class PlayerPhysicsServerIntegrationTest {
              var binding = UnigravMod.entityBinder.bind(fixture.player, GravityMode.REPLACE)) {
             FloorWorldFields.onChunkLoad(new ChunkEvent.Load(fixture.world.world().getChunkProvider().loadedChunks.get(0L)));
             var owned = fixture.adoptRemote();
-            var boost = new PlayerPhysicsProtocol.Controls(new Vec3d(0, 0, 0), new Vec3d(0, 0, 1),
-                    false, false, false, true, 5);
+            var boost = new PlayerPhysicsProtocol.Controls(new Vec3d(1, 0, 0), new Vec3d(0, 0, 1),
+                    false, false, false, true, 5, Math.sqrt(2.0));
             for (long sequence = 3; sequence <= 12; sequence++) fixture.input(owned, sequence, boost);
             assertEquals(8, fixture.player.posZ, "packet count supplies no simulation time");
             fixture.tick();
             assertEquals(8.2, fixture.player.posZ, 1e-10);
+            assertEquals(8.02, fixture.player.posX, 1e-10, "bounded zero-G drift uses the normalized translation only");
             assertEquals(4, fixture.physics.accepted(fixture.player.connection).orElseThrow().worldVelocity().z(), 1e-10);
-            fixture.input(owned, 13, new PlayerPhysicsProtocol.Controls(new Vec3d(0, 0, 0), new Vec3d(0, 0, 1),
-                    false, false, false, false, 5));
+            assertEquals(0.4, fixture.physics.accepted(fixture.player.connection).orElseThrow().worldVelocity().x(), 1e-10,
+                    "keyboard travel gain does not amplify free drift");
+            fixture.input(owned, 13, new PlayerPhysicsProtocol.Controls(new Vec3d(1, 0, 0), new Vec3d(0, 0, 1),
+                    false, false, false, false, 5, Math.sqrt(2.0)));
             fixture.input(owned, 12, boost); // A replay cannot undo release.
             fixture.tick();
             assertEquals(8.4, fixture.player.posZ, 1e-10);
+            assertEquals(8.06, fixture.player.posX, 1e-10);
             assertEquals(4, fixture.physics.accepted(fixture.player.connection).orElseThrow().worldVelocity().z(), 1e-10);
+            assertEquals(0.8, fixture.physics.accepted(fixture.player.connection).orElseThrow().worldVelocity().x(), 1e-10);
             assertTrue(fixture.intent.observe(fixture.player).orElseThrow().active());
         } finally {
             FloorWorldFields.clearAll();
@@ -2199,6 +3925,55 @@ class PlayerPhysicsServerIntegrationTest {
         }
     }
 
+    @Test void aliasedHandlerCannotObserveOrConfirmTheOwnersTeleport(@TempDir Path directory) {
+        var previousBinder = UnigravMod.entityBinder;
+        UnigravMod.entityBinder = new GravityEntityBinder();
+        try (var fixture = new Fixture(directory);
+             var binding = UnigravMod.entityBinder.bind(fixture.player, GravityMode.REPLACE)) {
+            FloorWorldFields.onChunkLoad(new ChunkEvent.Load(fixture.world.world().getChunk(0, 0)));
+            fixture.adoptOrdinary();
+            var before = fixture.physics.accepted(fixture.player.connection).orElseThrow();
+            double mass = UnigravMod.entityBinder.bodyPhysicsOf(fixture.player).massKg();
+            fixture.physics.addImpulse(fixture.player, new Vec3(mass * 2, 0, 0));
+            int teleportId = fixture.teleport(12, 65, 8);
+            fixture.physicsReplies.clear();
+
+            var other = fixture.world.serverPlayer(new UUID(0, 1889));
+            var original = other.connection;
+            var primary = fixture.player.connection;
+            var alias = new NetHandlerPlayServer(fixture.player.getServer(), primary.netManager, other);
+            primary.netManager.setNetHandler(primary);
+            try {
+                primary.processConfirmTeleport(new CPacketConfirmTeleport(teleportId));
+                fixture.physics.confirmNativeTeleport(alias, teleportId, true);
+                var afterAliasConfirmation = fixture.physics.accepted(primary).orElseThrow();
+                var aliasReplies = new ArrayList<>(fixture.physicsReplies);
+
+                fixture.physics.confirmNativeTeleport(primary, teleportId, true);
+                var afterPrimaryConfirmation = fixture.physics.accepted(primary).orElseThrow();
+                fixture.physicsReplies.clear();
+                fixture.physics.observeNativeTeleport(alias, teleportId);
+                fixture.tick();
+                double xAfterAliasObservation = fixture.player.posX;
+
+                assertAll(
+                        () -> assertEquals(before, afterAliasConfirmation,
+                                "a same-manager alias cannot consume the owner's pending correction"),
+                        () -> assertTrue(aliasReplies.isEmpty(), "an alias cannot publish ACK-derived STATE"),
+                        () -> assertEquals(before.revision() + 1, afterPrimaryConfirmation.revision(),
+                                "the primary handler's consumed ACK re-anchors exactly once"),
+                        () -> assertEquals(12.1, xAfterAliasObservation, 1e-6,
+                                "a stale alias observation cannot re-arm the owner correction fence"));
+            } finally {
+                primary.netManager.setNetHandler(primary);
+                other.connection = original;
+            }
+        } finally {
+            FloorWorldFields.clearAll();
+            UnigravMod.entityBinder = previousBinder;
+        }
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void ownedWallAndCeilingUseTheCommittedCollisionSpeed(boolean ceiling, @TempDir Path directory) {
@@ -2269,6 +4044,70 @@ class PlayerPhysicsServerIntegrationTest {
                 Optional.empty(), Optional.empty(), Optional.empty());
     }
 
+    private static void move(Fixture fixture, EntityPlayerMP player, NetHandlerPlayServer handler,
+                            double x, double y, double z) {
+        fixture.router.runPacket(handler, () -> {
+            Vec3 start = new Vec3(player.posX, player.posY, player.posZ);
+            var incoming = new CPacketPlayer.Position(start.x() + x, start.y() + y, start.z() + z, false);
+            if (fixture.router.handleOwnedPacket(handler, incoming, false)) return;
+            var packet = fixture.router.begin(handler, incoming, start, false);
+            fixture.router.move(player, MoverType.PLAYER, packet.getX(start.x()) - start.x(),
+                    packet.getY(start.y()) - start.y(), packet.getZ(start.z()) - start.z());
+            fixture.router.assignEndpoint(player, player.posX, player.posY, player.posZ, 0, 0, false);
+            fixture.router.beforeTracking(false);
+        }, () -> false);
+    }
+
+    private static final class AckErrorCapture extends AbstractAppender implements AutoCloseable {
+        private final org.apache.logging.log4j.core.Logger logger;
+        private final List<LogEvent> events = new ArrayList<>();
+
+        private AckErrorCapture() {
+            super("ug-s2-ack-errors-" + UUID.randomUUID(), null, null, true, Property.EMPTY_ARRAY);
+            logger = (org.apache.logging.log4j.core.Logger) UnigravMod.LOGGER;
+            logger.addAppender(this);
+            start();
+        }
+
+        @Override public synchronized void append(LogEvent event) {
+            if (event.getLevel() == Level.ERROR
+                    && event.getMessage().getFormattedMessage().startsWith("ugmotion1 native correction failed:"))
+                events.add(event.toImmutable());
+        }
+
+        private synchronized List<LogEvent> events() { return List.copyOf(events); }
+
+        @Override public void close() {
+            logger.removeAppender(this);
+            stop();
+        }
+    }
+
+    private static final class RenderPoseErrorCapture extends AbstractAppender implements AutoCloseable {
+        private final org.apache.logging.log4j.core.Logger logger;
+        private final List<LogEvent> events = new ArrayList<>();
+
+        private RenderPoseErrorCapture() {
+            super("ugpose-errors-" + UUID.randomUUID(), null, null, true, Property.EMPTY_ARRAY);
+            logger = (org.apache.logging.log4j.core.Logger) UnigravMod.LOGGER;
+            logger.addAppender(this);
+            start();
+        }
+
+        @Override public synchronized void append(LogEvent event) {
+            if (event.getLevel() == Level.ERROR
+                    && event.getMessage().getFormattedMessage().startsWith("ugpose1 "))
+                events.add(event.toImmutable());
+        }
+
+        private synchronized List<LogEvent> events() { return List.copyOf(events); }
+
+        @Override public void close() {
+            logger.removeAppender(this);
+            stop();
+        }
+    }
+
     private static final class Fixture implements AutoCloseable {
         private final BootWorldFixture world;
         private final EntityPlayerMP player;
@@ -2291,9 +4130,11 @@ class PlayerPhysicsServerIntegrationTest {
         private final GIntentServer intent = new GIntentServer((actor, packet) -> gReplies.add(packet), remote);
         private boolean failOwned;
         private boolean failState;
+        private boolean failNative;
         private final PlayerPhysicsServer physics = new PlayerPhysicsServer(intent, (actor, packet) -> {
             if (failOwned && packet.kind() == PlayerPhysicsProtocol.Kind.OWNED) throw sendFailure;
             if (failState && packet.kind() == PlayerPhysicsProtocol.Kind.STATE) throw sendFailure;
+            if (failNative && packet.kind() == PlayerPhysicsProtocol.Kind.NATIVE) throw sendFailure;
             physicsReplies.add(packet);
         });
         private final PlayerMovementRouter router = new PlayerMovementRouter(remote, physics);
@@ -2317,8 +4158,13 @@ class PlayerPhysicsServerIntegrationTest {
         }
 
         private Fixture(Path directory, boolean remoteEnabled, boolean active, Consumer<EntityPlayerMP> afterJump) {
+            this(directory, remoteEnabled, active, afterJump, true);
+        }
+
+        private Fixture(Path directory, boolean remoteEnabled, boolean active,
+                        Consumer<EntityPlayerMP> afterJump, boolean dedicated) {
             this.remoteEnabled = remoteEnabled;
-            world = BootWorldFixture.open(directory, new UUID(0, 971), true);
+            world = BootWorldFixture.open(directory, new UUID(0, 971), dedicated);
             player = world.serverPlayer(new UUID(0, 972), afterJump);
             if (remoteEnabled) {
                 UnigravConfig.remoteCreativeBoost = true;

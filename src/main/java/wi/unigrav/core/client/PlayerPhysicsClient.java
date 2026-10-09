@@ -22,7 +22,10 @@ import wi.unigrav.core.player.PlayerPhysicsNetwork;
 import wi.unigrav.core.player.PlayerPhysicsProtocol;
 import wi.unigrav.core.player.PlayerPhysicalSnapshot;
 import wi.unigrav.core.player.PlayerKinematics;
+import wi.unigrav.core.player.PlayerBodyShape;
 import wi.unigrav.api.math.Vec3;
+
+import java.util.Optional;
 
 /** Client-thread physical negotiation and absolute state installation; OFFER/APPLY never install an owner. */
 public final class PlayerPhysicsClient {
@@ -122,6 +125,37 @@ public final class PlayerPhysicsClient {
 
     public static boolean drivesMotion(EntityPlayer actor) {
         return owns(actor) && INSTANCE.session.drivesMotion() && !PlayerKinematics.requiresNative(actor);
+    }
+
+    /** Current local cardinal mirror eligible for read-only model presentation; never installs state. */
+    public static Optional<PlayerPhysicalSnapshot> acceptedPresentation(EntityPlayer actor) {
+        Minecraft mc = Minecraft.getMinecraft();
+        if (!(actor instanceof EntityPlayerSP localPlayer) || actor != mc.player || !actor.isEntityAlive()
+                || actor.world != mc.world || PlayerKinematics.requiresNative(actor)
+                || !INSTANCE.targets(mc.getConnection(), localPlayer, mc.world) || INSTANCE.session == null) {
+            return Optional.empty();
+        }
+        var accepted = INSTANCE.session.presentationSnapshot();
+        if (accepted.isEmpty()) return Optional.empty();
+        PlayerPhysicalSnapshot snapshot = accepted.orElseThrow();
+        if (!snapshot.scope().playerId().equals(actor.getUniqueID())
+                || snapshot.scope().dimension() != actor.dimension
+                || !(snapshot.placement().shape() instanceof PlayerBodyShape.Cardinal)
+                || !PlayerPhysicsClientMirror.matchesAcceptedPresentationGeometry(actor, snapshot)) {
+            return Optional.empty();
+        }
+        return accepted;
+    }
+
+    public static float physicalEyeHeight(EntityPlayer actor, float nativeHeight) {
+        return drivesMotion(actor) ? INSTANCE.session.physicalEyeHeight(actor, nativeHeight) : nativeHeight;
+    }
+
+    public static void runNativePose(EntityPlayer actor, Runnable original) {
+        Minecraft mc = Minecraft.getMinecraft();
+        if (actor == mc.player && INSTANCE.targets(mc.getConnection(), mc.player, mc.world) && INSTANCE.session != null)
+            INSTANCE.session.runNativePose(actor, original);
+        else original.run();
     }
 
     public static void runLegacyMotion(EntityPlayer actor, Runnable original) {

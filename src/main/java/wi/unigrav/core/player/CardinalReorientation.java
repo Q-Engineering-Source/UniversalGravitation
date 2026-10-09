@@ -87,6 +87,9 @@ public final class CardinalReorientation {
                 || actor.isSpectator() || ((Entity) actor).isInWeb)
             return new Rejected(Reason.ACTOR_CHANGED, "native actor state forbids a physical reorientation");
         PlayerBodyShape.Dimensions dimensions = shape.dimensions();
+        if (!dimensions.supportsCapsule())
+            return new Rejected(Reason.UNSUPPORTED_SHAPE,
+                    "native cardinal dimensions cannot use the capsule rotation envelope");
         if (actor.width != dimensions.width() || actor.height != dimensions.height())
             return new Rejected(Reason.ACTOR_CHANGED, "native dimensions differ from the accepted shape");
         // Same canonical CHB comparison the collision entry guard uses, not a rebuilt nominal box.
@@ -271,7 +274,7 @@ public final class CardinalReorientation {
      * Read-only zero-gap contact probe in the selected frame, using the same strict native
      * query and the same rule as the movement tail: a nonzero gap is not support.
      */
-    private static Optional<Boolean> probeSupport(WorldServer world, EntityPlayerMP actor,
+    static Optional<Boolean> probeSupport(WorldServer world, EntityPlayerMP actor,
                                                   PlayerPhysicalSnapshot installed, CardinalFrame frame) {
         var request = new CardinalMovementResolver.Request(frame, actor.getEntityBoundingBox(),
                 frame.toWorld(new Vec3d(0, SUPPORT_PROBE_LOCAL_DELTA, 0)), MoverType.PLAYER, false, false, 0);

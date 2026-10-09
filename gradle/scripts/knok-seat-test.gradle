@@ -1,0 +1,68 @@
+import java.security.MessageDigest
+import java.util.zip.ZipFile
+import org.objectweb.asm.ClassReader
+import org.objectweb.asm.ClassWriter
+import org.objectweb.asm.commons.ClassRemapper
+import org.objectweb.asm.commons.Remapper
+
+buildscript { dependencies { classpath files(rootProject.buildscript.configurations.classpath) } }
+
+// Test only: execute the user's exact Seat bytecode against the mapped Minecraft world.
+// Only member names are remapped; no instruction, constructor or physics behavior is replaced.
+def jarPath = providers.gradleProperty('knok_test_jar')
+if (!jarPath.isPresent()) {
+    tasks.register('knokSeatTest') {
+        doLast { throw new GradleException('knokSeatTest requires -Pknok_test_jar=<actual KNK JAR>') }
+    }
+    return
+}
+def seatJar = file(jarPath.get())
+def mappings = file("${providers.environmentVariable('GRADLE_USER_HOME').getOrElse(System.getProperty('user.home') + '/.gradle')}/caches/minecraft/de/oceanlabs/mcp/mcp_stable/39/rfg_srgs/mcp-srg.srg")
+def mappedSeat = layout.buildDirectory.dir('test-knok-seat')
+def prepareSeat = tasks.register('prepareKnokSeatTest') {
+    inputs.files(seatJar, mappings)
+    inputs.file(file('gradle/scripts/knok-seat-test.gradle'))
+    outputs.dir(mappedSeat)
+    doLast {
+        String digest = MessageDigest.getInstance('SHA-256').digest(seatJar.bytes).encodeHex().toString().toUpperCase(Locale.ROOT)
+        if (digest != 'A5C409CD345A18EF3C6A89D1DF7234F59A771910BD2A5BA1905D50E303DCB1C3')
+            throw new GradleException("Unsupported KNK test artifact: ${digest}")
+        def methods = [:], fields = [:]
+        mappings.eachLine { line ->
+            def tokens = line.split(' ')
+            if (tokens[0] == 'MD:') methods[tokens[3].tokenize('/').last()] = tokens[1].tokenize('/').last()
+            if (tokens[0] == 'FD:') fields[tokens[2].tokenize('/').last()] = tokens[1].tokenize('/').last()
+        }
+        def names = new Remapper() {
+            @Override String mapMethodName(String owner, String name, String descriptor) { methods[name] ?: name }
+            @Override String mapFieldName(String owner, String name, String descriptor) { fields[name] ?: name }
+        }
+        new ZipFile(seatJar).withCloseable { zip ->
+            ['knok/entity/ISeat.class', 'knok/entity/ISeat$Seat.class'].each { name ->
+                def entry = zip.getEntry(name)
+                if (entry == null) throw new GradleException("Missing exact KNK seat class ${name}")
+                def writer = new ClassWriter(0)
+                zip.getInputStream(entry).withCloseable { new ClassReader(it).accept(new ClassRemapper(writer, names), 0) }
+                def output = mappedSeat.get().file(name).asFile
+                output.parentFile.mkdirs()
+                output.bytes = writer.toByteArray()
+            }
+        }
+        logger.lifecycle("Prepared actual KNK Seat test classes, source SHA-256 ${digest}")
+    }
+}
+sourceSets {
+    knokTest {
+        compileClasspath += sourceSets.test.compileClasspath + sourceSets.main.output + sourceSets.test.output + files(mappedSeat)
+        runtimeClasspath += compileClasspath + sourceSets.test.runtimeClasspath
+    }
+}
+configurations.knokTestImplementation.extendsFrom(configurations.testImplementation)
+configurations.knokTestRuntimeOnly.extendsFrom(configurations.testRuntimeOnly)
+tasks.named('compileKnokTestJava').configure { dependsOn prepareSeat, tasks.named('testClasses') }
+tasks.register('knokSeatTest', Test) {
+    dependsOn tasks.named('knokTestClasses')
+    useJUnitPlatform()
+    testClassesDirs = sourceSets.knokTest.output.classesDirs
+    classpath = sourceSets.knokTest.runtimeClasspath
+}

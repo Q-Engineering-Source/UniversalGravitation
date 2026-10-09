@@ -92,11 +92,11 @@ public record BodyPhysics(double massKg, double volumeM3) {
             new SpeciesPhysicsCatalog();
 
     public BodyPhysics {
-        if (massKg <= 0.0) {
-            throw new IllegalArgumentException("mass must be positive");
+        if (!Double.isFinite(massKg) || massKg <= 0.0) {
+            throw new IllegalArgumentException("mass must be finite and positive");
         }
-        if (volumeM3 < 0.0) {
-            throw new IllegalArgumentException("volume must be non-negative");
+        if (!Double.isFinite(volumeM3) || volumeM3 < 0.0) {
+            throw new IllegalArgumentException("volume must be finite and non-negative");
         }
     }
 
@@ -143,6 +143,8 @@ public record BodyPhysics(double massKg, double volumeM3) {
      * client-side label can differ slightly from the server's value).
      */
     public static BodyPhysics estimate(Entity entity) {
+        if (!canEstimate(entity)) throw new IllegalArgumentException("No formula mass for zero-size helper "
+                + entity.getClass().getName());
         double volume = entity.width * entity.width * entity.height * BOUNDING_BOX_FILL;
         double mass;
         if (entity instanceof EntitySheep && ((EntitySheep) entity).getSheared()) {
@@ -154,6 +156,17 @@ public record BodyPhysics(double massKg, double volumeM3) {
                     : volume * UnigravConfig.defaultBodyDensity;
         }
         return new BodyPhysics(mass, volume);
+    }
+
+    /** Zero-size helpers have no formula mass; a declared species mass remains authoritative. */
+    public static boolean canEstimate(Entity entity) {
+        if (!Float.isFinite(entity.width) || !Float.isFinite(entity.height)
+                || entity.width < 0 || entity.height < 0) {
+            throw new IllegalArgumentException("Invalid estimated body dimensions for "
+                    + entity.getClass().getName() + ": width=" + entity.width + ", height=" + entity.height);
+        }
+        return entity.width > 0 && entity.height > 0 || speciesPreset(entity) != null
+                || entity instanceof EntitySheep sheep && sheep.getSheared();
     }
 
     /**

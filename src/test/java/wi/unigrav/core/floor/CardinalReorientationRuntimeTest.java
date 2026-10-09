@@ -60,6 +60,31 @@ class CardinalReorientationRuntimeTest {
 
     @BeforeAll static void bootstrap() { Bootstrap.register(); }
 
+    @Test
+    void shortWideNativeShapeRejectsRotationWithoutChangingActorOrBudget(@TempDir Path directory) {
+        try (var fixture = BootWorldFixture.open(directory, new UUID(0, 10421), true)) {
+            var player = fixture.serverPlayer(new UUID(0, 10422));
+            player.width = .6F;
+            player.height = .5999999642372131F;
+            player.setPosition(8, 65, 8);
+            var dimensions = new PlayerBodyShape.Dimensions(player.width, player.height, player.getEyeHeight());
+            var shape = new PlayerBodyShape.Cardinal(CardinalFrame.Y_POS, dimensions);
+            var placement = PlayerBodyPlacement.fromTransport(new Vec3d(8, 65, 8), CardinalFrame.Y_POS.attitude(), shape);
+            var accepted = new PlayerPhysicalSnapshot(new PlayerPhysicalSnapshot.Scope(player.getUniqueID(),
+                    new UUID(0, 10423), player.dimension, 1), 1, placement, ZERO);
+            var budget = new BoostMovementBudget(70, 0, new Vec3(8, 65, 8));
+            var before = budget.snapshot();
+            var bounds = player.getEntityBoundingBox();
+            var result = CardinalReorientation.adopt(fixture.world(), player, accepted, CardinalFrame.X_POS, budget, 0);
+            var rejected = assertInstanceOf(CardinalReorientation.Rejected.class, result);
+            assertEquals(CardinalReorientation.Reason.UNSUPPORTED_SHAPE, rejected.reason());
+            assertEquals(before, budget.snapshot());
+            assertEquals(bounds, player.getEntityBoundingBox());
+            assertEquals(8, player.posX);
+            assertEquals(CardinalFrame.Y_POS, frame(accepted));
+        }
+    }
+
     @ParameterizedTest
     @EnumSource(value = CardinalFrame.class, names = {"Y_NEG", "X_POS", "X_NEG", "Z_POS", "Z_NEG"})
     void effectiveConstraintAdoptsTheTargetStandingFrame(CardinalFrame target, @TempDir Path directory) {
@@ -100,11 +125,17 @@ class CardinalReorientationRuntimeTest {
 
                 // The whole state moved together: bounds, transport mirror, frame and dimensions.
                 var placement = adopted.placement();
-                assertEquals(scene.center(), placement.center(), "a reorientation must not displace the body centre");
-                assertBounds(scene.expectedBounds(), placement.bounds(), target);
+                // The prior native-style tail carries gravity velocity into this movement tick.
+                // A side frame permits that Y component as tangent motion; rotation itself remains atomic.
+                double dy = target == CardinalFrame.Y_NEG ? 0 : retained.worldVelocity().y() * GravityEntityBinder.TICK_SECONDS;
+                assertEquals(scene.center().x(), placement.center().x(), EXACT);
+                assertEquals(scene.center().y() + dy, placement.center().y(), EXACT,
+                        "only the preceding tick's velocity may translate the adopted body");
+                assertEquals(scene.center().z(), placement.center().z(), EXACT);
+                assertBounds(scene.expectedBounds().offset(0, dy, 0), placement.bounds(), target);
                 assertEquals(scene.expectedTransport().x(), placement.transport().x(), EXACT,
                         "the native transport mirror must follow the new collider");
-                assertEquals(scene.expectedTransport().y(), placement.transport().y(), EXACT,
+                assertEquals(scene.expectedTransport().y() + dy, placement.transport().y(), EXACT,
                         "an X/Z frame's minimum Y is not the Y+ body's minimum Y");
                 assertEquals(scene.expectedTransport().z(), placement.transport().z(), EXACT,
                         "the native transport mirror must follow the new collider");
@@ -112,8 +143,8 @@ class CardinalReorientationRuntimeTest {
                         "width is frame independent");
                 assertEquals(player.height, placement.shape().dimensions().height(), EXACT,
                         "height is frame independent");
-                assertEquals(EnumFacing.UP, floorFacing(fixture, scene.sourceFloor()),
-                        "re-aiming the source floor must not move the body off its real support");
+                assertEquals(EnumFacing.DOWN, floorFacing(fixture, scene.sourceFloor()),
+                        "the source floor keeps the direction deliberately set before this tick");
             }
         } finally {
             FloorWorldFields.clearAll();
@@ -140,7 +171,8 @@ class CardinalReorientationRuntimeTest {
             double x = player.posX;
             double y = player.posY;
             double z = player.posZ;
-            var creditBefore = budget.snapshot().distanceCredit();
+                budget.advance(1);
+                var creditBefore = budget.snapshot().distanceCredit();
 
             try (var binding = binder.bind(player, GravityMode.REPLACE)) {
                 fixture.world().setTotalWorldTime(1);
@@ -294,30 +326,33 @@ class CardinalReorientationRuntimeTest {
                          Vec3d expectedTransport) {
 
         static Scene of(CardinalFrame target) {
+            double h = (double) 1.8F / 2;
+            double r = (double) .6F / 2;
+            double y = 65 + h;
             return switch (target) {
                 // Feet land on x = 8, the east face of the floor in column 7.
-                case X_POS -> scene(new Vec3d(8.9, 65.9, 8.5), new BlockPos(8, 64, 8), new BlockPos(7, 65, 8),
-                        EnumFacing.EAST, target, true, new Vec3d(8.0, 65.6, 8.2), new Vec3d(9.8, 66.2, 8.8));
+                case X_POS -> scene(new Vec3d(8 + h, y, 8.5), new BlockPos(8, 64, 8), new BlockPos(7, 65, 8),
+                        EnumFacing.EAST, target, true, new Vec3d(8, y - r, 8.5 - r), new Vec3d(8 + 2 * h, y + r, 8.5 + r));
                 // Feet land on x = 8, the west face of the floor in column 8.
-                case X_NEG -> scene(new Vec3d(7.1, 65.9, 8.5), new BlockPos(7, 64, 8), new BlockPos(8, 65, 8),
-                        EnumFacing.WEST, target, true, new Vec3d(6.2, 65.6, 8.2), new Vec3d(8.0, 66.2, 8.8));
+                case X_NEG -> scene(new Vec3d(8 - h, y, 8.5), new BlockPos(7, 64, 8), new BlockPos(8, 65, 8),
+                        EnumFacing.WEST, target, true, new Vec3d(8 - 2 * h, y - r, 8.5 - r), new Vec3d(8, y + r, 8.5 + r));
                 // Feet land on z = 8, the south face of the floor in column 7.
-                case Z_POS -> scene(new Vec3d(8.5, 65.9, 8.9), new BlockPos(8, 64, 8), new BlockPos(8, 65, 7),
-                        EnumFacing.SOUTH, target, true, new Vec3d(8.2, 65.6, 8.0), new Vec3d(8.8, 66.2, 9.8));
+                case Z_POS -> scene(new Vec3d(8.5, y, 8 + h), new BlockPos(8, 64, 8), new BlockPos(8, 65, 7),
+                        EnumFacing.SOUTH, target, true, new Vec3d(8.5 - r, y - r, 8), new Vec3d(8.5 + r, y + r, 8 + 2 * h));
                 // Feet land on z = 8, the north face of the floor in column 8.
-                case Z_NEG -> scene(new Vec3d(8.5, 65.9, 7.1), new BlockPos(8, 64, 7), new BlockPos(8, 65, 8),
-                        EnumFacing.NORTH, target, true, new Vec3d(8.2, 65.6, 6.2), new Vec3d(8.8, 66.2, 8.0));
+                case Z_NEG -> scene(new Vec3d(8.5, y, 8 - h), new BlockPos(8, 64, 7), new BlockPos(8, 65, 8),
+                        EnumFacing.NORTH, target, true, new Vec3d(8.5 - r, y - r, 8 - 2 * h), new Vec3d(8.5 + r, y + r, 8));
                 // An inverted body cannot rest on a floor and on its own stand at once, so its
                 // floor sits two blocks above the sweep envelope and the body falls up towards it.
-                case Y_NEG -> scene(new Vec3d(8.5, 65.9, 8.5), new BlockPos(8, 64, 8), new BlockPos(8, 67, 8),
-                        EnumFacing.DOWN, target, false, new Vec3d(8.2, 65.0, 8.2), new Vec3d(8.8, 66.8, 8.8));
+                case Y_NEG -> scene(new Vec3d(8.5, y, 8.5), new BlockPos(8, 64, 8), new BlockPos(8, 67, 8),
+                        EnumFacing.DOWN, target, false, new Vec3d(8.5 - r, 65, 8.5 - r), new Vec3d(8.5 + r, 65 + 2 * h, 8.5 + r));
                 case Y_POS -> throw new IllegalArgumentException("Y_POS is the accepted reference, not a target");
             };
         }
 
         /** The same two floors, but the body stands 0.4 m closer so the rotation would enter the target floor. */
         Scene blocked() {
-            return new Scene(new Vec3d(8.5, 65.9, 8.5), sourceFloor, targetFloor, targetFacing, target,
+            return new Scene(new Vec3d(8.5, center.y(), 8.5), sourceFloor, targetFloor, targetFacing, target,
                     grounded, expectedBounds, expectedTransport);
         }
 

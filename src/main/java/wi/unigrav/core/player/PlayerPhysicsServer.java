@@ -8,12 +8,16 @@ import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.UUID;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 
 import dev.crlhitbox.api.geometry.Vec3d;
+import dev.crlhitbox.api.geometry.Aabb;
 import net.minecraft.entity.Entity;
+import net.minecraft.entity.MoverType;
 import net.minecraft.entity.player.EntityPlayerMP;
 import net.minecraft.network.NetHandlerPlayServer;
 import net.minecraft.network.NetworkManager;
+import net.minecraft.util.math.AxisAlignedBB;
 import net.minecraft.world.WorldServer;
 import net.minecraftforge.common.DimensionManager;
 import net.minecraftforge.common.MinecraftForge;
@@ -42,6 +46,10 @@ public final class PlayerPhysicsServer {
     private static final PlayerPhysicsProtocol.Controls IDLE = new PlayerPhysicsProtocol.Controls(
             new Vec3d(0, 0, 0), new Vec3d(0, 0, 1), false, false, false, false, 5);
     private static final long INPUT_TIMEOUT_TICKS = 20;
+    private static final CollisionQueryFootprint.Limits POSE_SCAN =
+            new CollisionQueryFootprint.Limits(16384, 16, 4096, 4096);
+    private static final CardinalMovementResolver.Limits POSE_MOVE =
+            new CardinalMovementResolver.Limits(128, 8192, 65536);
     private final GIntentServer intent;
     private final BiConsumer<EntityPlayerMP, PlayerPhysicsProtocol.Packet> outbound;
     private final Map<NetworkManager, Capability> capabilities = new IdentityHashMap<>();
@@ -66,6 +74,21 @@ public final class PlayerPhysicsServer {
                 ? Optional.of(session.owner.snapshot) : Optional.empty();
     }
 
+    /** Read-only Cardinal render admission; never repairs geometry or changes protocol custody. */
+    public synchronized Optional<PlayerPhysicalSnapshot> presentationAccepted(NetHandlerPlayServer handler) {
+        if (handler == null) return Optional.empty();
+        if (!handler.player.getServerWorld().isCallingFromMinecraftThread())
+            throw new IllegalStateException("Physics presentation read off-thread");
+        Session session = sessions.get(handler.netManager);
+        if (session == null || session.handler != handler || session.player != handler.player
+                || !current(session) || session.pending != null || session.owner == null) return Optional.empty();
+        Owned owner = session.owner;
+        if (owner.nativeDelegated || owner.teleportPending || PlayerKinematics.requiresNative(session.player)
+                || !(owner.snapshot.placement().shape() instanceof PlayerBodyShape.Cardinal)
+                || !matchesAcceptedPlacement(session)) return Optional.empty();
+        return Optional.of(owner.snapshot);
+    }
+
     /** Protocol custody includes native delegation; use drivesMotion for competing movement writes. */
     public boolean owns(EntityPlayerMP player) {
         return player.connection != null && player.connection.player == player && accepted(player.connection).isPresent();
@@ -82,25 +105,231 @@ public final class PlayerPhysicsServer {
         if (!drivesMotion(player)) { original.run(); return; }
         Session session = sessions.get(player.connection.netManager);
         Owned owner = session.owner;
+        // Aqua's independent callback and Artemis's event can run inside updateSize.
+        // Only the outer controlled operation may install a successor.
+        if (owner.poseDepth > 0) { original.run(); return; }
         var previous = owner.snapshot;
         boolean anchored = !owner.teleportPending && matchesAcceptedPlacement(session);
         long correction = owner.travel.correctionRevision();
-        original.run();
+        long tick = session.world.getTotalWorldTime();
+        RuntimeException callbackFailure = null;
+        owner.poseContext = anchored ? new PoseContext(previous, correction, tick) : null;
+        owner.poseGrowth = null;
+        owner.poseDepth++;
+        try {
+            original.run();
+        } catch (RuntimeException failure) {
+            callbackFailure = failure;
+        } finally {
+            owner.poseDepth--;
+        }
+        try {
+            adoptNativePose(session, owner, previous, anchored, correction, tick);
+        } catch (RuntimeException recoveryFailure) {
+            if (callbackFailure == null) throw recoveryFailure;
+            if (recoveryFailure != callbackFailure) callbackFailure.addSuppressed(recoveryFailure);
+        } finally {
+            owner.poseContext = null;
+            owner.poseGrowth = null;
+        }
+        // Checked geometry already written by a failed callback must not strand the owner.
+        // Its original failure still reaches the authoritative caller with cleanup failures attached.
+        if (callbackFailure != null) throw callbackFailure;
+    }
+
+    private void adoptNativePose(Session session, Owned owner, PlayerPhysicalSnapshot previous,
+                                 boolean anchored, long correction, long tick) {
+        var player = session.player;
         // Callback relocation/ownership changes are handled by their own lifecycle, not this pose observer.
         if (!anchored || !current(session) || session.owner != owner || owner.snapshot != previous
                 || owner.teleportPending || owner.travel.correctionRevision() != correction
+                || session.world.getTotalWorldTime() != tick
                 || PlayerKinematics.requiresNative(player)) return;
         var actual = WorldCollisionCandidates.ActorGeometry.read(player);
-        if (!actual.position().equals(previous.placement().transport())) return;
+        var growth = owner.poseGrowth;
+        boolean completedGrowth = growth != null && actual.position().equals(growth.position())
+                && actual.bounds().equals(growth.bounds()) && actual.width() == growth.width()
+                && actual.height() == growth.height();
+        if (!actual.position().equals(previous.placement().transport()) && !completedGrowth) return;
         var shape = (PlayerBodyShape.Cardinal) previous.placement().shape();
-        if (shape.frame() != CardinalFrame.Y_POS) return;
         var dimensions = new PlayerBodyShape.Dimensions(actual.width(), actual.height(), player.getEyeHeight());
         if (dimensions.equals(shape.dimensions()) && actual.bounds().equals(previous.placement().bounds())) return;
-        var placement = PlayerBodyPlacement.fromCardinalBounds(actual.bounds(), actual.position(),
-                previous.placement().attitude(), new PlayerBodyShape.Cardinal(shape.frame(), dimensions));
-        // The feet/transport anchor did not move: no movement credit is consumed, refunded or rebased.
-        owner.snapshot = new PlayerPhysicalSnapshot(previous.scope(), Math.incrementExact(previous.revision()),
-                placement, previous.worldVelocity(), previous.contacts());
+        var placement = shape.frame() == CardinalFrame.Y_POS || completedGrowth
+                ? PlayerBodyPlacement.fromCardinalBounds(actual.bounds(), actual.position(),
+                        previous.placement().attitude(), new PlayerBodyShape.Cardinal(shape.frame(), dimensions))
+                : previous.placement().proposeDimensionsAtFeet(dimensions);
+        var captured = WorldCollisionCandidates.capture(session.world, player, placement.bounds(),
+                CollisionQueryFootprint.QueryPolicy.NATIVE_STRICT, POSE_SCAN);
+        if (!current(session) || session.owner != owner || owner.snapshot != previous || owner.teleportPending
+                || owner.travel.correctionRevision() != correction || session.world.getTotalWorldTime() != tick
+                || !actual.equals(WorldCollisionCandidates.ActorGeometry.read(player))) return;
+        // A mod may expand without a native collision test. Keep a viable accepted collider,
+        // and let its next controlled callback retry the desired size after space becomes free.
+        if (captured instanceof WorldCollisionCandidates.Unavailable
+                || !((WorldCollisionCandidates.Snapshot) captured).boxes().isEmpty()) {
+            var retained = new PlayerBodyShape.Dimensions(shape.dimensions().width(), shape.dimensions().height(),
+                    player.getEyeHeight());
+            placement = completedGrowth ? placement.proposeDimensionsAtFeet(retained)
+                    : PlayerBodyPlacement.fromCardinalBounds(previous.placement().bounds(),
+                    previous.placement().transport(), previous.placement().attitude(),
+                    new PlayerBodyShape.Cardinal(shape.frame(), retained));
+            owner.lastFailure = captured instanceof WorldCollisionCandidates.Unavailable failure
+                    ? "pose query " + failure.reason() + ": " + failure.detail() : "pose target occupied";
+        } else owner.lastFailure = null;
+        installPoseGeometry(player, placement);
+        var proposed = new PlayerPhysicalSnapshot(previous.scope(), Math.incrementExact(previous.revision()),
+                placement, previous.worldVelocity());
+        var support = CardinalReorientation.probeSupport(session.world, player, proposed, shape.frame());
+        if (!current(session) || session.owner != owner || owner.snapshot != previous || owner.teleportPending
+                || owner.travel.correctionRevision() != correction || session.world.getTotalWorldTime() != tick
+                || !WorldCollisionCandidates.ActorGeometry.read(player).position().equals(placement.transport())
+                || !WorldCollisionCandidates.ActorGeometry.read(player).bounds().equals(placement.bounds())) return;
+        // The foot anchor did not move. A side frame's changed minY is only a transport rebase.
+        if (!placement.transport().equals(previous.placement().transport())) {
+            var transport = placement.transport();
+            owner.budget.rebase(new Vec3(transport.x(), transport.y(), transport.z()), owner.budgetTick);
+        }
+        player.onGround = support.orElse(false);
+        owner.snapshot = new PlayerPhysicalSnapshot(previous.scope(), proposed.revision(), placement,
+                previous.worldVelocity(), Optional.of(new PlayerPhysicalSnapshot.Contacts(player.onGround,
+                false, false, player.fallDistance)));
+    }
+
+    private record PoseContext(PlayerPhysicalSnapshot snapshot, long correction, long tick) { }
+    private record PoseGrowth(Vec3d position, Aabb bounds, float width, float height) { }
+
+    /** Only the exact Aqua growth call site may reserve this movement inside an anchored pose callback. */
+    public synchronized void runPoseMove(EntityPlayerMP player, MoverType type, Vec3d delta, Consumer<Vec3d> original) {
+        Objects.requireNonNull(original, "original");
+        if (!drivesMotion(player)) { original.accept(delta); return; }
+        var session = sessions.get(player.connection.netManager);
+        var owner = session.owner;
+        var context = owner.poseContext;
+        if (context == null || owner.poseDepth == 0) { original.accept(delta); return; }
+        if (!poseContextCurrent(session, owner, context)) return;
+        if (owner.poseGrowth != null || owner.budget.snapshot().pending())
+            throw new IllegalStateException("Pose growth cannot open a second movement reservation");
+        var before = WorldCollisionCandidates.ActorGeometry.read(player);
+        var box = player.getEntityBoundingBox();
+        float width = (float) (box.maxX - box.minX);
+        float height = (float) (box.maxY - box.minY);
+        double expected = (double) (player.width - width);
+        if (type != MoverType.SELF || !(width > player.width) || delta.x() != expected
+                || delta.y() != 0 || delta.z() != expected
+                || box.maxX != box.minX + (double) width || box.maxY != box.minY + (double) height
+                || box.maxZ != box.minZ + (double) width)
+            throw new IllegalArgumentException("Unrecognized Aqua growth movement geometry");
+        var previous = context.snapshot();
+        var shape = (PlayerBodyShape.Cardinal) previous.placement().shape();
+        var dimensions = new PlayerBodyShape.Dimensions(width, height, player.getEyeHeight());
+        if (!poseContextCurrent(session, owner, context)
+                || !before.equals(WorldCollisionCandidates.ActorGeometry.read(player))) return;
+        var base = previous.placement().proposeDimensionsAtFeet(dimensions);
+        PlayerBodyPlacement candidate;
+        Vec3d worldDelta;
+        if (shape.frame() == CardinalFrame.Y_POS) {
+            var center = before.bounds().center();
+            candidate = PlayerBodyPlacement.fromCardinalBounds(before.bounds(),
+                    new Vec3d(center.x(), before.bounds().min().y(), center.z()), previous.placement().attitude(),
+                    new PlayerBodyShape.Cardinal(shape.frame(), dimensions));
+            worldDelta = delta;
+        } else {
+            // Aqua preserves the old upright min corner before moving. In a physical frame,
+            // the corresponding half-width offset and requested move are both local tangents.
+            double halfGrowth = ((double) width - before.width()) / 2;
+            var shift = shape.frame().toWorld(new Vec3d(halfGrowth, 0, halfGrowth));
+            var bounds = base.bounds();
+            var shifted = new Aabb(bounds.min().add(shift), bounds.max().add(shift));
+            candidate = PlayerBodyPlacement.fromCardinalBounds(shifted,
+                    new Vec3d(shifted.center().x(), shifted.min().y(), shifted.center().z()),
+                    previous.placement().attitude(), new PlayerBodyShape.Cardinal(shape.frame(), dimensions));
+            worldDelta = shape.frame().toWorld(delta);
+            installPoseGeometry(player, candidate);
+            var anchor = base.transport();
+            owner.budget.rebase(new Vec3(anchor.x(), anchor.y(), anchor.z()), owner.budgetTick);
+        }
+        var destination = candidate.transport().add(worldDelta);
+        var admission = owner.budget.prepareClipped(Math.incrementExact(owner.budget.lastSequence()), owner.budgetTick,
+                new Vec3(destination.x(), destination.y(), destination.z()));
+        if (!admission.accepted()) throw new IllegalStateException("Pose growth budget: " + admission.failure());
+        Vec3d bounded = new Vec3d(admission.destination().x(), admission.destination().y(), admission.destination().z())
+                .subtract(candidate.transport());
+        RuntimeException primary = null;
+        CardinalMoveFinalizer.Ready finalizer = null;
+        try {
+            if (shape.frame() == CardinalFrame.Y_POS) original.accept(bounded);
+            else {
+                var sample = new PlayerPhysicalSnapshot(previous.scope(), previous.revision(), candidate, previous.worldVelocity());
+                var request = new CardinalMovementResolver.Request(shape.frame(), player.getEntityBoundingBox(), bounded,
+                        type, player.onGround, player.isSneaking(), player.stepHeight);
+                var observation = WorldCollisionCandidates.resolveCardinal(session.world, player, sample, request, POSE_SCAN, POSE_MOVE);
+                if (observation.worldFailure().isPresent()) {
+                    var failure = observation.worldFailure().orElseThrow();
+                    throw new IllegalStateException("Pose growth collision: " + failure.reason(), failure.cause().orElse(null));
+                }
+                if (!(observation.calculation().orElse(null) instanceof CardinalMovementResolver.Resolved resolved)
+                        || !(CardinalMoveFinalizer.preparePhysical(player, request, resolved) instanceof CardinalMoveFinalizer.Ready ready))
+                    throw new IllegalStateException("Pose growth collision did not commit");
+                finalizer = ready;
+                if (!(ready.commit() instanceof CardinalMoveFinalizer.Applied))
+                    throw new IllegalStateException("Pose growth collision did not commit");
+            }
+        } catch (RuntimeException failure) {
+            primary = failure;
+            throw failure;
+        } finally {
+            try {
+                if (poseContextCurrent(session, owner, context)) {
+                    var actual = WorldCollisionCandidates.ActorGeometry.read(player);
+                    var point = actual.position();
+                    boolean installed = shape.frame() == CardinalFrame.Y_POS
+                            ? point.x() == actual.bounds().center().x() && point.y() == actual.bounds().min().y()
+                            && point.z() == actual.bounds().center().z()
+                            && withinNativeGrowth(box, actual.bounds(), bounded, player.stepHeight)
+                            : finalizer != null && finalizer.installation().filter(value ->
+                            value.transport().equals(point) && value.bounds().equals(player.getEntityBoundingBox())).isPresent();
+                    if (installed) {
+                        if (!owner.budget.commitNative(admission, new Vec3(point.x(), point.y(), point.z())))
+                            throw new IllegalStateException("Pose growth lost its reserved movement ticket");
+                        owner.poseGrowth = new PoseGrowth(point, actual.bounds(), width, height);
+                    }
+                }
+            } catch (RuntimeException recoveryFailure) {
+                if (primary == null) throw recoveryFailure;
+                if (recoveryFailure != primary) primary.addSuppressed(recoveryFailure);
+            } finally { owner.budget.abort(admission); }
+        }
+    }
+
+    private static boolean withinNativeGrowth(AxisAlignedBB start, Aabb end, Vec3d delta, float stepHeight) {
+        // Native collision may shorten each tangent, or take its bounded step path. A block
+        // callback's unrelated setPosition is not a completion of this reserved growth move.
+        return end.min().x() >= Math.min(start.minX, start.minX + delta.x())
+                && end.min().x() <= Math.max(start.minX, start.minX + delta.x())
+                && end.min().z() >= Math.min(start.minZ, start.minZ + delta.z())
+                && end.min().z() <= Math.max(start.minZ, start.minZ + delta.z())
+                && end.min().y() >= start.minY && end.min().y() <= start.minY + stepHeight;
+    }
+
+    private boolean poseContextCurrent(Session session, Owned owner, PoseContext context) {
+        return current(session) && session.owner == owner && owner.poseContext == context
+                && owner.snapshot == context.snapshot() && !owner.teleportPending
+                && owner.travel.correctionRevision() == context.correction()
+                && session.world.getTotalWorldTime() == context.tick()
+                && !PlayerKinematics.requiresNative(session.player);
+    }
+
+    private static void installPoseGeometry(EntityPlayerMP player, PlayerBodyPlacement placement) {
+        var dimensions = placement.shape().dimensions();
+        var bounds = placement.bounds();
+        var transport = placement.transport();
+        player.width = (float) dimensions.width();
+        player.height = (float) dimensions.height();
+        player.setEntityBoundingBox(new AxisAlignedBB(bounds.min().x(), bounds.min().y(), bounds.min().z(),
+                bounds.max().x(), bounds.max().y(), bounds.max().z()));
+        player.posX = transport.x();
+        player.posY = transport.y();
+        player.posZ = transport.z();
     }
 
     /** Native setPlayerLocation already moved the actor and sent its correction before this hook. */
@@ -108,7 +337,7 @@ public final class PlayerPhysicsServer {
         if (!handler.player.getServerWorld().isCallingFromMinecraftThread())
             throw new IllegalStateException("Physics correction off-thread");
         Session session = sessions.get(handler.netManager);
-        if (session == null || !current(session)) return;
+        if (session == null || session.handler != handler || !current(session)) return;
         if (teleportId < 0) throw new IllegalArgumentException("Negative native teleport ID");
         session.pending = null;
         if (session.owner == null) {
@@ -123,40 +352,114 @@ public final class PlayerPhysicsServer {
     /** Re-anchor only after vanilla consumed this exact confirmation. No new owner or budget is created. */
     public void confirmNativeTeleport(NetHandlerPlayServer handler, int teleportId, boolean pendingCleared) {
         var states = new ArrayList<Offer>();
+        RuntimeException primary = null;
+        String failureStage = null;
+        String outboundFailureStage = null;
+        Session diagnosticSession = null;
         synchronized (this) {
             if (!handler.player.getServerWorld().isCallingFromMinecraftThread())
                 throw new IllegalStateException("Physics confirmation off-thread");
             Session session = sessions.get(handler.netManager);
-            if (session == null || !current(session) || session.owner == null) return;
+            if (session == null || session.handler != handler || !current(session) || session.owner == null) return;
+            diagnosticSession = session;
             Owned owner = session.owner;
             if (!pendingCleared || !owner.teleportPending || owner.nativeTeleportId.orElse(-1) != teleportId) return;
             if (owner.nativeDelegated) {
-                owner.budget.rebase(new Vec3(session.player.posX, session.player.posY, session.player.posZ), owner.budgetTick);
-                owner.teleportPending = false;
-                owner.lastWorldTick = session.world.getTotalWorldTime();
-                publishNative(session, states);
+                try {
+                    owner.budget.rebase(new Vec3(session.player.posX, session.player.posY, session.player.posZ), owner.budgetTick);
+                    owner.teleportPending = false;
+                    owner.lastWorldTick = session.world.getTotalWorldTime();
+                    publishNative(session, states);
+                } catch (RuntimeException failure) {
+                    primary = failure;
+                    failureStage = "rebase delegated correction";
+                }
             } else {
                 var previous = owner.snapshot;
+                long correction = owner.travel.correctionRevision();
+                String stage = "observe geometry";
                 var shape = (PlayerBodyShape.Cardinal) previous.placement().shape();
-                if (shape.frame() != CardinalFrame.Y_POS)
-                    throw new IllegalStateException("Native correction requires a Y+ physical frame");
-                var actual = WorldCollisionCandidates.ActorGeometry.read(session.player);
-                var dimensions = new PlayerBodyShape.Dimensions(actual.width(), actual.height(), session.player.getEyeHeight());
-                var placement = PlayerBodyPlacement.fromCardinalBounds(actual.bounds(), actual.position(),
-                        previous.placement().attitude(), new PlayerBodyShape.Cardinal(shape.frame(), dimensions));
-                var corrected = new PlayerPhysicalSnapshot(previous.scope(), Math.incrementExact(previous.revision()),
-                        placement, previous.worldVelocity(), Optional.of(new PlayerPhysicalSnapshot.Contacts(
-                        session.player.onGround, session.player.collidedHorizontally, session.player.collidedVertically,
-                        session.player.fallDistance)));
-                owner.budget.rebase(new Vec3(actual.position().x(), actual.position().y(), actual.position().z()), owner.budgetTick);
-                owner.snapshot = corrected;
-                owner.teleportPending = false;
-                owner.lastWorldTick = session.world.getTotalWorldTime();
-                owner.lastFailure = null;
-                publishAccepted(session, states);
+                if (shape.frame() != CardinalFrame.Y_POS) {
+                    try {
+                        recoverNativeCorrection(session, owner, states, "unsupported non-Y+ physical frame");
+                    } catch (RuntimeException failure) {
+                        primary = failure;
+                        failureStage = "recover unsupported non-Y+ correction";
+                    }
+                } else try {
+                    var actual = WorldCollisionCandidates.ActorGeometry.read(session.player);
+                    var dimensions = new PlayerBodyShape.Dimensions(actual.width(), actual.height(), session.player.getEyeHeight());
+                    var placement = PlayerBodyPlacement.fromCardinalBounds(actual.bounds(), actual.position(),
+                            previous.placement().attitude(), new PlayerBodyShape.Cardinal(shape.frame(), dimensions));
+                    var corrected = new PlayerPhysicalSnapshot(previous.scope(), Math.incrementExact(previous.revision()),
+                            placement, previous.worldVelocity(), Optional.of(new PlayerPhysicalSnapshot.Contacts(
+                            session.player.onGround, session.player.collidedHorizontally, session.player.collidedVertically,
+                            session.player.fallDistance)));
+                    if (!current(session) || session.owner != owner || owner.snapshot != previous
+                            || !owner.teleportPending || owner.nativeTeleportId.orElse(-1) != teleportId
+                            || owner.travel.correctionRevision() != correction
+                            || !actual.equals(WorldCollisionCandidates.ActorGeometry.read(session.player))) return;
+                    stage = "commit anchor";
+                    owner.budget.rebase(new Vec3(actual.position().x(), actual.position().y(), actual.position().z()), owner.budgetTick);
+                    owner.snapshot = corrected;
+                    owner.teleportPending = false;
+                    owner.lastWorldTick = session.world.getTotalWorldTime();
+                    owner.lastFailure = null;
+                    stage = "publish accepted";
+                    publishAccepted(session, states);
+                } catch (RuntimeException failure) {
+                    primary = failure;
+                    failureStage = stage;
+                    // Only this consumed correction can leave WAITING_ACK. A callback's newer
+                    // correction or lifetime is never cleared by the failed older operation.
+                    if (current(session) && session.owner == owner && owner.snapshot == previous
+                            && owner.teleportPending && owner.nativeTeleportId.orElse(-1) == teleportId
+                            && owner.travel.correctionRevision() == correction) {
+                        try {
+                            recoverNativeCorrection(session, owner, states, stage);
+                        } catch (RuntimeException recoveryFailure) {
+                            if (recoveryFailure != failure) failure.addSuppressed(recoveryFailure);
+                        }
+                    }
+                }
             }
         }
-        for (Offer state : states) outbound.accept(state.player(), state.packet());
+        for (Offer state : states) {
+            try { outbound.accept(state.player(), state.packet()); }
+            catch (RuntimeException publicationFailure) {
+                String stage = "publish " + state.packet().kind();
+                if (primary == null) {
+                    primary = publicationFailure;
+                    failureStage = stage;
+                    break;
+                }
+                if (outboundFailureStage == null) outboundFailureStage = stage;
+                if (publicationFailure != primary) primary.addSuppressed(publicationFailure);
+            }
+        }
+        if (primary != null) {
+            Session session = Objects.requireNonNull(diagnosticSession, "native correction diagnostic session");
+            UnigravMod.LOGGER.error("ugmotion1 native correction failed: stage={}, outboundStage={}, session={}, scope={}, dimension={}, teleportId={}",
+                    failureStage, outboundFailureStage == null ? "none" : outboundFailureStage,
+                    session.scope.sessionId(), session.scope, session.scope.dimension(), teleportId, primary);
+            throw primary;
+        }
+    }
+
+    private void recoverNativeCorrection(Session session, Owned owner, ArrayList<Offer> states, String stage) {
+        // Retain custody and the same budget, but withdraw the stale geometry's movement writer.
+        // Native completions must establish fresh samples before the existing resume handshake.
+        owner.nativeDelegated = true;
+        owner.resumeOffered = false;
+        owner.delegationProposal = session.proposal;
+        owner.controls = IDLE;
+        owner.lastFailure = "native correction recovery: " + stage;
+        owner.teleportPending = false;
+        owner.lastWorldTick = session.world.getTotalWorldTime();
+        session.pending = null;
+        NativePlayerMovement.INSTANCE.invalidate(session.handler);
+        publishNative(session, states);
+        restoreNativeGravity(session);
     }
 
     /** Queues J/m for the next owner step; callbacks cannot overwrite an in-flight movement snapshot. */
@@ -738,6 +1041,9 @@ public final class PlayerPhysicsServer {
         private boolean teleportPending;
         private boolean nativeDelegated;
         private boolean resumeOffered;
+        private int poseDepth;
+        private PoseContext poseContext;
+        private PoseGrowth poseGrowth;
         private long delegationProposal;
         private Vec3 pendingImpulse = Vec3.ZERO;
         private final PlayerPhysicsStep.TravelState travel = new PlayerPhysicsStep.TravelState();

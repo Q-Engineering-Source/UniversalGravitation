@@ -16,7 +16,7 @@ import wi.unigrav.core.boost.BoostProtocol;
 /** Independent physical-owner messages; positions are metres and velocities m/s. */
 public final class PlayerPhysicsProtocol {
     public static final String CHANNEL = "ugmotion1";
-    public static final int VERSION = 2;
+    public static final int VERSION = 4;
     public static final int MAX_BYTES = 512;
     private PlayerPhysicsProtocol() {}
     public enum Kind { OFFER, APPLY, OWNED, INPUT, STATE, NATIVE }
@@ -53,13 +53,22 @@ public final class PlayerPhysicsProtocol {
     }
     /** Translation and camera forward are WORLD vectors; the client samples both from the same UIE frame. */
     public record Controls(Vec3d translation, Vec3d forward, boolean jump, boolean sneak,
-                           boolean sprint, boolean boost, int boostGear) {
+                           boolean sprint, boolean boost, int boostGear, double keyboardTravelGain) {
+        /** Existing world/analog callers carry no keyboard-only travel magnitude. */
+        public Controls(Vec3d translation, Vec3d forward, boolean jump, boolean sneak,
+                        boolean sprint, boolean boost, int boostGear) {
+            this(translation, forward, jump, sneak, sprint, boost, boostGear, 1.0);
+        }
+
         public Controls {
             requireFinite(translation);
             requireFinite(forward);
             double magnitude = length(translation);
             if (magnitude > 1.0 + 1e-12 || Math.abs(length(forward) - 1) > 1e-12
-                    || boostGear < 1 || boostGear > 9) {
+                    || boostGear < 1 || boostGear > 9
+                    || !Double.isFinite(keyboardTravelGain) || keyboardTravelGain < 1.0
+                    || keyboardTravelGain > Math.sqrt(2.0)
+                    || keyboardTravelGain > 1.0 && Math.abs(magnitude - 1.0) > 1e-12) {
                 throw new IllegalArgumentException("Invalid physical controls");
             }
         }
@@ -123,6 +132,7 @@ public final class PlayerPhysicsProtocol {
             out.put((byte) ((controls.jump() ? 1 : 0) | (controls.sneak() ? 2 : 0)
                     | (controls.sprint() ? 4 : 0) | (controls.boost() ? 8 : 0)));
             out.put((byte) controls.boostGear());
+            out.putDouble(controls.keyboardTravelGain());
         });
         return Arrays.copyOf(out.array(), out.position());
     }
@@ -155,7 +165,7 @@ public final class PlayerPhysicsProtocol {
                 int flags = Byte.toUnsignedInt(in.get());
                 if (flags > 15) throw new IllegalArgumentException("Unknown control flags");
                 controls = Optional.of(new Controls(translation, forward, (flags & 1) != 0, (flags & 2) != 0,
-                        (flags & 4) != 0, (flags & 8) != 0, Byte.toUnsignedInt(in.get())));
+                        (flags & 4) != 0, (flags & 8) != 0, Byte.toUnsignedInt(in.get()), in.getDouble()));
             }
             if (in.hasRemaining()) throw new IllegalArgumentException("Trailing physics bytes");
             return new Packet(kind, scope, sequence, offerSequence, application, snapshot, controls, nativeTeleportId);

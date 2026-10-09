@@ -46,7 +46,7 @@ import net.minecraft.world.storage.WorldInfo;
 import net.minecraftforge.common.DimensionManager;
 
 /** Test-only real mapped WorldServer fixture; it never starts, saves, generates, or opens a socket. */
-final class BootWorldFixture implements AutoCloseable {
+public final class BootWorldFixture implements AutoCloseable {
     private final TestServer server;
     private final TestWorld world;
     private final EntityPlayer actor;
@@ -62,7 +62,7 @@ final class BootWorldFixture implements AutoCloseable {
         return open(dataDirectory, playerId, false);
     }
 
-    static BootWorldFixture open(Path dataDirectory, UUID playerId, boolean dedicated) {
+    public static BootWorldFixture open(Path dataDirectory, UUID playerId, boolean dedicated) {
         if (DimensionManager.getWorld(0) != null) {
             throw new IllegalStateException("headless fixture refuses to replace an existing dimension-zero world");
         }
@@ -82,7 +82,7 @@ final class BootWorldFixture implements AutoCloseable {
         }
     }
 
-    WorldServer world() {
+    public WorldServer world() {
         return world;
     }
 
@@ -95,7 +95,7 @@ final class BootWorldFixture implements AutoCloseable {
     int positionUpdates(Entity entity) { return world.positionUpdates.getOrDefault(entity, 0); }
 
     /** An actual MP and native connection handler, with no channel/socket opened. */
-    EntityPlayerMP serverPlayer(UUID id) {
+    public EntityPlayerMP serverPlayer(UUID id) {
         return serverPlayer(id, null);
     }
 
@@ -164,8 +164,7 @@ final class BootWorldFixture implements AutoCloseable {
         world.remove(chunkX, chunkZ);
     }
 
-    @Override
-    public void close() {
+    @Override public void close() {
         try {
             for (EntityPlayerMP player : serverPlayers) player.getAdvancements().dispose();
         } finally {

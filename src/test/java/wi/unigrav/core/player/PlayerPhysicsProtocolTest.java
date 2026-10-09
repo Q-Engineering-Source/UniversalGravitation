@@ -17,6 +17,20 @@ class PlayerPhysicsProtocolTest {
     private static final PlayerPhysicalSnapshot.Scope SCOPE =
             new PlayerPhysicalSnapshot.Scope(new UUID(0, 1), new UUID(0, 2), -1, 3);
 
+    @Test void loggedSwimmingDimensionsRoundTripAndOldVersionIsRejected() {
+        var dimensions = new PlayerBodyShape.Dimensions(.6000000238418579, .5999999642372131, .4000000059604645);
+        var shape = new PlayerBodyShape.Cardinal(CardinalFrame.Y_POS, dimensions);
+        var placement = PlayerBodyPlacement.fromTransport(new Vec3d(8, 65, 9), CardinalFrame.Y_POS.attitude(), shape);
+        var state = new PlayerPhysicalSnapshot(SCOPE, 2, placement, new Vec3d(1, 0, 0),
+                Optional.of(new PlayerPhysicalSnapshot.Contacts(false, false, false, 0)));
+        var original = packet(PlayerPhysicsProtocol.Kind.STATE, Optional.empty(), Optional.of(state), Optional.empty());
+        byte[] bytes = PlayerPhysicsProtocol.encode(original);
+        assertEquals(original, PlayerPhysicsProtocol.decode(bytes));
+        assertEquals(placement.bounds(), PlayerPhysicsProtocol.decode(bytes).snapshot().orElseThrow().placement().bounds());
+        bytes[0] = 2;
+        assertThrows(IllegalArgumentException.class, () -> PlayerPhysicsProtocol.decode(bytes));
+    }
+
     @Test void nativeEyeOutsideColliderRoundTripsWithoutExpandingCollisionGeometry() {
         var dimensions = new PlayerBodyShape.Dimensions(.5, .5, 1.5);
         var shape = new PlayerBodyShape.Cardinal(CardinalFrame.Y_POS, dimensions);
@@ -144,6 +158,39 @@ class PlayerPhysicsProtocolTest {
         assertThrows(IllegalArgumentException.class, () -> PlayerPhysicsProtocol.decode(bytes));
     }
 
+    @Test void keyboardTravelGainRoundTripsAndRejectsInvalidCrossFieldOrLegacyWire() {
+        double diagonal = Math.sqrt(2.0);
+        var translation = new Vec3d(1 / diagonal, 0, 1 / diagonal);
+        var keyboard = new PlayerPhysicsProtocol.Controls(translation, new Vec3d(0, 0, 1),
+                false, false, false, false, 5, diagonal);
+        var input = packet(PlayerPhysicsProtocol.Kind.INPUT, Optional.empty(), Optional.empty(), Optional.of(keyboard));
+        byte[] bytes = PlayerPhysicsProtocol.encode(input);
+        var decoded = PlayerPhysicsProtocol.decode(bytes);
+        assertEquals(input, decoded);
+        assertEquals(diagonal, decoded.controls().orElseThrow().keyboardTravelGain(), 0);
+
+        assertEquals(1.0, new PlayerPhysicsProtocol.Controls(translation, new Vec3d(0, 0, 1),
+                false, false, false, false, 5).keyboardTravelGain(), 0,
+                "the source-compatible constructor retains world-vector speed");
+        assertThrows(IllegalArgumentException.class, () -> new PlayerPhysicsProtocol.Controls(
+                translation, new Vec3d(0, 0, 1), false, false, false, false, 5, 0.999));
+        assertThrows(IllegalArgumentException.class, () -> new PlayerPhysicsProtocol.Controls(
+                translation, new Vec3d(0, 0, 1), false, false, false, false, 5, Double.NaN));
+        assertThrows(IllegalArgumentException.class, () -> new PlayerPhysicsProtocol.Controls(
+                translation, new Vec3d(0, 0, 1), false, false, false, false, 5, diagonal + 1e-9));
+        assertThrows(IllegalArgumentException.class, () -> new PlayerPhysicsProtocol.Controls(
+                new Vec3d(.9, 0, 0), new Vec3d(0, 0, 1), false, false, false, false, 5, diagonal));
+        assertThrows(IllegalArgumentException.class, () -> new PlayerPhysicsProtocol.Controls(
+                new Vec3d(0, 0, 0), new Vec3d(0, 0, 1), false, false, false, false, 5, diagonal));
+
+        byte[] invalidGain = bytes.clone();
+        ByteBuffer.wrap(invalidGain).putDouble(invalidGain.length - Double.BYTES, Double.POSITIVE_INFINITY);
+        assertThrows(IllegalArgumentException.class, () -> PlayerPhysicsProtocol.decode(invalidGain));
+        bytes[0] = 3;
+        assertThrows(IllegalArgumentException.class, () -> PlayerPhysicsProtocol.decode(bytes),
+                "the v3 INPUT wire does not silently discard the new travel magnitude");
+    }
+
     @Test void malformedTagsAndNonFiniteWireInputAreRejectedBeforeUse() {
         var input = packet(PlayerPhysicsProtocol.Kind.INPUT, Optional.empty(), Optional.empty(),
                 Optional.of(controls(new Vec3d(0, 0, 0), new Vec3d(0, 0, -1), 1)));
@@ -151,7 +198,7 @@ class PlayerPhysicsProtocolTest {
         badBoolean[62] = 2;
         assertThrows(IllegalArgumentException.class, () -> PlayerPhysicsProtocol.decode(badBoolean));
         byte[] badFlags = PlayerPhysicsProtocol.encode(input);
-        badFlags[badFlags.length - 2] = 16;
+        badFlags[badFlags.length - 10] = 16;
         assertThrows(IllegalArgumentException.class, () -> PlayerPhysicsProtocol.decode(badFlags));
         byte[] nan = PlayerPhysicsProtocol.encode(input);
         java.nio.ByteBuffer.wrap(nan).putDouble(63, Double.NaN);

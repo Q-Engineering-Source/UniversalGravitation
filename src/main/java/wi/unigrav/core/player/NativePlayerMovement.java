@@ -375,7 +375,7 @@ public final class NativePlayerMovement {
         double eye = player.getEyeHeight();
         if (!finite(player.posX, player.posY, player.posZ, player.motionX, player.motionY, player.motionZ,
                 box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ, player.width, player.height, eye)
-                || player.width <= 0 || player.height < player.width || eye < 0
+                || player.width <= 0 || player.height <= 0 || eye < 0
                 || !(box.minX < box.maxX && box.minY < box.maxY && box.minZ < box.maxZ)
                 || player.posY != box.minY) return Optional.empty();
         // Native player floats cannot overflow binary64 here; reject collapsed translations explicitly.

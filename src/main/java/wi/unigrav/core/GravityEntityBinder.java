@@ -107,8 +107,12 @@ public final class GravityEntityBinder {
         void close();
     }
 
+    /** Stable identity retained by estimates/physics updates, replaced by each new bind. */
+    private static final class BindingLineage { }
+
     private static final class Binding {
         final GravityMode mode;
+        final BindingLineage lineage;
         boolean restoreNoGravity;
         /** Per-tick activity filter, or null for "always active". */
         final Predicate<Entity> tickFilter;
@@ -128,13 +132,21 @@ public final class GravityEntityBinder {
 
         Binding(GravityMode mode, boolean restoreNoGravity, Predicate<Entity> tickFilter,
                 BodyPhysics physics, boolean estimated) {
+            this(mode, restoreNoGravity, tickFilter, physics, estimated, new BindingLineage());
+        }
+
+        Binding(GravityMode mode, boolean restoreNoGravity, Predicate<Entity> tickFilter,
+                BodyPhysics physics, boolean estimated, BindingLineage lineage) {
             this.mode = mode;
+            this.lineage = lineage;
             this.restoreNoGravity = restoreNoGravity;
             this.tickFilter = tickFilter;
             this.physics = physics;
             this.estimated = estimated;
         }
     }
+
+    private record RegistrationBinding(Entity entity, BindingLineage lineage) { }
 
     private final class PredicateRegistration implements Registration {
         final Predicate<Entity> predicate;
@@ -155,13 +167,18 @@ public final class GravityEntityBinder {
         public void close() {
             if (closed.compareAndSet(false, true)) {
                 predicates.remove(this);
-                List<Entity> toUnbind;
+                List<RegistrationBinding> toUnbind = new ArrayList<>();
                 synchronized (bindings) {
-                    toUnbind = new ArrayList<>(autoBound);
+                    for (Entity entity : autoBound) {
+                        Binding binding = bindings.get(entity);
+                        if (binding != null && binding.owner == this) {
+                            toUnbind.add(new RegistrationBinding(entity, binding.lineage));
+                        }
+                    }
                     autoBound.clear();
                 }
-                for (Entity entity : toUnbind) {
-                    unbind(entity);
+                for (RegistrationBinding entry : toUnbind) {
+                    unbindLineage(entry.entity(), entry.lineage(), this);
                 }
             }
         }
@@ -179,10 +196,12 @@ public final class GravityEntityBinder {
     }
 
     /** Binds one entity to the gravity field, with estimated mass/volume. */    public Registration bind(Entity entity, GravityMode mode) {
+        BindingLineage lineage;
         try (var mutation = NativePlayerMovement.INSTANCE.beginForceMutation(entity)) {
             synchronized (bindings) {
                 mutation.changed();
                 doBind(entity, mode, null, BodyPhysics.estimate(entity), true);
+                lineage = bindings.get(entity).lineage;
             }
         }
         return new Registration() {
@@ -191,7 +210,7 @@ public final class GravityEntityBinder {
             @Override
             public void close() {
                 if (closed.compareAndSet(false, true)) {
-                    unbind(entity);
+                    unbindLineage(entity, lineage, null);
                 }
             }
         };
@@ -199,10 +218,12 @@ public final class GravityEntityBinder {
 
     /** Binds one entity to the gravity field, with explicit mass/volume. */
     public Registration bind(Entity entity, GravityMode mode, BodyPhysics physics) {
+        BindingLineage lineage;
         try (var mutation = NativePlayerMovement.INSTANCE.beginForceMutation(entity)) {
             synchronized (bindings) {
                 mutation.changed();
                 doBind(entity, mode, null, physics, false);
+                lineage = bindings.get(entity).lineage;
             }
         }
         return new Registration() {
@@ -211,7 +232,7 @@ public final class GravityEntityBinder {
             @Override
             public void close() {
                 if (closed.compareAndSet(false, true)) {
-                    unbind(entity);
+                    unbindLineage(entity, lineage, null);
                 }
             }
         };
@@ -236,17 +257,21 @@ public final class GravityEntityBinder {
      */
     public Registration bindPredicate(Predicate<Entity> predicate, GravityMode mode,
                                       Predicate<Entity> tickFilter) {
+        MinecraftServer server = FMLCommonHandler.instance().getMinecraftServerInstance();
+        return bindPredicate(predicate, mode, tickFilter, server == null ? new WorldServer[0] : server.worlds);
+    }
+
+    /** Registers the same automatic policy against an explicitly supplied current world set. */
+    public Registration bindPredicate(Predicate<Entity> predicate, GravityMode mode,
+                                      Predicate<Entity> tickFilter, WorldServer[] loadedWorlds) {
         PredicateRegistration registration =
                 new PredicateRegistration(predicate, mode, tickFilter);
         predicates.add(registration);
-        MinecraftServer server = FMLCommonHandler.instance().getMinecraftServerInstance();
-        if (server != null) {
-            for (WorldServer world : server.worlds) {
-                // Copy: binding during iteration would not modify the list,
-                // but entity lists are not guaranteed stable while iterating.
-                for (Entity entity : new ArrayList<>(world.loadedEntityList)) {
-                    tryBindWith(registration, entity);
-                }
+        for (WorldServer world : loadedWorlds) {
+            // Copy: binding during iteration would not modify the list,
+            // but entity lists are not guaranteed stable while iterating.
+            for (Entity entity : new ArrayList<>(world.loadedEntityList)) {
+                tryBindWith(registration, entity);
             }
         }
         return registration;
@@ -350,6 +375,10 @@ public final class GravityEntityBinder {
         synchronized (bindings) {
             binding = bindings.get(entity);
         }
+        if (binding != null && binding.estimated && !BodyPhysics.canEstimate(entity)) {
+            unbind(entity, binding);
+            return;
+        }
         if (binding != null && !entity.isDead
                 && (binding.tickFilter == null || binding.tickFilter.test(entity))) {
             applyDeltaV(entity, binding);
@@ -430,7 +459,7 @@ public final class GravityEntityBinder {
                     return;
                 }
                 Binding updated = new Binding(old.mode, old.restoreNoGravity,
-                        old.tickFilter, physics, false);
+                        old.tickFilter, physics, false, old.lineage);
                 updated.owner = old.owner;
                 bindings.put(entity, updated);
                 EntityGravitySources.update(entity, physics);
@@ -455,10 +484,16 @@ public final class GravityEntityBinder {
             if (observed == null || !observed.estimated) {
                 return null;
             }
-            fresh = BodyPhysics.estimate(entity);
-            if (fresh.equals(observed.physics)) {
+            fresh = BodyPhysics.canEstimate(entity) ? BodyPhysics.estimate(entity) : null;
+            if (fresh != null && fresh.equals(observed.physics)) {
                 return null;
             }
+        }
+        if (fresh == null) {
+            // Acquire the mutation boundary outside the binding lock, and release only the
+            // exact estimated entry observed above. A concurrent explicit replacement survives.
+            unbind(entity, observed);
+            return null;
         }
         try (var mutation = NativePlayerMovement.INSTANCE.beginForceMutation(entity)) {
             synchronized (bindings) {
@@ -468,7 +503,7 @@ public final class GravityEntityBinder {
                 }
                 mutation.changed();
                 Binding updated = new Binding(binding.mode, binding.restoreNoGravity,
-                        binding.tickFilter, fresh, true);
+                        binding.tickFilter, fresh, true, binding.lineage);
                 updated.owner = binding.owner;
                 bindings.put(entity, updated);
                 EntityGravitySources.update(entity, fresh);
@@ -516,16 +551,19 @@ public final class GravityEntityBinder {
     private void tryBindWith(PredicateRegistration registration, Entity entity) {
         // The predicate runs outside the lock (arbitrary user code); the
         // contains-check and the structural put are atomic under the lock.
-        if (entity.isDead || !registration.predicate.test(entity)) {
+        if (entity.isDead || registration.closed.get() || !registration.predicate.test(entity)
+                || registration.closed.get()) {
             return;
         }
         try (var mutation = NativePlayerMovement.INSTANCE.beginForceMutation(entity)) {
             synchronized (bindings) {
-                if (bindings.containsKey(entity)) {
+                if (registration.closed.get() || bindings.containsKey(entity)) {
                     return;
                 }
+                if (!BodyPhysics.canEstimate(entity)) return;
+                BodyPhysics physics = BodyPhysics.estimate(entity);
                 mutation.changed();
-                doBind(entity, registration.mode, registration, BodyPhysics.estimate(entity), true);
+                doBind(entity, registration.mode, registration, physics, true);
                 registration.autoBound.add(entity);
             }
         }
@@ -534,10 +572,17 @@ public final class GravityEntityBinder {
     /** Caller must hold {@code synchronized (bindings)}. */
     private void doBind(Entity entity, GravityMode mode, PredicateRegistration owner,
                         BodyPhysics physics, boolean estimated) {
-        boolean restore = false;
+        Binding previous = bindings.get(entity);
+        boolean restore = previous != null && previous.restoreNoGravity;
+        if (previous != null && previous.owner != null && previous.owner != owner) {
+            previous.owner.autoBound.remove(entity);
+        }
         if (mode == GravityMode.REPLACE && !entity.hasNoGravity()) {
             entity.setNoGravity(true);
             restore = true;
+        } else if (mode != GravityMode.REPLACE && restore) {
+            if (!entity.isDead) entity.setNoGravity(false);
+            restore = false;
         }
         Binding binding = new Binding(mode, restore,
                 owner != null ? owner.tickFilter : null, physics, estimated);
@@ -547,10 +592,31 @@ public final class GravityEntityBinder {
     }
 
     private void unbind(Entity entity) {
+        unbind(entity, null, null, false);
+    }
+
+    private void unbind(Entity entity, Binding expected) {
+        unbind(entity, expected, null, true);
+    }
+
+    private void unbindLineage(Entity entity, BindingLineage expectedLineage, PredicateRegistration expectedOwner) {
+        unbind(entity, null, expectedLineage, expectedOwner, true);
+    }
+
+    private void unbind(Entity entity, Binding expected, BindingLineage expectedLineage, boolean requireBindingMatch) {
+        unbind(entity, expected, expectedLineage, null, requireBindingMatch);
+    }
+
+    private void unbind(Entity entity, Binding expected, BindingLineage expectedLineage,
+                        PredicateRegistration expectedOwner, boolean requireBindingMatch) {
         Binding binding;
         try (var mutation = NativePlayerMovement.INSTANCE.beginForceMutation(entity)) {
             synchronized (bindings) {
                 binding = bindings.get(entity);
+                if (requireBindingMatch && (binding == null
+                        || expected != null && binding != expected
+                        || expectedLineage != null && binding.lineage != expectedLineage
+                        || expectedOwner != null && binding.owner != expectedOwner)) return;
                 if (binding != null || appliedForces.containsKey(entity)) {
                     mutation.changed();
                 }
@@ -737,6 +803,11 @@ public final class GravityEntityBinder {
             }
             // Integrated servers reuse this binder, not their world or thread. Never cross that lifetime.
             if (!(entity.world instanceof WorldServer ownerWorld) || !currentWorlds.contains(ownerWorld)) {
+                continue;
+            }
+            if (entry.getValue().estimated && !BodyPhysics.canEstimate(entity)) {
+                refreshIfEstimated(entity);
+                handled.add(entity);
                 continue;
             }
             if (entity instanceof EntityPlayerMP) {

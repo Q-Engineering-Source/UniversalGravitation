@@ -142,6 +142,52 @@ class PlayerPhysicsClientSessionTest {
         assertFalse(client.receive(matching));
     }
 
+    @Test void presentationFenceClearsOnlyAfterMatchingCorrectionIsSuccessfullyInstalled() {
+        var installationAllowed = new AtomicBoolean(true);
+        var throwDuringInstall = new AtomicBoolean(false);
+        var failure = new IllegalStateException("corrected mirror install failed");
+        var current = new AtomicReference<PlayerPhysicsClientSession>();
+        var client = new PlayerPhysicsClientSession(snapshot -> {
+            assertTrue(current.get().presentationSnapshot().isEmpty(),
+                    "an applying state is never visible as a completed presentation");
+            if (throwDuringInstall.get()) throw failure;
+            return installationAllowed.get();
+        }, () -> {}, () -> {});
+        current.set(client);
+        prepare(client);
+        assertTrue(client.receive(state(PlayerPhysicsProtocol.Kind.OWNED, 1, 1, 9)));
+        assertSame(client.snapshot().orElseThrow(), client.presentationSnapshot().orElseThrow());
+
+        client.nativeCorrection(42);
+        assertTrue(client.owns(), "correction must not revoke protocol custody");
+        assertTrue(client.drivesMotion(), "presentation gating must not change motion ownership");
+        assertTrue(client.presentationSnapshot().isEmpty());
+
+        var duplicate = withNativeId(state(PlayerPhysicsProtocol.Kind.STATE, 2, 1, 9), 42);
+        assertTrue(client.receive(duplicate));
+        assertEquals(PlayerPhysicsClientSession.StateDisposition.RETRANSMISSION, client.lastStateDisposition());
+        assertTrue(client.presentationSnapshot().isEmpty(), "a retransmission did not install corrected geometry");
+
+        var corrected = withNativeId(state(PlayerPhysicsProtocol.Kind.STATE, 3, 2, 6), 42);
+        installationAllowed.set(false);
+        assertFalse(client.receive(corrected));
+        assertTrue(client.presentationSnapshot().isEmpty(), "rejected installation leaves the fence pending");
+        installationAllowed.set(true);
+        throwDuringInstall.set(true);
+        assertSame(failure, assertThrows(IllegalStateException.class, () -> client.receive(corrected)));
+        assertTrue(client.presentationSnapshot().isEmpty(), "thrown installation leaves the fence pending");
+
+        throwDuringInstall.set(false);
+        assertTrue(client.receive(corrected), "the exact failed correction can be retried");
+        assertEquals(2, client.presentationSnapshot().orElseThrow().revision());
+        assertFalse(client.receive(corrected), "the now-stale retransmission does not reapply the correction");
+        var oldFence = withNativeId(state(PlayerPhysicsProtocol.Kind.STATE, 4, 3, 5), 41);
+        assertFalse(client.receive(oldFence), "successful presentation recovery retains the protocol teleport ID");
+        assertEquals(PlayerPhysicsClientSession.StateDisposition.TELEPORT_MISMATCH, client.lastStateDisposition());
+        client.reset();
+        assertTrue(client.presentationSnapshot().isEmpty(), "reset invalidates accepted presentation");
+    }
+
     @Test void correctionBeforeApplyDoesNotPoisonTheNextProposal() {
         var client = new PlayerPhysicsClientSession(snapshot -> true, () -> { }, () -> { });
         client.receive(new PlayerPhysicsProtocol.Packet(PlayerPhysicsProtocol.Kind.OFFER, SCOPE, 0, 1,
@@ -271,6 +317,11 @@ class PlayerPhysicsClientSessionTest {
         var snapshot = new PlayerPhysicalSnapshot(SCOPE, revision,
                 new PlayerBodyPlacement(new Vec3d(2, 5, 3), CardinalFrame.Y_POS.attitude(), shape), new Vec3d(speed, 0, 0));
         return new PlayerPhysicsProtocol.Packet(kind, SCOPE, sequence, 1, Optional.empty(), Optional.of(snapshot), Optional.empty());
+    }
+
+    private static PlayerPhysicsProtocol.Packet withNativeId(PlayerPhysicsProtocol.Packet packet, int teleportId) {
+        return new PlayerPhysicsProtocol.Packet(packet.kind(), packet.scope(), packet.sequence(), packet.offerSequence(),
+                packet.application(), packet.snapshot(), packet.controls(), OptionalInt.of(teleportId));
     }
 
     private static BoostProtocol.Packet legacyState(long serial, BoostProtocol.Operation operation) {

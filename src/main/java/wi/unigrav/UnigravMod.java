@@ -38,6 +38,8 @@ import wi.unigrav.core.player.GIntentNetwork;
 import wi.unigrav.core.player.GIntentServer;
 import wi.unigrav.core.player.PlayerPhysicsNetwork;
 import wi.unigrav.core.player.PlayerPhysicsServer;
+import wi.unigrav.core.player.PlayerRenderPoseNetwork;
+import wi.unigrav.core.player.PlayerRenderPoseTracker;
 
 import wi.unigrav.core.network.ImpactReportMessage;
 import wi.unigrav.core.boost.BoostNetwork;
@@ -97,6 +99,8 @@ public class UnigravMod {
         entityBinder.registerOnEventBus();
         PlayerPhysicsNetwork.initialize(PlayerPhysicsServer.INSTANCE::receive);
         PlayerPhysicsServer.INSTANCE.install();
+        PlayerRenderPoseNetwork.initialize(PlayerRenderPoseTracker.INSTANCE::receive);
+        PlayerRenderPoseTracker.INSTANCE.install();
         MinecraftForge.EVENT_BUS.register(motionTiming);
         MassPresetsLoader.load(event.getModConfigurationDirectory());
         worldGravity = new WorldGravityManager();
@@ -129,6 +133,7 @@ public class UnigravMod {
     @Mod.EventHandler
     public void serverStopping(FMLServerStoppingEvent event) {
         motionTiming.stop();
+        PlayerRenderPoseTracker.INSTANCE.stop();
         // Retire physical ownership while binding restoration and its G source still exist.
         PlayerPhysicsServer.INSTANCE.stop();
         GIntentServer.INSTANCE.stop();

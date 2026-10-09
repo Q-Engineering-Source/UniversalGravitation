@@ -10,15 +10,15 @@ public sealed interface PlayerBodyShape {
     Dimensions dimensions();
 
     /**
-     * Square tangent cross-section and an inscribed capsule of the same exterior height.
+     * Native positive dimensions; capsule representability is a separate admission.
      * Eye height is an independent native presentation anchor, not a collider extent:
      * vanilla sneaking while gliding can put it above the 0.6 m body.
      */
     record Dimensions(double width, double height, double eyeHeight) {
         public Dimensions {
             if (!Double.isFinite(width) || !Double.isFinite(height) || !Double.isFinite(eyeHeight)
-                    || width / 2 <= 0 || height < width || eyeHeight < 0) {
-                throw new IllegalArgumentException("finite dimensions require 0 < width <= height and eyeHeight >= 0"
+                    || width / 2 <= 0 || height <= 0 || eyeHeight < 0) {
+                throw new IllegalArgumentException("finite dimensions require width > 0, height > 0 and eyeHeight >= 0"
                         + " (width=" + width + ", height=" + height + ", eyeHeight=" + eyeHeight + ")");
             }
         }
@@ -27,7 +27,14 @@ public sealed interface PlayerBodyShape {
             return width / 2;
         }
 
+        public boolean supportsCapsule() {
+            return height >= width;
+        }
+
         public double centerlineHalfLength() {
+            if (!supportsCapsule()) {
+                throw new IllegalArgumentException("capsule height must be at least its width");
+            }
             return (height - width) / 2;
         }
 
@@ -48,6 +55,9 @@ public sealed interface PlayerBodyShape {
     record FreeCapsule(Dimensions dimensions) implements PlayerBodyShape {
         public FreeCapsule {
             Objects.requireNonNull(dimensions, "dimensions");
+            if (!dimensions.supportsCapsule()) {
+                throw new IllegalArgumentException("capsule height must be at least its width");
+            }
         }
     }
 }

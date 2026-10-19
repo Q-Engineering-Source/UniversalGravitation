@@ -1096,7 +1096,7 @@ public final class RevoUiSixDofCamera implements AutoCloseable {
                         && ClientKeyBindingState.isDown(minecraft.gameSettings.keyBindJump),
                 enabled && owns(frame, InputAction.PLAYER_SNEAK)
                         && ClientKeyBindingState.isDown(minecraft.gameSettings.keyBindSneak),
-                enabled && owns(frame, InputAction.PLAYER_SPRINT) && player.isSprinting(),
+                enabled && owns(frame, InputAction.PLAYER_SPRINT) && PlayerPhysicsClient.localSprintIntent(player),
                 enabled && ClientKeyBindingState.isDown(ClientGravityTicker.BOOST_KEY) && !alignmentBoostSuppressed(),
                 controlGears.boostGear(), Optional.of(new Rotation3d(
                         attitude.components().x(), attitude.components().y(), attitude.components().z(), attitude.components().w())));

@@ -183,8 +183,9 @@ public final class CardinalReorientation {
             if (clearance instanceof CardinalClearancePrepared.Prepared prepared)
                 return CardinalClearanceFinalizer.install(prepared, budgetTick, nativeRestore);
             if (clearance instanceof CardinalClearancePrepared.Unavailable failure) return failure.rejection();
-            var rejection = validateOwnedArc(transaction, actor, accepted, target, targetBounds, budget);
-            if (rejection != null) return rejection;
+            // An owner tick has one installation journal. A reference change consumes this tick;
+            // ordinary travel resumes from the committed reference on the next owner tick.
+            return adoptOwnedArc(transaction, actor, accepted, target, proposed, budget, budgetTick, nativeRestore);
         }
 
         Geometry saved = Geometry.of(actor);
@@ -226,8 +227,10 @@ public final class CardinalReorientation {
         return new Installed(snapshot, target, onGround);
     }
 
-    private static Rejected validateOwnedArc(FreeOwnerTransaction transaction, EntityPlayerMP actor,
-            PlayerPhysicalSnapshot accepted, CardinalFrame target, Aabb fullTarget, BoostMovementBudget budget) {
+    private static Outcome adoptOwnedArc(FreeOwnerTransaction transaction, EntityPlayerMP actor,
+            PlayerPhysicalSnapshot accepted, CardinalFrame target, PlayerBodyPlacement targetPlacement,
+            BoostMovementBudget budget, long budgetTick, boolean nativeRestore) {
+        Aabb fullTarget = targetPlacement.bounds();
         if (!transaction.matchesCardinalOwner(actor, accepted, budget))
             return new Rejected(Reason.ACTOR_CHANGED, "foreign Cardinal owner transaction or movement budget");
         try {
@@ -239,7 +242,7 @@ public final class CardinalReorientation {
                 return new Rejected(Reason.WORLD_UNAVAILABLE, "Cardinal source " + failure.reason() + ": "
                         + failure.diagnostics(), failure.cause().map(cause -> (RuntimeException) cause));
             var candidate = CardinalRealizedArcRecipe.prepare(
-                    ((CardinalContainedCapsuleSource.Prepared) contained).containment(), target, transaction.numeric());
+                    ((CardinalContainedCapsuleSource.Prepared) contained).containment(), targetPlacement, transaction.numeric());
             if (candidate instanceof CardinalRealizedArcRecipe.Unavailable failure)
                 return new Rejected(Reason.WORLD_UNAVAILABLE, "Cardinal arc recipe " + failure.reason() + ": "
                         + failure.detail(), failure.cause());
@@ -273,7 +276,8 @@ public final class CardinalReorientation {
             transaction.requireCurrent();
             if (!((CapsuleArcValidator.VerifiedArc) arc).matchesBound(source))
                 return new Rejected(Reason.ACTOR_CHANGED, "Cardinal arc proof lost its exact source/capture context");
-            return null;
+            return CardinalClearanceFinalizer.installArc(transaction, capture, window, source, prepared,
+                    (CapsuleArcValidator.VerifiedArc) arc, targetPlacement, target, budgetTick, nativeRestore);
         } catch (NumericWorkExhaustedException exhausted) {
             return new Rejected(Reason.WORLD_UNAVAILABLE, "Cardinal arc numeric budget exhausted", Optional.of(exhausted));
         }

@@ -195,6 +195,9 @@ public final class PlayerPhysicsClient {
         private final EntityPlayerSP actor;
         private final World world;
         private final long ownerGeneration;
+        // Native onLivingUpdate owns the input latch; metadata and prediction own only its mirror.
+        private boolean sprintIntentInitialized;
+        private boolean sprintIntent;
 
         private AcceptedOfferContext(PlayerPhysicsInboundConnections.DecodeHandle decode,
                 PlayerPhysicsProtocol.Packet offer, PlayerPhysicsClientSession session,
@@ -1369,6 +1372,37 @@ public final class PlayerPhysicsClient {
                 && (!PlayerKinematics.requiresNative(actor) || INSTANCE.session.nativeMovementMustRemainGated());
     }
 
+    private static AcceptedOfferContext sprintIntentOwner(EntityPlayerSP actor) {
+        var owner = INSTANCE.acceptedOfferContext;
+        if (owner == null || owner.actor != actor) return null;
+        if (!drivesMotion(actor) || !INSTANCE.acceptedOwnerLifetimeCurrent(owner, Minecraft.getMinecraft())) {
+            owner.sprintIntentInitialized = false;
+            return null;
+        }
+        return owner;
+    }
+
+    /** Keep vanilla's sprint start/stop rules while excluding delayed entity metadata from input. */
+    public static boolean localSprintIntent(EntityPlayerSP actor) {
+        var owner = sprintIntentOwner(actor);
+        if (owner == null) return actor.isSprinting();
+        if (!owner.sprintIntentInitialized) {
+            owner.sprintIntent = actor.isSprinting();
+            owner.sprintIntentInitialized = true;
+        }
+        return owner.sprintIntent;
+    }
+
+    /** Only decisions made by native onLivingUpdate may update the local input latch. */
+    public static void nativeSprintDecision(EntityPlayerSP actor, boolean requested, Runnable nativeSetter) {
+        var owner = sprintIntentOwner(actor);
+        nativeSetter.run();
+        if (owner != null && sprintIntentOwner(actor) == owner) {
+            owner.sprintIntent = requested;
+            owner.sprintIntentInitialized = true;
+        }
+    }
+
     public static Optional<PlayerMobilityIntent.State> mobilityState() {
         Minecraft minecraft = Minecraft.getMinecraft();
         EntityPlayerSP actor = minecraft.player;
@@ -1913,15 +1947,15 @@ public final class PlayerPhysicsClient {
                     - (ClientKeyBindingState.isDown(keys.keyBindRight) ? 1 : 0) : 0;
             controls = tangent != null ? PlayerPhysicsInput.keyboard(tangent, forward, strafe,
                     active && ClientKeyBindingState.isDown(keys.keyBindJump),
-                    active && ClientKeyBindingState.isDown(keys.keyBindSneak), active && player.isSprinting(),
+                    active && ClientKeyBindingState.isDown(keys.keyBindSneak), active && localSprintIntent(player),
                     active && ClientKeyBindingState.isDown(ClientGravityTicker.BOOST_KEY))
                     : rawView != null ? PlayerPhysicsInput.keyboard(rawView, forward, strafe,
                     active && ClientKeyBindingState.isDown(keys.keyBindJump),
-                    active && ClientKeyBindingState.isDown(keys.keyBindSneak), active && player.isSprinting(),
+                    active && ClientKeyBindingState.isDown(keys.keyBindSneak), active && localSprintIntent(player),
                     active && ClientKeyBindingState.isDown(ClientGravityTicker.BOOST_KEY))
                     : session.keyboardControls(player.rotationYaw, forward, strafe, headForward,
                     active && ClientKeyBindingState.isDown(keys.keyBindJump),
-                    active && ClientKeyBindingState.isDown(keys.keyBindSneak), active && player.isSprinting(),
+                    active && ClientKeyBindingState.isDown(keys.keyBindSneak), active && localSprintIntent(player),
                     active && ClientKeyBindingState.isDown(ClientGravityTicker.BOOST_KEY),
                     acceptedEffectiveBodyReference(player));
         }

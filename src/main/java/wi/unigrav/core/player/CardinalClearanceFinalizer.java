@@ -1,6 +1,8 @@
 package wi.unigrav.core.player;
 
 import java.util.Optional;
+import java.util.function.BooleanSupplier;
+import dev.crlhitbox.api.geometry.Aabb;
 import net.minecraft.util.math.AxisAlignedBB;
 
 /** The only mutation point for the verified composite path. A failed tail is never replayed. */
@@ -27,10 +29,49 @@ final class CardinalClearanceFinalizer {
                     return new CardinalReorientation.Rejected(CardinalReorientation.Reason.TARGET_OCCUPIED,
                             "clearance full target changed before install");
             }
-            var admission = tx.reserve(tx.nextLedgerSequence(), budgetTick, prepared.centerPathUpper());
+            return installTarget(tx, target, prepared.centerPathUpper(), CardinalFrame.Y_POS,
+                    budgetTick, nativeRestore, prepared::current);
+        } catch (RuntimeException failure) {
+            return failed(tx, failure);
+        }
+    }
+    /** A stationary arc uses the same journal, custody and terminal response as clearance. */
+    static CardinalReorientation.Outcome installArc(FreeOwnerTransaction tx,
+            WorldCollisionCandidates.Snapshot capture, Aabb window,
+            CapsulePathSource source, CardinalRealizedArcRecipe.Prepared recipe,
+            CapsuleArcValidator.VerifiedArc arc, PlayerBodyPlacement target, CardinalFrame frame,
+            long budgetTick, boolean nativeRestore) {
+        try {
+            tx.requireCurrent();
+            if (!source.current() || !arc.matchesBound(source)
+                    || !recipe.recipe().matchesFullCardinalTarget(target)
+                    || !target.center().equals(tx.accepted().placement().center()))
+                return rejected("stationary Cardinal arc lost its exact target or source");
+            var observed = WorldCollisionCandidates.capture(tx, window,
+                    CollisionQueryFootprint.QueryPolicy.CAPSULE_CONTACT, CardinalClearancePrepared.SCAN);
+            if (observed instanceof WorldCollisionCandidates.Unavailable failure)
+                return new CardinalReorientation.Rejected(CardinalReorientation.Reason.WORLD_UNAVAILABLE,
+                        "stationary Cardinal arc preinstall capture: " + failure.detail(), failure.cause());
+            tx.requireCurrent();
+            if (!capture.sameObservation((WorldCollisionCandidates.Snapshot) observed)
+                    || !source.current() || !arc.matchesBound(source))
+                return rejected("stationary Cardinal arc observation changed before install");
+            return installTarget(tx, target, 0D, frame, budgetTick, nativeRestore,
+                    () -> source.current() && arc.matchesBound(source)
+                            && recipe.recipe().matchesFullCardinalTarget(target));
+        } catch (RuntimeException failure) {
+            return failed(tx, failure);
+        }
+    }
+
+    private static CardinalReorientation.Outcome installTarget(FreeOwnerTransaction tx,
+            PlayerBodyPlacement target, double pathUpper, CardinalFrame frame,
+            long budgetTick, boolean nativeRestore, BooleanSupplier proofCurrent) {
+        try {
+            var admission = tx.reserve(tx.nextLedgerSequence(), budgetTick, pathUpper);
             if (!admission.accepted()) return rejected("clearance center-path reservation rejected: " + admission.failure());
-            tx.requireReservedPath(prepared.centerPathUpper());
-            if (!prepared.current()) return rejected("clearance proof expired after reservation");
+            tx.requireReservedPath(pathUpper);
+            if (!proofCurrent.getAsBoolean()) return rejected("clearance proof expired after reservation");
             var actor = tx.actor();
             var journal = tx.prepareInstallation(target);
             tx.beginInstallation(journal);
@@ -47,13 +88,13 @@ final class CardinalClearanceFinalizer {
                 tx.recordMutationFailure(journal, failure);
                 throw failure;
             }
-            tx.commit(target, prepared.centerPathUpper());
+            tx.commit(target, pathUpper);
             // Old contacts are not an observation at the installed target.
             actor.onGround = false;
             actor.collidedHorizontally = false;
             actor.collidedVertically = false;
             var support = CardinalReorientation.observeSupport(tx.world(), actor, journal.journal(),
-                    CardinalFrame.Y_POS, nativeRestore);
+                    frame, nativeRestore);
             if (support.grounded().isEmpty() && support.cause().isPresent()) {
                 // The observation has already failed. A later authority fence must not replace its cause.
                 var original = support.cause().orElseThrow();
@@ -74,17 +115,22 @@ final class CardinalClearanceFinalizer {
             tx.requireCurrent();
             tx.stageTerminalResponse(provisional ->
                     CapsuleMoveFinalizer.applyCardinalIdentityResponse(tx));
-            return new CardinalReorientation.Recovered(snapshot, CardinalFrame.Y_POS, grounded);
+            return new CardinalReorientation.Recovered(snapshot, frame, grounded);
         } catch (RuntimeException failure) {
-            tx.recordFailure(failure);
-            if (tx.installationStage() == FreeOwnerTransaction.InstallationStage.INSTALLED
-                    || tx.installationStage() == FreeOwnerTransaction.InstallationStage.PARTIAL)
-                return new CardinalReorientation.CommittedFailure(tx.installedJournal().orElseThrow(),
-                        tx.originalFailure().orElse(failure), tx.installationCustody());
-            return new CardinalReorientation.Rejected(CardinalReorientation.Reason.WORLD_UNAVAILABLE,
-                    "clearance failed before native installation", Optional.of(failure));
+            return failed(tx, failure);
         }
     }
+
+    private static CardinalReorientation.Outcome failed(FreeOwnerTransaction tx, RuntimeException failure) {
+        tx.recordFailure(failure);
+        if (tx.installationStage() == FreeOwnerTransaction.InstallationStage.INSTALLED
+                || tx.installationStage() == FreeOwnerTransaction.InstallationStage.PARTIAL)
+            return new CardinalReorientation.CommittedFailure(tx.installedJournal().orElseThrow(),
+                    tx.originalFailure().orElse(failure), tx.installationCustody());
+        return new CardinalReorientation.Rejected(CardinalReorientation.Reason.WORLD_UNAVAILABLE,
+                "Cardinal reference failed before native installation", Optional.of(failure));
+    }
+
     private static CardinalReorientation.Rejected rejected(String detail) {
         return new CardinalReorientation.Rejected(CardinalReorientation.Reason.ACTOR_CHANGED, detail);
     }

@@ -43,6 +43,29 @@ final class CardinalRealizedArcRecipe {
         this.targetContainment = targetContainment; this.halfLength = halfLength; this.work = work;
     }
 
+    /** Bind the stationary arc to the exact full collider that its owner will install. */
+    static Result prepare(CardinalCapsuleContainment.Contained certificate, PlayerBodyPlacement fullTarget,
+            StoredDyadic.Work work) {
+        if (!(fullTarget.shape() instanceof PlayerBodyShape.Cardinal targetCardinal)
+                || !(certificate.source().placement().shape() instanceof PlayerBodyShape.Cardinal sourceCardinal)
+                || !StoredRealizationLimits.sameRaw(fullTarget.center(), certificate.source().placement().center())
+                || !StoredRealizationLimits.sameRaw(fullTarget.attitude(), targetCardinal.frame().attitude())
+                || !StoredRealizationLimits.sameRaw(targetCardinal.dimensions(), sourceCardinal.dimensions()))
+            return unavailable(Reason.TARGET_DOMAIN, "stationary full target changed center, frame or dimensions");
+        var selected = prepare(certificate, targetCardinal.frame(), work);
+        if (selected instanceof Unavailable failure) return failure;
+        var previous = ((Prepared) selected).recipe();
+        var accepted = certificate.source();
+        var targetSnapshot = new PlayerPhysicalSnapshot(accepted.scope(), accepted.revision(), fullTarget,
+                accepted.worldVelocity(), accepted.contacts());
+        var containment = CardinalCapsuleContainment.prepare(targetSnapshot, previous.target, work);
+        if (!(containment instanceof CardinalCapsuleContainment.Contained targetCertificate))
+            return unavailable(Reason.TARGET_CONTAINMENT, "stationary arc target is outside its exact installed collider");
+        var recipe = new CardinalRealizedArcRecipe(previous.source, previous.start, previous.target,
+                targetCertificate, previous.halfLength, work, null, null, fullTarget);
+        return new Prepared(recipe, CapsuleArcEnclosure.prepareFixed(recipe, sourceCardinal.frame().up(), work));
+    }
+
     static Result prepare(CardinalCapsuleContainment.Contained certificate, CardinalFrame targetFrame,
             StoredDyadic.Work work) {
         Objects.requireNonNull(certificate); Objects.requireNonNull(targetFrame); Objects.requireNonNull(work);
@@ -239,7 +262,7 @@ final class CardinalRealizedArcRecipe {
         return true;
     }
     boolean matchesFullCardinalTarget(PlayerBodyPlacement exactTarget) {
-        return translatedSource != null && fullTarget == exactTarget;
+        return fullTarget != null && fullTarget == exactTarget;
     }
     boolean matchesPathSource(CapsulePathSource pathSource) {
         return translatedSource == null ? pathSource.isContainedRoot(source)

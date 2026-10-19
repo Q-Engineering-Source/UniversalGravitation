@@ -92,6 +92,8 @@ public final class CardinalPredictionStep {
         var frame = shape.frame();
         var bounds = box(state.placement().bounds());
         boolean grounded = state.contacts().onGround();
+        // Match native jump ordering: the last committed contact supplies this tick's input.
+        boolean jumpGrounded = grounded;
         if (grounded && environment.standingReference()) {
             var support = ledger.resolve(new CardinalMovementResolver.Request(frame, bounds,
                     frame.toWorld(new Vec3d(0, -1.0e-4, 0)), MoverType.PLAYER, true, false, 0), query);
@@ -111,7 +113,7 @@ public final class CardinalPredictionStep {
         }
         boolean jumped = false;
         if (environment.standingReference() || environment.flying()) {
-            jumped = CardinalTravelKernel.shouldJump(cooldown, controls.jump(), grounded, environment.flying());
+            jumped = CardinalTravelKernel.shouldJump(cooldown, controls.jump(), jumpGrounded, environment.flying());
             if (jumped) {
                 Vec3d local = frame.toLocal(motion);
                 motion = frame.toWorld(new Vec3d(local.x(), environment.jumpLaunch(), local.z()));

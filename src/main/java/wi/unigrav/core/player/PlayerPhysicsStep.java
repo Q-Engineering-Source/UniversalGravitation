@@ -1443,6 +1443,11 @@ public final class PlayerPhysicsStep {
                 // A retained native flag is not sustained support in a region with no standing constraint.
                 actor.onGround = false;
             }
+            // Native jumping consumes the preceding committed movement's contact. A support
+            // observation at the new horizontal endpoint must not erase that input opportunity
+            // when the previous movement has just crossed a descending step edge.
+            boolean jumpGrounded = standingReference && accepted.contacts()
+                    .map(PlayerPhysicalSnapshot.Contacts::onGround).orElse(false);
             if (actor.onGround && standingReference) {
                 var supportRequest = new CardinalMovementResolver.Request(frame, actor.getEntityBoundingBox(),
                         frame.toWorld(new Vec3d(0, -1.0e-4, 0)), MoverType.PLAYER, actor.onGround, false, 0);
@@ -1523,7 +1528,7 @@ public final class PlayerPhysicsStep {
             if (!gliding && (standingReference || fluid || flying)) {
                 if (!flying && !fluid && controls.jump())
                     travel.jumpOutcome = PlayerPhysicsProtocol.JumpOutcome.REJECTED;
-                if (!flying && !fluid && controls.jump() && actor.onGround && travel.jumpTicks == 0) {
+                if (!flying && !fluid && controls.jump() && jumpGrounded && travel.jumpTicks == 0) {
                     travel.jumpTicks = 10;
                     final var jumpPlacement = accepted.placement();
                     final var jumpFrame = frame;

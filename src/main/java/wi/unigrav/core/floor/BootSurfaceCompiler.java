@@ -1,5 +1,7 @@
 package wi.unigrav.core.floor;
 
+import wi.unigrav.core.player.EnvironmentObservationWork;
+
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -111,6 +113,17 @@ public final class BootSurfaceCompiler {
             .thenComparing(Plane::qualification, QUALIFICATION_ORDER);
 
     public static Compilation compile(List<Primitive> observations, Map<Primitive, Qualification> qualifications, Limits limits) {
+        return compileInternal(observations, qualifications, limits, null);
+    }
+
+    public static Compilation compile(List<Primitive> observations, Map<Primitive, Qualification> qualifications,
+            Limits limits, EnvironmentObservationWork work) {
+        Objects.requireNonNull(work).requireCurrent();
+        return compileInternal(observations, qualifications, limits, work);
+    }
+
+    private static Compilation compileInternal(List<Primitive> observations, Map<Primitive, Qualification> qualifications,
+            Limits limits, EnvironmentObservationWork work) {
         Objects.requireNonNull(observations, "observations");
         Objects.requireNonNull(qualifications, "qualifications");
         Objects.requireNonNull(limits, "limits");
@@ -120,16 +133,22 @@ public final class BootSurfaceCompiler {
         }
         Map<Primitive, Qualification> ownedQualifications = Map.copyOf(qualifications);
         List<Primitive> ordered = new ArrayList<>(List.copyOf(observations));
-        ordered.sort(SOURCE_ORDER);
+        Comparator<Primitive> sourceOrder = (left, right) -> {
+            charge(work, EnvironmentObservationWork.Unit.COMPARISON);
+            return SOURCE_ORDER.compare(left, right);
+        };
+        ordered.sort(sourceOrder);
         int rawFaces = 0;
         boolean degenerate = false;
         for (int index = 0; index < ordered.size(); index++) {
+            charge(work, EnvironmentObservationWork.Unit.CLASSIFICATION);
             Primitive current = ordered.get(index);
-            if (index > 0 && SOURCE_ORDER.compare(ordered.get(index - 1), current) == 0) {
+            if (index > 0 && sourceOrder.compare(ordered.get(index - 1), current) == 0) {
                 throw new IllegalArgumentException("duplicate cell/callback ordinal in surface observations");
             }
             Aabb box = current.rawBounds();
             for (int axis = 0; axis < 3; axis++) {
+                charge(work, EnvironmentObservationWork.Unit.FACE_PREDICATE);
                 if (component(box.min(), axis) >= component(box.max(), axis)) {
                     degenerate = true;
                 }
@@ -137,12 +156,14 @@ public final class BootSurfaceCompiler {
         }
         Set<Primitive> observed = Set.copyOf(ordered);
         for (Primitive qualified : ownedQualifications.keySet()) {
+            charge(work, EnvironmentObservationWork.Unit.CLASSIFICATION);
             if (!observed.contains(qualified) || !qualified.magnetic()) {
                 throw new IllegalArgumentException("surface qualification requires an observed magnetic primitive");
             }
         }
         if (degenerate) return unavailable(Reason.DEGENERATE_COLLIDER);
         for (Primitive current : ordered) {
+            charge(work, EnvironmentObservationWork.Unit.CLASSIFICATION);
             if (current.magnetic()) {
                 if (!ownedQualifications.containsKey(current)) return unavailable(Reason.MATERIAL_UNAVAILABLE);
                 rawFaces += 6;
@@ -150,17 +171,22 @@ public final class BootSurfaceCompiler {
         }
         if (rawFaces > limits.maxRawFaces()) return unavailable(Reason.RAW_FACE_LIMIT);
 
-        Map<Plane, List<Candidate>> groups = new TreeMap<>(PLANE_ORDER);
+        Map<Plane, List<Candidate>> groups = new TreeMap<>((left, right) -> {
+            charge(work, EnvironmentObservationWork.Unit.COMPARISON);
+            return PLANE_ORDER.compare(left, right);
+        });
         for (Primitive primitive : ordered) {
+            charge(work, EnvironmentObservationWork.Unit.CLASSIFICATION);
             if (!primitive.magnetic()) continue;
             for (CardinalFrame outward : CardinalFrame.values()) {
+                charge(work, EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
                 int axis = axis(outward);
                 double plane = component(positive(outward) ? primitive.rawBounds().max() : primitive.rawBounds().min(), axis);
                 groups.computeIfAbsent(new Plane(outward, plane, ownedQualifications.get(primitive)), ignored -> new ArrayList<>())
                         .add(new Candidate(project(primitive.rawBounds(), axis), primitive));
             }
         }
-        Budget budget = new Budget(limits);
+        Budget budget = new Budget(limits, work);
         List<Fragment> fragments = new ArrayList<>();
         try {
             for (Map.Entry<Plane, List<Candidate>> group : groups.entrySet()) {
@@ -174,8 +200,12 @@ public final class BootSurfaceCompiler {
 
     private static List<Fragment> compilePlane(Plane plane, List<Candidate> candidates,
                                                List<Primitive> solids, Budget budget) {
-        TreeSet<Double> uCuts = new TreeSet<>();
-        TreeSet<Double> vCuts = new TreeSet<>();
+        Comparator<Double> cutOrder = (left, right) -> {
+            charge(budget.work, EnvironmentObservationWork.Unit.COMPARISON);
+            return Double.compare(left, right);
+        };
+        TreeSet<Double> uCuts = new TreeSet<>(cutOrder);
+        TreeSet<Double> vCuts = new TreeSet<>(cutOrder);
         for (Candidate candidate : candidates) addCuts(candidate.rectangle(), uCuts, vCuts, budget);
         Rect domain = new Rect(uCuts.first(), uCuts.last(), vCuts.first(), vCuts.last());
         List<Rect> blockers = new ArrayList<>();
@@ -204,6 +234,7 @@ public final class BootSurfaceCompiler {
             List<Primitive> runOwners = List.of();
             double runStart = vs.getFirst();
             for (int v = 0; v + 1 < vs.size(); v++) {
+                charge(budget.work, EnvironmentObservationWork.Unit.CLASSIFICATION);
                 Rect tile = new Rect(us.get(u), us.get(u + 1), vs.get(v), vs.get(v + 1));
                 List<Primitive> owners = owners(tile, candidates, blockers, budget);
                 if (!owners.equals(runOwners)) {
@@ -345,21 +376,30 @@ public final class BootSurfaceCompiler {
 
     private static final class Budget {
         private final Limits limits;
+        private final EnvironmentObservationWork work;
         private long tiles;
         private long checks;
         private int fragments;
 
-        private Budget(Limits limits) { this.limits = limits; }
+        private Budget(Limits limits, EnvironmentObservationWork work) {
+            this.limits = limits; this.work = work;
+        }
         private void tiles(long count) {
             tiles += count;
             if (tiles > limits.maxTiles()) throw new LimitFailure(Reason.TILE_LIMIT);
         }
         private void coverage() {
+            charge(work, EnvironmentObservationWork.Unit.FACE_PREDICATE);
             if (++checks > limits.maxCoverageChecks()) throw new LimitFailure(Reason.COVERAGE_LIMIT);
         }
         private void fragment() {
             if (++fragments > limits.maxFragments()) throw new LimitFailure(Reason.FRAGMENT_LIMIT);
         }
+    }
+
+    private static void charge(EnvironmentObservationWork work,
+            EnvironmentObservationWork.Unit unit) {
+        if (work != null) work.charge(unit);
     }
 
     private static final class LimitFailure extends RuntimeException {

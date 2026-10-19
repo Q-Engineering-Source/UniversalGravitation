@@ -1,0 +1,27 @@
+# run30 原生姿态恢复生命周期修复
+
+本文件为本次具体NG与hard方法边界；动态进度仍以唯一推进账本为准。Mainline拥有集成责任，client_prediction_owner在NEW025实施，024核心意图WIP完整保留并停止写入，不把其未完成V13协议混入c8故障修复。
+
+## 实际故障及分层
+
+run30 candidate8：首次TP前fill/setblock/testforblock访问未加载目标区，返回Cannot place/test blocks outside of the world，地面未建；公开TP后坠落死亡。这是场景夹具错误，source03改为公开TP实际加载并读回后再建地面，正式测量前回到Survival/Goff。
+
+死亡后另有真实产品崩溃：22:01:47 `IllegalStateException: Accepted native pose mirror restoration was rejected`，Session.runNativePose307，Artemis AttachAttributes resize经Aqua postTick嵌套于外层native updateSize。crash原件13073 bytes，SHA D558C7F062C44B23921D5124AC25D16055CB6EA97F255C9649372A970DF1432E。不能用修夹具避开死亡代替产品生命周期回归。
+
+现场prediction-events call6542 applyPredictionProjection ENTER，内部call6543 retire(reason Authority installation invalidated)，再6542返回false；前6540/6541仍true，serial285。原日志先出现prediction rebase required，再Session rejected崩溃。证明restorer回调内部发生退役后返回false；Session只在回调前核lifetime/snapshot/correction，回调后仍造synthetic rejected。此时原三元组已失效，catch不能mint typed token，原异常逃逸。死亡后的Mirror.DEAD拒绝是源码支持且需回归复现的机制；若现场未直接记录拒绝enum，不将该enum冒称原始直接观测。
+
+## hard只读方法建议与采用边界
+
+hard会话01a0de5a-21a2-7960-970e-d19bfb0c6c44已实际审阅023源码与crash。Mirror对DEAD的拒绝保留。恢复资格应由Client exact actor/world/handler/connection/scope/session lifetime/acceptedPacket/correction/successfulInstallSerial及本次restorer给出，不能只靠UUID和Session三元组。
+
+- 捕获每次进入的真实restoration lease与原restorer；回调前后、setter阶段核其有效性。进入前已结束或回调中死亡、同UUID新actor、world/TP/新install替代后，旧lease不得继续写mirror、不得制造rejected或向dead发RECOVER。
+- 将BooleanSupplier模糊false窄改为typed结果或等价强制前后判定：RESTORED、LEASE_ENDED_BEFORE_WRITE、FAILED含cause/possiblyPartial。开始写后资格变化仍沿Mutation/retirement/quarantine，不得一律当正常stale掩盖partial责任。
+- nested Aqua/Artemis每层捕获本次operation/restorer/serial，原native callback各执行一次，finally恢复栈，不清新closure。暂不随意改成outermost-only恢复，因为还须证明内层消费者依赖。
+- 原native异常为primary，真实恢复失败作suppressed；旧lease正常结束不新增synthetic异常。仍有效同lease的prepare/proof/installer拒绝或throw必须明确失败并走exactowner有限恢复。旧token不退役successor、不写旧rollback。
+- 正常死亡沿owner失效清理路径，仅身份匹配才清旧restorer；respawn新actor须新成功OWNED/proof，不能凭同UUID复用旧lease。
+
+## 必要回归与运行顺序
+
+先精确c8 555输入复现真实责任seam的RED，再修并测：进入前dead；outer中inner致死；同UUID respawn/world/TP/successor替代；live同lease拒绝/throw仍NG；original X与restore Y保X主Y suppressed；partialsetter后scope改变保quarantine、不旧rollback。最后在真实Aqua+Artemis双层入口验证death→公开respawn→新scope/OWNED及预测恢复。
+
+所有原run30、source02与candidate8身份保存。夹具source03仅SOURCE修复不宣称死亡产品已修；candidate8已知runtime NG仍保留。NEW025受影响编译/回归可执行，完整build、normal FML和下一release候选经实际回执及独审推进；不重跑无关已验项目、不触碰原服。

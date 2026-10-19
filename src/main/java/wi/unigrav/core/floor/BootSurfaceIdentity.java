@@ -1,11 +1,15 @@
 package wi.unigrav.core.floor;
 
+import java.util.AbstractList;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Collections;
+import java.util.RandomAccess;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.LongConsumer;
 
 import dev.crlhitbox.api.geometry.Aabb;
 import dev.crlhitbox.api.geometry.Vec3d;
@@ -48,9 +52,25 @@ public record BootSurfaceIdentity(PlayerPhysicalSnapshot.Scope scope, long rules
      */
     public static BootSurfaceIdentity from(BootSurfaceQuery.Measurements measurements,
                                            BootSurfaceQuery.Candidate candidate) {
+        return from(measurements, candidate, ignored -> { });
+    }
+
+    /** Same derivation with an owner-supplied charge for variable-length identity scans. */
+    public static BootSurfaceIdentity from(BootSurfaceQuery.Measurements measurements,
+                                           BootSurfaceQuery.Candidate candidate,
+                                           LongConsumer postprocessingWork) {
         Objects.requireNonNull(measurements, "measurements");
         Objects.requireNonNull(candidate, "candidate");
-        if (measurements.candidates().stream().noneMatch(actual -> actual == candidate)) {
+        Objects.requireNonNull(postprocessingWork, "postprocessingWork");
+        boolean retainedCandidate = false;
+        for (BootSurfaceQuery.Candidate actual : measurements.candidates()) {
+            postprocessingWork.accept(1);
+            if (actual == candidate) {
+                retainedCandidate = true;
+                break;
+            }
+        }
+        if (!retainedCandidate) {
             throw new IllegalArgumentException("candidate must be the exact candidate retained by measurements");
         }
         BootWorldSurfaces.QualifiedSnapshot qualified = measurements.qualifiedCapture()
@@ -64,22 +84,34 @@ public record BootSurfaceIdentity(PlayerPhysicalSnapshot.Scope scope, long rules
         var fragment = candidate.fragment();
         List<Contributor> witnesses = new ArrayList<>(fragment.contributors().size());
         for (Primitive contributor : fragment.contributors()) {
-            if (!capture.primitives().contains(contributor)) {
+            boolean captured = false;
+            for (Primitive actual : capture.primitives()) {
+                postprocessingWork.accept(1);
+                if (actual == contributor) {
+                    captured = true;
+                    break;
+                }
+            }
+            if (!captured) {
                 throw new IllegalArgumentException("fragment contributor is absent from its qualified capture");
             }
+            postprocessingWork.accept(1);
             MaterialMatch materialMatch = qualified.materialMatches().get(contributor);
             if (materialMatch == null) {
                 throw new IllegalArgumentException("fragment contributor lacks a same-read material match");
             }
+            postprocessingWork.accept(1);
             if (!fragment.qualification().ruleId().equals(materialMatch.selectionId())) {
                 throw new IllegalArgumentException("fragment qualification must match its same-read material selector");
             }
-            witnesses.add(witness(contributor, materialMatch));
+            postprocessingWork.accept(1);
+            witnesses.add(witness(contributor, materialMatch, postprocessingWork));
         }
+        List<Contributor> canonical = canonicalContributors(witnesses, postprocessingWork);
+        // The private marker tells the public record constructor this list is already metered and canonical.
         return new BootSurfaceIdentity(measurements.source().physical().scope(), qualified.rulesRevision(),
-                fragment.geometry(), fragment.qualification(), witnesses);
+                fragment.geometry(), fragment.qualification(), canonical);
     }
-
     /** Deterministic primary provenance cell for adapters; it does not establish physical support. */
     public BlockPos primaryContributorCell() {
         return contributors.getFirst().cell();
@@ -146,53 +178,117 @@ public record BootSurfaceIdentity(PlayerPhysicalSnapshot.Scope scope, long rules
         }
     }
 
-    private static Contributor witness(Primitive primitive, MaterialMatch materialMatch) {
+    private static Contributor witness(Primitive primitive, MaterialMatch materialMatch, LongConsumer work) {
         IBlockState state = primitive.storedState();
         ResourceLocation name = Objects.requireNonNull(Block.REGISTRY.getNameForObject(state.getBlock()),
                 "registered primitive block ID");
         if (Block.REGISTRY.getObject(name) != state.getBlock()) {
             throw new IllegalArgumentException("primitive block registry inverse lookup does not retain its exact block");
         }
-        return new Contributor(primitive.cell(), name.toString(), listedState(state), primitive.rawBounds(),
+        List<StateProperty> listed = listedState(state, work);
+        // The private state marker records the validation and ordering work charged above.
+        return new Contributor(primitive.cell(), name.toString(), listed, primitive.rawBounds(),
                 primitive.ordinal(), materialMatch);
     }
 
-    private static List<StateProperty> listedState(IBlockState state) {
+    private static List<StateProperty> listedState(IBlockState state, LongConsumer work) {
         List<StateProperty> stateProperties = new ArrayList<>(state.getProperties().size());
         for (IProperty<?> property : state.getPropertyKeys()) {
+            work.accept(1);
             stateProperties.add(new StateProperty(property.getName(), canonicalValue(state, property)));
         }
-        return canonicalState(stateProperties);
+        return canonicalState(stateProperties, work);
     }
-
     private static <T extends Comparable<T>> String canonicalValue(IBlockState state, IProperty<T> property) {
         return property.getName(state.getValue(property));
     }
 
     private static List<Contributor> canonicalContributors(List<Contributor> contributors) {
+        return canonicalContributors(contributors, ignored -> { });
+    }
+
+    private static List<Contributor> canonicalContributors(List<Contributor> contributors, LongConsumer work) {
         Objects.requireNonNull(contributors, "contributors");
+        if (contributors instanceof CanonicalContributors canonical) return canonical;
         List<Contributor> ordered = new ArrayList<>(contributors.size());
-        for (Contributor contributor : contributors) ordered.add(Objects.requireNonNull(contributor, "contributor"));
+        for (Contributor contributor : contributors) {
+            work.accept(1);
+            ordered.add(Objects.requireNonNull(contributor, "contributor"));
+        }
         if (ordered.isEmpty()) throw new IllegalArgumentException("boot surface identity requires a contributor");
-        ordered.sort(CONTRIBUTOR_ORDER);
-        return List.copyOf(ordered);
+        boolean sorted = true;
+        for (int index = 1; index < ordered.size(); index++) {
+            if (compareContributors(ordered.get(index - 1), ordered.get(index), work) > 0) sorted = false;
+        }
+        if (!sorted) ordered.sort((left, right) -> compareContributors(left, right, work));
+        return new CanonicalContributors(ordered);
     }
 
     private static List<StateProperty> canonicalState(List<StateProperty> listedState) {
+        return canonicalState(listedState, ignored -> { });
+    }
+
+    private static List<StateProperty> canonicalState(List<StateProperty> listedState, LongConsumer work) {
         Objects.requireNonNull(listedState, "listedState");
+        if (listedState instanceof CanonicalState canonical) return canonical;
         List<StateProperty> ordered = new ArrayList<>(listedState.size());
         Set<String> names = new HashSet<>();
         for (StateProperty property : listedState) {
+            work.accept(1);
             StateProperty nonNullProperty = Objects.requireNonNull(property, "listed state property");
             if (!names.add(nonNullProperty.name())) {
                 throw new IllegalArgumentException("listed state property names must be unique");
             }
             ordered.add(nonNullProperty);
         }
-        ordered.sort(Comparator.naturalOrder());
-        return List.copyOf(ordered);
+        boolean sorted = true;
+        for (int index = 1; index < ordered.size(); index++) {
+            work.accept(1);
+            if (ordered.get(index - 1).compareTo(ordered.get(index)) > 0) sorted = false;
+        }
+        if (!sorted) ordered.sort((left, right) -> {
+            work.accept(1);
+            return left.compareTo(right);
+        });
+        return new CanonicalState(ordered);
     }
 
+    private static int compareContributors(Contributor left, Contributor right, LongConsumer work) {
+        work.accept(1);
+        int compare = compareCell(left.cell(), right.cell());
+        if (compare != 0) return compare;
+        work.accept(1);
+        compare = left.blockRegistryId().compareTo(right.blockRegistryId());
+        if (compare != 0) return compare;
+        compare = compareLists(left.listedState(), right.listedState(), Comparator.naturalOrder(), work);
+        if (compare != 0) return compare;
+        work.accept(1);
+        compare = compareAabb(left.rawBounds(), right.rawBounds());
+        if (compare != 0) return compare;
+        work.accept(1);
+        compare = Integer.compare(left.callbackOrdinal(), right.callbackOrdinal());
+        if (compare != 0) return compare;
+        work.accept(1);
+        compare = left.materialMatch().selectionId().compareTo(right.materialMatch().selectionId());
+        if (compare != 0) return compare;
+        work.accept(1);
+        return Integer.compare(left.materialMatch().evidenceKind().ordinal(), right.materialMatch().evidenceKind().ordinal());
+    }
+
+    /** Private immutable markers avoid repeating already charged canonical scans in record constructors. */
+    private static final class CanonicalContributors extends AbstractList<Contributor> implements RandomAccess {
+        private final List<Contributor> values;
+        private CanonicalContributors(List<Contributor> values) { this.values = Collections.unmodifiableList(values); }
+        @Override public Contributor get(int index) { return values.get(index); }
+        @Override public int size() { return values.size(); }
+    }
+
+    private static final class CanonicalState extends AbstractList<StateProperty> implements RandomAccess {
+        private final List<StateProperty> values;
+        private CanonicalState(List<StateProperty> values) { this.values = Collections.unmodifiableList(values); }
+        @Override public StateProperty get(int index) { return values.get(index); }
+        @Override public int size() { return values.size(); }
+    }
     private static String requireNamespacedId(String value) {
         if (value == null || value.isBlank() || value.indexOf(':') <= 0 || value.indexOf(':') == value.length() - 1) {
             throw new IllegalArgumentException("blockRegistryId must be an exact namespaced ID");
@@ -249,11 +345,18 @@ public record BootSurfaceIdentity(PlayerPhysicalSnapshot.Scope scope, long rules
     }
 
     private static <T> int compareLists(List<T> left, List<T> right, Comparator<? super T> comparator) {
+        return compareLists(left, right, comparator, ignored -> { });
+    }
+
+    private static <T> int compareLists(List<T> left, List<T> right, Comparator<? super T> comparator,
+                                        LongConsumer work) {
         int length = Math.min(left.size(), right.size());
         for (int index = 0; index < length; index++) {
+            work.accept(1);
             int compare = comparator.compare(left.get(index), right.get(index));
             if (compare != 0) return compare;
         }
+        work.accept(1);
         return Integer.compare(left.size(), right.size());
     }
 }

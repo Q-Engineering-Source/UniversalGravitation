@@ -1,0 +1,25 @@
+# 受控死亡/公开重生测试责任边界
+
+本文件记录 run31 工具NG后的最小方法约束。Mainline已授权 driver12 与新控制脚本的窄修复；动态结果仍以唯一推进账本和每轮原始证据为准，不另建验收账本。
+
+Hard会话 `01a0de5a-21a2-7960-970e-d19bfb0c6c44` 已按目标入口§5.1实际只读校核。结论是以下闭环足够，不需要先追清run31在命令之前约33秒发生、来源未观察到的实体替换，不重做c9已接受构建/native/raw门，不扩一般observer框架。
+
+## 工具命令边界
+
+respawn在同client线程捕获exact actor、world与实际引用generation，实际liveness guard必须与该命令关联。alive是正常拒绝，写明确COMMAND_REJECTED(seq/op/reason/actor/generation/alive)后立即return；不得release键位、调用respawnPlayer、关GUI、落到尾部COMMAND_DISPATCHED、置failed或使客户端退出。序号仍消耗，避免同拒绝命令重放；日志写失败仍是意外失败，不假成功。
+
+dead分支保持真实公开respawnPlayer调用一次，记录同seq/actor的CALL与正常RETURN或精确定义ISSUED阶段。调用已发起不代表新actor已完成。真实执行异常保原cause/stack及阶段。若同步回调已换actor/world/GUI，不让旧命令盲目清后继GUI；只对捕获的预期死亡界面做仍有效的原GUI动作。
+
+现sample窄加alive/health，绑定同actor引用世代、world、时间与行号。identityHash只是诊断，不能替代引用比较；不从entityId复用推断实体相同，不从旧GuiGameOver推断命令执行时仍dead。
+
+## 下一实际场景
+
+只消费当前run最新fresh窗口和实际命令回执。登录已经alive则记录初始公开respawn未执行，不补发历史死亡命令。先安全alive拒绝case：实际REJECTED、零respawn CALL、无DISPATCHED，后续无副作用sample仍alive且引用/世界未变。不能只凭进程暂未退出。
+
+受控kill在已有真实生产OWNED/accepted Y_POS/projection及稳定support状态下进行，优先利用当前登录实际受支持位置与公开world field命令建立资格，不无故先建新arena。只有确有必要才复用已接受source03安全setup作为前置。
+
+同一脚本发送一次真实kill，观察同actor真正死亡后立即一次公开respawn。执行时若已alive而拒绝，该公开重生case为NOT_EXECUTED/NG，不补kill或重复respawn刷成功。只有本次CALL/ISSUED→引用generation变化→新scope成功OWNED/安装proof→真实projection与UIE恢复，才通过该链。不得拿先发生的实体替换、旧scope OWNED或noGUI补证明。
+
+先闭合本次真实death/respawn，再继续原source03六向运动。若受控kill后、issued之前又发生不明替换，或issued后新generation/OWNED无法关联，才追该具体窗口的server死亡/重生包与现raw顺序；不预先追任意mod全图。
+
+run30产品原nativePose崩溃与run31工具崩溃分开保留。A/proxy exit1原因为何与最终无端口/lease释放分开记录，不重写clean exit。Aqua/Artemis original host直接次数仍不可用，源码/真实嵌套FML/实际death分层，不把无崩溃冒充直接计数。

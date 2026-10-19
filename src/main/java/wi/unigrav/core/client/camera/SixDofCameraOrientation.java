@@ -2,7 +2,10 @@ package wi.unigrav.core.client.camera;
 
 import java.util.Objects;
 
+import dev.crlhitbox.api.geometry.Vec3d;
+import neofontrender.addons.api.flight.FlightAttitude;
 import wi.unigrav.api.math.Vec3;
+import wi.unigrav.core.player.CardinalFrame;
 
 /**
  * Stateful, pure-Java orientation for the six-degree-of-freedom camera.
@@ -34,6 +37,21 @@ final class SixDofCameraOrientation {
         Quaternion yaw = Quaternion.aboutY(-Math.toRadians(minecraftYawDegrees));
         Quaternion pitch = Quaternion.aboutX(Math.toRadians(minecraftPitchDegrees));
         orientation = yaw.multiply(pitch).normalizedCanonical();
+        initialized = true;
+    }
+
+    /** Installs a complete local-to-world camera attitude without reducing it to Euler angles. */
+    void reset(FlightAttitude attitude) {
+        Objects.requireNonNull(attitude, "attitude");
+        Quaternion next = new Quaternion(attitude.w, attitude.x, attitude.y, attitude.z);
+        if (!next.finite()) {
+            throw new IllegalArgumentException("Camera attitude must be finite");
+        }
+        double length = Math.hypot(Math.hypot(next.w(), next.x()), Math.hypot(next.y(), next.z()));
+        if (!Double.isFinite(length) || length == 0.0) {
+            throw new IllegalArgumentException("Camera attitude must have nonzero magnitude");
+        }
+        orientation = next.normalizedCanonical();
         initialized = true;
     }
 
@@ -160,6 +178,39 @@ final class SixDofCameraOrientation {
         applyLocalDelta(localMouseDelta);
     }
 
+    /** Applies NFR mouse look around accepted physical up and the updated camera-right axis. */
+    void applyCardinalMouseDelta(int deltaX, int deltaY, double sensitivity,
+            boolean invertMouse, Vec3 acceptedUp) {
+        if (!initialized || !finiteUnit(acceptedUp) || !Double.isFinite(sensitivity)) {
+            return;
+        }
+        MouseDelta delta = alignedMouseDelta(deltaX, deltaY, sensitivity, invertMouse);
+        if (delta.magnitudeRadians() == 0.0) {
+            return;
+        }
+
+        orientation = worldAxisRotation(acceptedUp, -delta.yawRadians())
+                .multiply(orientation).normalizedCanonical();
+        Vec3 updatedRight = right();
+        orientation = worldAxisRotation(updatedRight, -delta.pitchRadians())
+                .multiply(orientation).normalizedCanonical();
+    }
+
+    /** Re-expresses a camera target in a newly accepted Cardinal reference basis. */
+    void rebaseCardinal(CardinalFrame oldFrame, Vec3d oldHeading,
+            CardinalFrame newFrame, Vec3d newHeading) {
+        Objects.requireNonNull(oldFrame, "oldFrame");
+        Objects.requireNonNull(oldHeading, "oldHeading");
+        Objects.requireNonNull(newFrame, "newFrame");
+        Objects.requireNonNull(newHeading, "newHeading");
+        if (!initialized) {
+            return;
+        }
+        Quaternion oldBasis = referenceBasis(oldFrame, oldHeading);
+        Quaternion newBasis = referenceBasis(newFrame, newHeading);
+        orientation = newBasis.multiply(oldBasis.conjugate()).multiply(orientation).normalizedCanonical();
+    }
+
     /**
      * Applies a mouse update while enforcing the selected reference horizon.
      * This ON-only path leaves the FREE mouse path unchanged.
@@ -281,6 +332,10 @@ final class SixDofCameraOrientation {
         return new Components(orientation.w(), orientation.x(), orientation.y(), orientation.z());
     }
 
+    FlightAttitude attitude() {
+        return new FlightAttitude(orientation.x(), orientation.y(), orientation.z(), orientation.w());
+    }
+
     Vec3 forward() {
         return rotate(0.0, 0.0, 1.0);
     }
@@ -303,6 +358,28 @@ final class SixDofCameraOrientation {
 
     private static Quaternion worldAxisRotation(Vec3 unitAxis, double angleRadians) {
         return Quaternion.axisAngle(unitAxis.x(), unitAxis.y(), unitAxis.z(), angleRadians);
+    }
+
+    private static Quaternion referenceBasis(CardinalFrame frame, Vec3d tangentHeading) {
+        Vec3 up = fromWorld(frame.up());
+        Vec3 forward = fromWorld(tangentHeading);
+        Vec3 left = cross(up, forward);
+        return Quaternion.fromBasis(left, up, forward);
+    }
+
+    private static Vec3 fromWorld(Vec3d value) {
+        return new Vec3(value.x(), value.y(), value.z());
+    }
+
+    private static Vec3 cross(Vec3 a, Vec3 b) {
+        return new Vec3(a.y() * b.z() - a.z() * b.y(),
+                a.z() * b.x() - a.x() * b.z(), a.x() * b.y() - a.y() * b.x());
+    }
+
+    private static boolean finiteUnit(Vec3 value) {
+        double lengthSquared = value.normSquared();
+        return Double.isFinite(value.x()) && Double.isFinite(value.y()) && Double.isFinite(value.z())
+                && Double.isFinite(lengthSquared) && Math.abs(lengthSquared - 1.0) <= 1.0e-9;
     }
 
     private static double pitchOverflow(double referencePitchRadians, double softPitchRadians) {
@@ -428,6 +505,31 @@ final class SixDofCameraOrientation {
                     Math.cos(halfAngle), axisX * scale, axisY * scale, axisZ * scale);
         }
 
+        private static Quaternion fromBasis(Vec3 left, Vec3 up, Vec3 forward) {
+            double m00 = left.x(), m01 = up.x(), m02 = forward.x();
+            double m10 = left.y(), m11 = up.y(), m12 = forward.y();
+            double m20 = left.z(), m21 = up.z(), m22 = forward.z();
+            double trace = m00 + m11 + m22;
+            if (trace > 0.0) {
+                double scale = Math.sqrt(trace + 1.0) * 2.0;
+                return new Quaternion(0.25 * scale, (m21 - m12) / scale,
+                        (m02 - m20) / scale, (m10 - m01) / scale).normalizedCanonical();
+            }
+            if (m00 > m11 && m00 > m22) {
+                double scale = Math.sqrt(1.0 + m00 - m11 - m22) * 2.0;
+                return new Quaternion((m21 - m12) / scale, 0.25 * scale,
+                        (m01 + m10) / scale, (m02 + m20) / scale).normalizedCanonical();
+            }
+            if (m11 > m22) {
+                double scale = Math.sqrt(1.0 + m11 - m00 - m22) * 2.0;
+                return new Quaternion((m02 - m20) / scale, (m01 + m10) / scale,
+                        0.25 * scale, (m12 + m21) / scale).normalizedCanonical();
+            }
+            double scale = Math.sqrt(1.0 + m22 - m00 - m11) * 2.0;
+            return new Quaternion((m10 - m01) / scale, (m02 + m20) / scale,
+                    (m12 + m21) / scale, 0.25 * scale).normalizedCanonical();
+        }
+
         private Quaternion multiply(Quaternion other) {
             return new Quaternion(
                     Math.fma(w, other.w(), -x * other.x() - y * other.y() - z * other.z()),
@@ -446,6 +548,15 @@ final class SixDofCameraOrientation {
                     w * inverseLength, x * inverseLength, y * inverseLength, z * inverseLength);
             return isCanonical(normalized) ? normalized
                     : new Quaternion(-normalized.w(), -normalized.x(), -normalized.y(), -normalized.z());
+        }
+
+        private Quaternion conjugate() {
+            return new Quaternion(w, -x, -y, -z);
+        }
+
+        private boolean finite() {
+            return Double.isFinite(w) && Double.isFinite(x)
+                    && Double.isFinite(y) && Double.isFinite(z);
         }
 
         private static boolean isCanonical(Quaternion quaternion) {

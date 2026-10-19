@@ -89,6 +89,29 @@ class BootQueryFootprintTest {
     }
 
     @Test
+    void acceptedBodyBoundsJoinOnlyTheRawObservationEnvelopeAndRemainBounded() {
+        var physical = new PlayerPhysicalSnapshot(new PlayerPhysicalSnapshot.Scope(
+                new UUID(0, 31), new UUID(0, 32), 0, 3), 4,
+                new PlayerBodyPlacement(new Vec3d(0.5, 65, 0.5), Rotation3d.identity(),
+                        new PlayerBodyShape.Cardinal(CardinalFrame.Y_POS, BODY)), new Vec3d(0, 0, 0));
+        var source = BootSurfaceGeometry.fromAccepted(physical);
+        var sensorOnly = BootQueryFootprint.plan(source, 1.5, LIMITS);
+        Aabb body = physical.placement().bounds();
+        var bodyAware = BootQueryFootprint.plan(source, 1.5, LIMITS, body);
+
+        assertEquals(1.5, bodyAware.reachMetres(), 0.0,
+                "the additional body collider observation must not enlarge magnetic force range");
+        assertTrue(bodyAware.nativeBounds().max().y() > sensorOnly.nativeBounds().max().y(),
+                "the raw capture must include the accepted body's upper 0.3m beyond the sensor envelope");
+        assertTrue(bodyAware.nativeBounds().min().y() <= body.min().y());
+        assertTrue(bodyAware.nativeBounds().max().y() >= body.max().y());
+
+        var enormous = new Aabb(new Vec3d(-100, -100, -100), new Vec3d(100, 300, 100));
+        assertThrows(IllegalArgumentException.class, () -> BootQueryFootprint.plan(source, 1.5, LIMITS, enormous),
+                "extra collision evidence must fail at finite planner limits instead of expanding work unboundedly");
+    }
+
+    @Test
     void dependencyBudgetIsIndependentOfProducerBudgetAndNoPartialPlanEscapes() {
         var source = source(new Vec3d(0.5, 64.5, 0.5), Rotation3d.identity(), new PlayerBodyShape.Cardinal(CardinalFrame.Y_POS, BODY));
         var plan = BootQueryFootprint.plan(source, 1.5, LIMITS);
@@ -128,12 +151,17 @@ class BootQueryFootprintTest {
 
     @Test
     void emptyHighSpaceDoesNotRequestNonexistentVerticalChunks() {
-        for (double y : new double[] {260, -10, 1e12, -1e12}) {
+        for (double y : new double[] {260, -10, 1e6, -1e6}) {
             var plan = BootQueryFootprint.plan(source(new Vec3d(0, y, 0), Rotation3d.identity(),
                     new PlayerBodyShape.FreeCapsule(BODY)), 1.5, LIMITS);
             assertTrue(plan.producers().isEmpty());
             assertTrue(plan.dependencies().isEmpty());
             assertTrue(plan.columns().isEmpty());
+        }
+        for (double y : new double[] {1e12, -1e12}) {
+            var failure = assertThrows(IllegalArgumentException.class,
+                    () -> source(new Vec3d(0, y, 0), Rotation3d.identity(), new PlayerBodyShape.FreeCapsule(BODY)));
+            assertEquals("center outside stored realization coordinate profile", failure.getMessage());
         }
     }
 
@@ -154,8 +182,9 @@ class BootQueryFootprintTest {
         assertThrows(IllegalArgumentException.class, () -> BootQueryFootprint.plan(source, 1_000_000, LIMITS));
         assertThrows(IllegalArgumentException.class, () -> BootQueryFootprint.plan(source, -1, LIMITS));
         assertThrows(IllegalArgumentException.class, () -> new BootQueryFootprint.Limits(0, 4096, 64, 512));
-        var remote = source(new Vec3d(1e12, 64, 0), Rotation3d.identity(), new PlayerBodyShape.FreeCapsule(BODY));
-        assertThrows(IllegalArgumentException.class, () -> BootQueryFootprint.plan(remote, 1.5, LIMITS));
+        var failure = assertThrows(IllegalArgumentException.class, () -> BootQueryFootprint.plan(
+                source(new Vec3d(1e12, 64, 0), Rotation3d.identity(), new PlayerBodyShape.FreeCapsule(BODY)), 1.5, LIMITS));
+        assertEquals("center outside stored realization coordinate profile", failure.getMessage());
     }
 
     private static BootSurfaceGeometry.Source source(Vec3d center, Rotation3d attitude, PlayerBodyShape shape) {

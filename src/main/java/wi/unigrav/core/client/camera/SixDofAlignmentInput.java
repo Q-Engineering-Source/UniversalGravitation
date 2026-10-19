@@ -1,6 +1,7 @@
 package wi.unigrav.core.client.camera;
 
 import wi.unigrav.api.math.Vec3;
+import wi.unigrav.core.player.CardinalFrame;
 
 /** Pure state for persistent alignment and temporary upright-reference selection. */
 final class SixDofAlignmentInput {
@@ -135,6 +136,17 @@ final class SixDofAlignmentInput {
 
         Vec3 normal() {
             return normal;
+        }
+
+        CardinalFrame cardinalFrame() {
+            return switch (this) {
+                case Y_POS -> CardinalFrame.Y_POS;
+                case Y_NEG -> CardinalFrame.Y_NEG;
+                case X_POS -> CardinalFrame.X_POS;
+                case X_NEG -> CardinalFrame.X_NEG;
+                case Z_POS -> CardinalFrame.Z_POS;
+                case Z_NEG -> CardinalFrame.Z_NEG;
+            };
         }
 
     }

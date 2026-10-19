@@ -1,0 +1,101 @@
+import java.util.zip.ZipFile
+import org.objectweb.asm.*
+import org.objectweb.asm.tree.*
+
+buildscript { dependencies { classpath files(rootProject.buildscript.configurations.classpath) } }
+
+// TEST ONLY: keep actual mapped inherited bodies. This is not production Mixin/refmap evidence.
+def output = layout.buildDirectory.dir('test-installed-free-fall-bridge')
+def prepare = tasks.register('prepareInstalledFreeFallTestBridge') {
+    dependsOn tasks.named('compileJava')
+    inputs.files(sourceSets.main.compileClasspath)
+    inputs.file(file('gradle/scripts/installed-free-fall-test-bridge.gradle'))
+    outputs.dir(output)
+    doLast {
+        String mp='net/minecraft/entity/player/EntityPlayerMP'
+        String player='net/minecraft/entity/player/EntityPlayer'
+        String entity='net/minecraft/entity/Entity'
+        String living='net/minecraft/entity/EntityLivingBase'
+        String hook='wi/unigrav/core/player/InstalledFreeFall'
+        String request=hook+'$Request', callback=hook+'$InheritedCall'
+        String fall='(DZLnet/minecraft/block/state/IBlockState;Lnet/minecraft/util/math/BlockPos;)V'
+        def report=['TEST_ONLY; NOT_PRODUCTION_MIXIN']
+        [mp,entity,living].each { String owner ->
+            def matches=[]
+            sourceSets.main.compileClasspath.files.findAll { it.isFile() && it.name.endsWith('.jar') }.each { jar ->
+                new ZipFile(jar).withCloseable { zip ->
+                    def entry=zip.getEntry(owner+'.class')
+                    if(entry!=null)matches.add([jar:jar,bytes:zip.getInputStream(entry).withCloseable { it.bytes }])
+                }
+            }
+            if(matches.size()!=1)throw new GradleException("Expected exactly one mapped ${owner}, got ${matches.size()}")
+            def node=new ClassNode();new ClassReader(matches[0].bytes as byte[]).accept(node,0)
+            def methods=node.methods.findAll { it.name=='updateFallState' && it.desc==fall }
+            if(methods.size()!=1)throw new GradleException("Native fall selector drift ${owner}")
+            def nativeFall=methods[0]
+            if(owner==mp) {
+                if(node.superName!=player)throw new GradleException('MP superclass drift')
+                def operations=nativeFall.instructions.toArray().findAll { it.opcode>=0 }
+                if(operations.size()!=1 || operations[0].opcode!=Opcodes.RETURN)
+                    throw new GradleException('MP updateFallState is no longer the proven empty override')
+                String bridge='wi/unigrav/core/player/InstalledFreeFallBridge'
+                if(node.interfaces.contains(bridge))throw new GradleException('MP already has installed fall bridge')
+                node.interfaces.add(bridge)
+                def target=new MethodNode(Opcodes.ACC_PRIVATE|Opcodes.ACC_SYNTHETIC,'unigrav$test$inheritedFall',fall,null,null)
+                target.instructions.add(new VarInsnNode(Opcodes.ALOAD,0))
+                target.instructions.add(new VarInsnNode(Opcodes.DLOAD,1))
+                target.instructions.add(new VarInsnNode(Opcodes.ILOAD,3))
+                target.instructions.add(new VarInsnNode(Opcodes.ALOAD,4))
+                target.instructions.add(new VarInsnNode(Opcodes.ALOAD,5))
+                target.instructions.add(new MethodInsnNode(Opcodes.INVOKESPECIAL,player,'updateFallState',fall,false))
+                target.instructions.add(new InsnNode(Opcodes.RETURN));node.methods.add(target)
+                def bridgeMethod=new MethodNode(Opcodes.ACC_PUBLIC|Opcodes.ACC_FINAL,'unigrav$installedFall','(L'+request+';)V',null,null)
+                bridgeMethod.instructions.add(new VarInsnNode(Opcodes.ALOAD,1))
+                bridgeMethod.instructions.add(new VarInsnNode(Opcodes.ALOAD,0))
+                bridgeMethod.instructions.add(new VarInsnNode(Opcodes.ALOAD,0))
+                bridgeMethod.instructions.add(new InvokeDynamicInsnNode('run','(L'+mp+';)L'+callback+';',
+                    new Handle(Opcodes.H_INVOKESTATIC,'java/lang/invoke/LambdaMetafactory','metafactory',
+                    '(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;',false),
+                    Type.getMethodType(fall),new Handle(Opcodes.H_INVOKESPECIAL,mp,'unigrav$test$inheritedFall',fall,false),Type.getMethodType(fall)))
+                bridgeMethod.instructions.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,request,'invoke','(L'+mp+';L'+callback+';)V',false))
+                bridgeMethod.instructions.add(new InsnNode(Opcodes.RETURN));node.methods.add(bridgeMethod)
+                report.add(owner+': emptyOverride=1; inheritedSpecial=1')
+            } else {
+                def expected=owner==entity ? ['getBlock':1,'onFallenUpon':1] :
+                    ['getBlock':2,'isAir':1,'addLandingEffects':1,'spawnParticle':1,'isInWater':1,'handleWaterMovement':1]
+                def counts=[:].withDefault { 0 };int writes=0
+                nativeFall.instructions.toArray().each { insn ->
+                    if(insn instanceof MethodInsnNode && expected.containsKey(insn.name)) {
+                        counts[insn.name]++
+                        if (owner==entity && insn.name=='onFallenUpon') {
+                            if (insn.owner!='net/minecraft/block/Block' || insn.opcode!=Opcodes.INVOKEVIRTUAL
+                                    || insn.desc!='(Lnet/minecraft/world/World;Lnet/minecraft/util/math/BlockPos;Lnet/minecraft/entity/Entity;F)V')
+                                throw new GradleException('Actual native fall callback descriptor drift')
+                            // Keep the original callback's actual receiver/arguments and virtual body.
+                            insn.setOpcode(Opcodes.INVOKESTATIC);insn.owner=hook;insn.name='callFallenUpon'
+                            insn.desc='(Lnet/minecraft/block/Block;Lnet/minecraft/world/World;Lnet/minecraft/util/math/BlockPos;Lnet/minecraft/entity/Entity;F)V'
+                            insn.itf=false
+                        }
+                        def check=new InsnList();check.add(new VarInsnNode(Opcodes.ALOAD,0))
+                        check.add(new MethodInsnNode(Opcodes.INVOKESTATIC,hook,'checkpoint','(L'+entity+';)V',false))
+                        nativeFall.instructions.insert(insn,check)
+                    }
+                    if(insn instanceof FieldInsnNode && insn.opcode==Opcodes.PUTFIELD && insn.name=='fallDistance' && insn.desc=='F') {
+                        writes++
+                        def check=new InsnList();check.add(new VarInsnNode(Opcodes.ALOAD,0))
+                        check.add(new MethodInsnNode(Opcodes.INVOKESTATIC,hook,'checkpoint','(L'+entity+';)V',false))
+                        nativeFall.instructions.insertBefore(insn,check)
+                    }
+                }
+                if(counts!=expected || writes!=(owner==entity?2:0))
+                    throw new GradleException("Native fall continuation seam drift ${owner}: ${counts}, writes=${writes}")
+                report.add(owner+': callbacks='+counts+'; writes='+writes)
+            }
+            def writer=new ClassWriter(ClassWriter.COMPUTE_MAXS);node.accept(writer)
+            def destination=output.get().file(owner+'.class').asFile;destination.parentFile.mkdirs();destination.bytes=writer.toByteArray()
+            report.add('input='+matches[0].jar+'; sha256='+java.security.MessageDigest.getInstance('SHA-256').digest(matches[0].bytes as byte[]).encodeHex())
+        }
+        output.get().file('installed-fall-bridge-input.txt').asFile.text=report.join('\n')+'\n'
+    }
+}
+tasks.named('test',Test).configure { dependsOn prepare; classpath=files(output)+classpath }

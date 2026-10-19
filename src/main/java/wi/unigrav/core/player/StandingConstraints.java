@@ -129,6 +129,89 @@ public final class StandingConstraints {
         }
     }
 
+    /** Source-separated six-direction field scores, stored without per-tick maps or array copies. */
+    public record FloorStrengths6(double yPositive, double yNegative, double xPositive,
+                                  double xNegative, double zPositive, double zNegative) {
+        public FloorStrengths6 {
+            requireFiniteNonnegative(yPositive, "yPositive floor strength");
+            requireFiniteNonnegative(yNegative, "yNegative floor strength");
+            requireFiniteNonnegative(xPositive, "xPositive floor strength");
+            requireFiniteNonnegative(xNegative, "xNegative floor strength");
+            requireFiniteNonnegative(zPositive, "zPositive floor strength");
+            requireFiniteNonnegative(zNegative, "zNegative floor strength");
+        }
+
+        public static FloorStrengths6 zero() {
+            return new FloorStrengths6(0, 0, 0, 0, 0, 0);
+        }
+
+        public double strength(CardinalFrame frame) {
+            return switch (Objects.requireNonNull(frame, "frame")) {
+                case Y_POS -> yPositive;
+                case Y_NEG -> yNegative;
+                case X_POS -> xPositive;
+                case X_NEG -> xNegative;
+                case Z_POS -> zPositive;
+                case Z_NEG -> zNegative;
+            };
+        }
+
+        private boolean hasAny() {
+            return yPositive > 0.0 || yNegative > 0.0 || xPositive > 0.0
+                    || xNegative > 0.0 || zPositive > 0.0 || zNegative > 0.0;
+        }
+
+        private static FloorStrengths6 fromFloorFaces(Map<Face, Double> strengths) {
+            Objects.requireNonNull(strengths, "strengths");
+            double yPositive = 0.0;
+            double yNegative = 0.0;
+            double xPositive = 0.0;
+            double xNegative = 0.0;
+            double zPositive = 0.0;
+            double zNegative = 0.0;
+            for (Map.Entry<Face, Double> entry : strengths.entrySet()) {
+                Face face = Objects.requireNonNull(entry.getKey(), "floor strength face");
+                double score = Objects.requireNonNull(entry.getValue(), "floor strength");
+                switch (CardinalFrame.fromFloorFace(face)) {
+                    case Y_POS -> yPositive = score;
+                    case Y_NEG -> yNegative = score;
+                    case X_POS -> xPositive = score;
+                    case X_NEG -> xNegative = score;
+                    case Z_POS -> zPositive = score;
+                    case Z_NEG -> zNegative = score;
+                }
+            }
+            return new FloorStrengths6(yPositive, yNegative, xPositive, xNegative, zPositive, zNegative);
+        }
+
+        private static FloorStrengths6 fromPureFaceEvidence(Map<CardinalFrame, FaceEvidence> evidence,
+                                                             ConstraintSource source) {
+            Objects.requireNonNull(evidence, "faceEvidence");
+            Objects.requireNonNull(source, "source");
+            double yPositive = 0.0;
+            double yNegative = 0.0;
+            double xPositive = 0.0;
+            double xNegative = 0.0;
+            double zPositive = 0.0;
+            double zNegative = 0.0;
+            for (Map.Entry<CardinalFrame, FaceEvidence> entry : evidence.entrySet()) {
+                FaceEvidence face = Objects.requireNonNull(entry.getValue(), "faceEvidence");
+                // A legacy merged score has lost its source magnitudes; never promote it to a
+                // pure floor score merely because FLOOR or MAGNETIC appears in its provenance.
+                if (face.sources().size() != 1 || !face.sources().contains(source)) continue;
+                switch (Objects.requireNonNull(entry.getKey(), "faceEvidence key")) {
+                    case Y_POS -> yPositive = face.preSumReferenceScore();
+                    case Y_NEG -> yNegative = face.preSumReferenceScore();
+                    case X_POS -> xPositive = face.preSumReferenceScore();
+                    case X_NEG -> xNegative = face.preSumReferenceScore();
+                    case Z_POS -> zPositive = face.preSumReferenceScore();
+                    case Z_NEG -> zNegative = face.preSumReferenceScore();
+                }
+            }
+            return new FloorStrengths6(yPositive, yNegative, xPositive, xNegative, zPositive, zNegative);
+        }
+    }
+
     /** Tier parameters are explicit engineering/configuration inputs, not inferred product defaults. */
     public record BootTier(FloorFieldProfile profile, double captureReachMetres, long jumpProtectionTicks) {
         public BootTier {
@@ -227,7 +310,16 @@ public final class StandingConstraints {
      */
     public record Evidence(Availability availability, Vec3 gravityAcceleration, Vec3 magneticAcceleration,
                            Map<CardinalFrame, FaceEvidence> faceEvidence,
-                           List<BootCandidate> bootCandidates, Optional<Surface> actualSupport) {
+                           List<BootCandidate> bootCandidates, Optional<Surface> actualSupport,
+                           FloorStrengths6 floorGravityStrengths, FloorStrengths6 floorMagneticStrengths) {
+        public Evidence(Availability availability, Vec3 gravityAcceleration, Vec3 magneticAcceleration,
+                        Map<CardinalFrame, FaceEvidence> faceEvidence,
+                        List<BootCandidate> bootCandidates, Optional<Surface> actualSupport) {
+            this(availability, gravityAcceleration, magneticAcceleration, faceEvidence, bootCandidates, actualSupport,
+                    FloorStrengths6.fromPureFaceEvidence(faceEvidence, ConstraintSource.FLOOR),
+                    FloorStrengths6.fromPureFaceEvidence(faceEvidence, ConstraintSource.MAGNETIC));
+        }
+
         public Evidence {
             Objects.requireNonNull(availability, "availability");
             requireFiniteVector(gravityAcceleration, "gravityAcceleration");
@@ -235,6 +327,8 @@ public final class StandingConstraints {
             Objects.requireNonNull(faceEvidence, "faceEvidence");
             Objects.requireNonNull(bootCandidates, "bootCandidates");
             Objects.requireNonNull(actualSupport, "actualSupport");
+            Objects.requireNonNull(floorGravityStrengths, "floorGravityStrengths");
+            Objects.requireNonNull(floorMagneticStrengths, "floorMagneticStrengths");
 
             EnumMap<CardinalFrame, FaceEvidence> faces = new EnumMap<>(CardinalFrame.class);
             for (Map.Entry<CardinalFrame, FaceEvidence> entry : faceEvidence.entrySet()) {
@@ -252,7 +346,8 @@ public final class StandingConstraints {
             }
             if (availability == Availability.UNAVAILABLE
                     && (!gravityAcceleration.equals(Vec3.ZERO) || !magneticAcceleration.equals(Vec3.ZERO)
-                    || !faces.isEmpty() || !candidates.isEmpty() || actualSupport.isPresent())) {
+                    || !faces.isEmpty() || !candidates.isEmpty() || actualSupport.isPresent()
+                    || floorGravityStrengths.hasAny() || floorMagneticStrengths.hasAny())) {
                 throw new IllegalArgumentException("unavailable evidence must not carry authoritative observations");
             }
             faceEvidence = Collections.unmodifiableMap(faces);
@@ -274,6 +369,12 @@ public final class StandingConstraints {
          * Missing data invalidates the whole observation.
          */
         public Evidence withFloorSample(Optional<StandingSample> floor, boolean gravityApplies) {
+            return withFloorSample(floor, gravityApplies, gravityApplies);
+        }
+
+        /** Adds one real floor observation with independent gravity-force and standing-reference gates. */
+        public Evidence withFloorSample(Optional<StandingSample> floor, boolean gravityForceApplies,
+                                        boolean gravityReferenceApplies) {
             Objects.requireNonNull(floor, "floor");
             if (availability == Availability.UNAVAILABLE || floor.isEmpty()) {
                 return unavailable();
@@ -286,13 +387,16 @@ public final class StandingConstraints {
             StandingSample sample = floor.orElseThrow();
             EnumMap<CardinalFrame, FaceEvidence> faces = new EnumMap<>(CardinalFrame.class);
             faces.putAll(faceEvidence);
-            if (gravityApplies) {
+            if (gravityReferenceApplies) {
                 mergeFloorStrengths(faces, sample.gravityStrengths(), ConstraintSource.FLOOR);
             }
             mergeFloorStrengths(faces, sample.magneticStrengths(), ConstraintSource.MAGNETIC);
             return new Evidence(Availability.AVAILABLE,
-                    gravityApplies ? gravityAcceleration.add(sample.forces().gravityAccel()) : gravityAcceleration,
-                    magneticAcceleration.add(sample.forces().magneticAccel()), faces, bootCandidates, actualSupport);
+                    gravityForceApplies ? gravityAcceleration.add(sample.forces().gravityAccel()) : gravityAcceleration,
+                    magneticAcceleration.add(sample.forces().magneticAccel()), faces, bootCandidates, actualSupport,
+                    gravityReferenceApplies ? FloorStrengths6.fromFloorFaces(sample.gravityStrengths())
+                            : FloorStrengths6.zero(),
+                    FloorStrengths6.fromFloorFaces(sample.magneticStrengths()));
         }
 
         private static void mergeFloorStrengths(EnumMap<CardinalFrame, FaceEvidence> faces,
@@ -489,23 +593,14 @@ public final class StandingConstraints {
     private static Selection select(Evidence evidence, List<BootCandidate> effectiveBoots,
                                     Optional<BootCandidate> rememberedCandidate,
                                     Optional<CardinalFrame> acceptedReference) {
-        Optional<BootCandidate> selectedBoot = rememberedCandidate;
-        Optional<CardinalFrame> target = selectedBoot.map(candidate -> candidate.surface().frame());
-        if (target.isEmpty()) {
-            target = acceptedReference.filter(frame -> isEligibleFrame(evidence, effectiveBoots, frame));
-        }
-        if (target.isEmpty()) {
-            target = evidence.actualSupport().map(Surface::frame).filter(frame -> isEligibleFrame(evidence, effectiveBoots, frame));
-        }
-        if (target.isEmpty()) {
-            target = highestScoringFrame(evidence);
-        }
-        if (target.isEmpty()) {
-            selectedBoot = preferredBoot(effectiveBoots, evidence.actualSupport());
-            target = selectedBoot.map(candidate -> candidate.surface().frame());
-        } else if (selectedBoot.isEmpty()) {
-            selectedBoot = preferredBootFor(target.orElseThrow(), effectiveBoots, evidence.actualSupport());
-        }
+        Optional<CardinalFrame> target = selectEnvironmentReference(evidence, effectiveBoots, acceptedReference)
+                .or(() -> selectNaturalReference(evidence, acceptedReference))
+                .or(() -> selectLegacyCompositeReference(evidence, acceptedReference));
+        Optional<BootCandidate> selectedBoot = target.isPresent()
+                ? preferredBootFor(target.orElseThrow(), effectiveBoots, evidence.actualSupport())
+                        .or(() -> rememberedCandidate)
+                : preferredBoot(effectiveBoots, evidence.actualSupport());
+        if (target.isEmpty()) target = selectedBoot.map(candidate -> candidate.surface().frame());
         Optional<BootCandidate> pullBoot = rememberedCandidate
                 .or(() -> preferredBoot(effectiveBoots, evidence.actualSupport()));
         return new Selection(selectedBoot, pullBoot, target);
@@ -528,27 +623,107 @@ public final class StandingConstraints {
         return candidates.stream().filter(candidate -> candidate.surface().equals(surface)).findFirst();
     }
 
-    private static boolean hasEffectiveFace(Evidence evidence, CardinalFrame frame) {
-        FaceEvidence face = evidence.faceEvidence().get(frame);
-        return face != null && face.isEffective();
+    /** Floor gravity, floor magnetism and qualified boots share one environmental priority tier. */
+    private static Optional<CardinalFrame> selectEnvironmentReference(Evidence evidence, List<BootCandidate> boots,
+                                                                       Optional<CardinalFrame> acceptedReference) {
+        Optional<CardinalFrame> supported = evidence.actualSupport().map(Surface::frame)
+                .filter(frame -> hasEnvironmentReference(evidence, boots, frame));
+        if (supported.isPresent()) return supported;
+        Optional<CardinalFrame> continuous = acceptedReference
+                .filter(frame -> hasEnvironmentReference(evidence, boots, frame));
+        if (continuous.isPresent()) return continuous;
+        return highestEnvironmentReference(evidence, boots);
     }
 
-    private static boolean isEligibleFrame(Evidence evidence, List<BootCandidate> boots, CardinalFrame frame) {
-        return hasEffectiveFace(evidence, frame)
+    private static Optional<CardinalFrame> highestEnvironmentReference(Evidence evidence, List<BootCandidate> boots) {
+        CardinalFrame winner = null;
+        double score = 0.0;
+        for (CardinalFrame frame : CardinalFrame.values()) {
+            double candidate = environmentReferenceScore(evidence, boots, frame);
+            if (candidate > 0.0 && (winner == null || candidate > score)) {
+                winner = frame;
+                score = candidate;
+            }
+        }
+        return Optional.ofNullable(winner);
+    }
+
+    private static boolean hasEnvironmentReference(Evidence evidence, List<BootCandidate> boots, CardinalFrame frame) {
+        return evidence.floorGravityStrengths().strength(frame) > 0.0
+                || evidence.floorMagneticStrengths().strength(frame) > 0.0
                 || boots.stream().anyMatch(candidate -> candidate.surface().frame() == frame);
     }
 
-    private static Optional<CardinalFrame> highestScoringFrame(Evidence evidence) {
+    private static double environmentReferenceScore(Evidence evidence, List<BootCandidate> boots,
+                                                    CardinalFrame frame) {
+        double score = evidence.floorGravityStrengths().strength(frame)
+                + evidence.floorMagneticStrengths().strength(frame);
+        double strongestBoot = 0.0;
+        for (BootCandidate candidate : boots) {
+            if (candidate.surface().frame() == frame) strongestBoot = Math.max(strongestBoot, candidate.pullMagnitude());
+        }
+        score += strongestBoot;
+        requireFiniteNonnegative(score, "environment reference score");
+        return score;
+    }
+
+    private static Optional<CardinalFrame> selectNaturalReference(Evidence evidence,
+                                                                   Optional<CardinalFrame> acceptedReference) {
+        Optional<CardinalFrame> supported = evidence.actualSupport().map(Surface::frame)
+                .filter(frame -> isPureNaturalReference(evidence.faceEvidence().get(frame)));
+        if (supported.isPresent()) return supported;
+        Optional<CardinalFrame> continuous = acceptedReference
+                .filter(frame -> isPureNaturalReference(evidence.faceEvidence().get(frame)));
+        if (continuous.isPresent()) return continuous;
         CardinalFrame winner = null;
         double score = 0.0;
         for (CardinalFrame frame : CardinalFrame.values()) {
             FaceEvidence candidate = evidence.faceEvidence().get(frame);
-            if (candidate != null && candidate.isEffective() && (winner == null || candidate.preSumReferenceScore() > score)) {
+            if (isPureNaturalReference(candidate)
+                    && (winner == null || candidate.preSumReferenceScore() > score)) {
                 winner = frame;
                 score = candidate.preSumReferenceScore();
             }
         }
         return Optional.ofNullable(winner);
+    }
+
+    private static boolean isPureNaturalReference(FaceEvidence evidence) {
+        return evidence != null && evidence.isEffective()
+                && evidence.sources().contains(ConstraintSource.NATURAL_BACKGROUND)
+                && !evidence.sources().contains(ConstraintSource.FLOOR)
+                && !evidence.sources().contains(ConstraintSource.MAGNETIC)
+                && !evidence.sources().contains(ConstraintSource.MIXED);
+    }
+
+    /**
+     * Six-argument legacy callers can supply an already-merged candidate. Keep it as a
+     * generic fallback, but never recover a floor-only magnitude from its composite score.
+     */
+    private static Optional<CardinalFrame> selectLegacyCompositeReference(Evidence evidence,
+                                                                           Optional<CardinalFrame> acceptedReference) {
+        Optional<CardinalFrame> supported = evidence.actualSupport().map(Surface::frame)
+                .filter(frame -> isLegacyComposite(evidence.faceEvidence().get(frame)));
+        if (supported.isPresent()) return supported;
+        Optional<CardinalFrame> continuous = acceptedReference
+                .filter(frame -> isLegacyComposite(evidence.faceEvidence().get(frame)));
+        if (continuous.isPresent()) return continuous;
+        CardinalFrame winner = null;
+        double score = 0.0;
+        for (Map.Entry<CardinalFrame, FaceEvidence> entry : evidence.faceEvidence().entrySet()) {
+            FaceEvidence candidate = entry.getValue();
+            if (!isLegacyComposite(candidate)) continue;
+            if (winner == null || candidate.preSumReferenceScore() > score) {
+                winner = entry.getKey();
+                score = candidate.preSumReferenceScore();
+            }
+        }
+        return Optional.ofNullable(winner);
+    }
+
+    private static boolean isLegacyComposite(FaceEvidence candidate) {
+        if (candidate == null || !candidate.isEffective() || isPureNaturalReference(candidate)) return false;
+        return candidate.sources().size() > 1 || candidate.sources().contains(ConstraintSource.MIXED);
     }
 
     private static Optional<BootCandidate> preferredBootFor(CardinalFrame frame, List<BootCandidate> boots,

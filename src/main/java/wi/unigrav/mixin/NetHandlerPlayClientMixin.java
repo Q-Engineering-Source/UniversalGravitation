@@ -1,6 +1,8 @@
 package wi.unigrav.mixin;
 
 import net.minecraft.client.network.NetHandlerPlayClient;
+import com.llamalad7.mixinextras.sugar.Share;
+import com.llamalad7.mixinextras.sugar.ref.LocalRef;
 import net.minecraft.client.entity.EntityPlayerSP;
 import org.objectweb.asm.Opcodes;
 import net.minecraft.network.NetworkManager;
@@ -52,8 +54,11 @@ public abstract class NetHandlerPlayClientMixin {
                     + "checkThreadAndEnqueue(Lnet/minecraft/network/Packet;"
                     + "Lnet/minecraft/network/INetHandler;Lnet/minecraft/util/IThreadListener;)V",
                     shift = At.Shift.AFTER), require = 1)
-    private void unigrav$captureNativeCorrection(SPacketPlayerPosLook packet, CallbackInfo callback) {
-        RemoteBoostClient.captureNativePositionLook((NetHandlerPlayClient) (Object) this, packet);
+    private void unigrav$captureNativeCorrection(SPacketPlayerPosLook packet, CallbackInfo callback,
+            @Share("unigrav$nativeApply") LocalRef<PlayerPhysicsClient.NativeCorrectionApplication> application) {
+        NetHandlerPlayClient handler = (NetHandlerPlayClient) (Object) this;
+        application.set(PlayerPhysicsClient.captureNativeCorrectionApplication(handler, packet,
+                () -> RemoteBoostClient.captureNativePositionLook(handler, packet)));
     }
 
     /**
@@ -65,9 +70,26 @@ public abstract class NetHandlerPlayClientMixin {
     @Redirect(method = "handlePlayerPosLook(Lnet/minecraft/network/play/server/SPacketPlayerPosLook;)V",
             at = @At(value = "INVOKE", target = "Lnet/minecraft/network/NetworkManager;"
                     + "sendPacket(Lnet/minecraft/network/Packet;)V"), require = 2)
-    private void unigrav$pairNativeCorrection(NetworkManager manager, Packet<?> packet) {
+    private void unigrav$pairNativeCorrection(NetworkManager manager, Packet<?> packet,
+            @Share("unigrav$nativeApply") LocalRef<PlayerPhysicsClient.NativeCorrectionApplication> application) {
         NetHandlerPlayClient handler = (NetHandlerPlayClient) (Object) this;
         manager.sendPacket(RemoteBoostClient.prepareOutgoingPacket(handler, packet));
+        PlayerPhysicsClient.nativeCorrectionReplySent(application.get(), packet);
+    }
+
+    @Inject(method = "handlePlayerPosLook(Lnet/minecraft/network/play/server/SPacketPlayerPosLook;)V",
+            at = @At(value = "INVOKE", target = "Lnet/minecraft/entity/player/EntityPlayer;setPositionAndRotation(DDDFF)V",
+                    shift = At.Shift.AFTER), require = 1)
+    private void unigrav$nativeCorrectionPositionApplied(SPacketPlayerPosLook packet, CallbackInfo callback,
+            @Share("unigrav$nativeApply") LocalRef<PlayerPhysicsClient.NativeCorrectionApplication> application) {
+        PlayerPhysicsClient.nativeCorrectionPositionApplied(application.get(), packet);
+    }
+
+    @Inject(method = "handlePlayerPosLook(Lnet/minecraft/network/play/server/SPacketPlayerPosLook;)V",
+            at = @At("RETURN"), require = 1)
+    private void unigrav$nativeCorrectionApplyReturned(SPacketPlayerPosLook packet, CallbackInfo callback,
+            @Share("unigrav$nativeApply") LocalRef<PlayerPhysicsClient.NativeCorrectionApplication> application) {
+        PlayerPhysicsClient.nativeCorrectionApplicationReturned(application.get(), packet);
     }
 
     @Inject(method = "sendPacket(Lnet/minecraft/network/Packet;)V", at = @At("HEAD"), cancellable = true)
@@ -78,7 +100,13 @@ public abstract class NetHandlerPlayClientMixin {
             // Calling the manager directly avoids recursively re-entering this
             // hook; the FRAME was already sent immediately before this call.
             handler.getNetworkManager().sendPacket(outbound);
+            PlayerPhysicsClient.nativePositionSubmitted(handler, outbound);
             callback.cancel();
         }
     }
+    @Inject(method = "sendPacket(Lnet/minecraft/network/Packet;)V", at = @At("RETURN"), require = 1)
+    private void unigrav$nativeSubmissionReturned(Packet<?> packet, CallbackInfo callback) {
+        PlayerPhysicsClient.nativePositionSubmitted((NetHandlerPlayClient) (Object) this, packet);
+    }
+
 }

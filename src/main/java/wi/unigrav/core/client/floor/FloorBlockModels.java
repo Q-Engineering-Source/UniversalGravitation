@@ -23,6 +23,7 @@ public final class FloorBlockModels {
     public static void registerModels(ModelRegistryEvent event) {
         register(FloorBlocks.GRAVITY_FLOOR);
         register(FloorBlocks.MAGNETIC_FLOOR);
+        register(FloorBlocks.DOUBLE_SIDED_GRAVITY_FLOOR);
     }
 
     private static void register(Block block) {

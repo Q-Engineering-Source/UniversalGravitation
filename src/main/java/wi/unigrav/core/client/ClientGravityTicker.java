@@ -5,15 +5,20 @@ import net.minecraft.client.entity.EntityPlayerSP;
 import net.minecraft.client.settings.KeyBinding;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.text.TextComponentString;
+import net.minecraft.util.text.TextComponentTranslation;
+import net.minecraftforge.fml.common.Loader;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
 
 import org.lwjgl.input.Keyboard;
 
+import java.util.Optional;
+
 import wi.unigrav.api.math.Vec3;
 import wi.unigrav.core.BodyPhysics;
 import wi.unigrav.core.GravityEntityBinder;
 import wi.unigrav.core.TickDriver;
+import wi.unigrav.core.UnigravConfig;
 import wi.unigrav.core.client.boost.RemoteBoostClient;
 import wi.unigrav.core.client.camera.SixDofBoostMotion;
 
@@ -68,7 +73,7 @@ public final class ClientGravityTicker {
         this.binder = binder;
     }
 
-    /** Whether the local creative player is currently using personal zero-G. */
+    /** Whether the local creative player is currently using confirmed personal zero-G. */
     public static boolean isPersonalZeroGActive(EntityPlayerSP player) {
         if (player == null || !player.isCreative()) {
             return false;
@@ -82,6 +87,35 @@ public final class ClientGravityTicker {
                 ? zeroG : RemoteBoostClient.isPersonalZeroGActive(player);
     }
 
+    public static boolean requestedPersonalZeroG(EntityPlayerSP player) {
+        if (player == null || player != Minecraft.getMinecraft().player) return false;
+        return Minecraft.getMinecraft().isIntegratedServerRunning()
+                ? zeroG : RemoteBoostClient.requestedPersonalZeroG();
+    }
+
+    public static Optional<Boolean> acknowledgedPersonalZeroG(EntityPlayerSP player) {
+        if (player == null || player != Minecraft.getMinecraft().player) return Optional.empty();
+        Optional<Boolean> gIntent = ClientGIntent.acknowledgedIntent(player);
+        if (gIntent.isPresent()) return gIntent;
+        return Minecraft.getMinecraft().isIntegratedServerRunning()
+                ? Optional.empty() : RemoteBoostClient.acknowledgedPersonalZeroG(player);
+    }
+
+    /** Existing G intent path shared by the short key press and the pose-backpack GUI. */
+    public static boolean requestPersonalZeroG(EntityPlayerSP player, boolean enabled) {
+        Minecraft minecraft = Minecraft.getMinecraft();
+        if (player == null || player != minecraft.player || minecraft.world == null
+                || player.world != minecraft.world || !player.isCreative()
+                || minecraft.getConnection() == null) return false;
+        if (minecraft.isIntegratedServerRunning()) {
+            zeroG = enabled;
+            player.sendStatusMessage(new TextComponentString(
+                    "UniGrav zero-G: " + (zeroG ? "ON (creative)" : "OFF")), true);
+            return true;
+        }
+        return RemoteBoostClient.requestPersonalZeroG(enabled);
+    }
+
     @SubscribeEvent
     public void onClientTick(TickEvent.ClientTickEvent event) {
         if (event.phase != TickEvent.Phase.END) {
@@ -89,9 +123,11 @@ public final class ClientGravityTicker {
         }
         Minecraft mc = Minecraft.getMinecraft();
         if (mc.world == null || mc.player == null) {
+            sampleGKeyGesture(mc);
             ClientGIntent.reset();
             return;
         }
+        sampleGKeyGesture(mc);
         if (!mc.isIntegratedServerRunning()) {
             RemoteBoostClient.tick(binder);
             ClientGIntent.tick(RemoteBoostClient.requestedPersonalZeroG());
@@ -104,13 +140,6 @@ public final class ClientGravityTicker {
             return;
         }
         EntityPlayerSP player = mc.player;
-        // G key: toggle personal zero-G (creative only). isPressed() drains
-        // the click queue, so this also catches presses from this tick.
-        while (ZERO_G_KEY.isPressed()) {
-            zeroG = !zeroG;
-            player.sendStatusMessage(new TextComponentString(
-                    "UniGrav zero-G: " + (zeroG ? "ON (creative)" : "OFF")), true);
-        }
         // Synchronize the explicit desire, but keep legacy prediction until a complete owner handoff.
         ClientGIntent.tick(zeroG);
         if (PlayerPhysicsClient.owns(player)) return;
@@ -153,5 +182,130 @@ public final class ClientGravityTicker {
                 binder.addImpulse(player, deltaVelocity.scale(mass));
             }
         }
+    }
+
+    private static boolean gHoldTracking;
+    private static boolean gLongPressConsumed;
+    private static boolean ignoreGUntilRelease;
+    private static long gHoldStartedNanos;
+    private static EntityPlayerSP gHoldPlayer;
+    private static Object gHoldWorld;
+    private static Object gHoldConnection;
+    private static int gHoldDimension = Integer.MIN_VALUE;
+
+    /** One physical-key sampler owns G for both the short intent toggle and the long GUI gesture. */
+    private static void sampleGKeyGesture(Minecraft minecraft) {
+        boolean physicalDown = ClientKeyBindingState.isPhysicalDown(ZERO_G_KEY);
+        int queuedPresses = 0;
+        while (ZERO_G_KEY.isPressed()) {
+            queuedPresses = Math.incrementExact(queuedPresses);
+        }
+        boolean inWorld = minecraft.world != null && minecraft.player != null
+                && minecraft.player.world == minecraft.world;
+        boolean focusedInGame = inWorld && minecraft.currentScreen == null
+                && minecraft.inGameHasFocus && !minecraft.isGamePaused();
+        if (!focusedInGame) {
+            boolean interruptedHold = gHoldTracking;
+            if (gHoldTracking) {
+                clearGHold();
+            }
+            if (physicalDown || interruptedHold) ignoreGUntilRelease = true;
+            else {
+                ignoreGUntilRelease = false;
+                clearGHold();
+            }
+            return;
+        }
+        if (gHoldTracking && !sameGHoldContext(minecraft)) {
+            clearGHold();
+            ignoreGUntilRelease = true;
+            return;
+        }
+        if (ignoreGUntilRelease) {
+            if (!physicalDown) {
+                ignoreGUntilRelease = false;
+                clearGHold();
+            }
+            return;
+        }
+        if (physicalDown) {
+            if (!gHoldTracking) {
+                gHoldTracking = true;
+                gLongPressConsumed = false;
+                gHoldStartedNanos = System.nanoTime();
+                captureGHoldContext(minecraft);
+            }
+            int holdMillis = UnigravConfig.poseBackpackGuiHoldMillis;
+            if (holdMillis <= 0) {
+                throw new IllegalStateException("Invalid pose_backpack_gui_hold_millis: " + holdMillis);
+            }
+            long elapsedNanos = System.nanoTime() - gHoldStartedNanos;
+            if (!gLongPressConsumed && elapsedNanos >= holdMillis * 1_000_000L) {
+                gLongPressConsumed = true;
+                openPoseBackpackGui(minecraft.player);
+            }
+            return;
+        }
+        if (gHoldTracking) {
+            int holdMillis = UnigravConfig.poseBackpackGuiHoldMillis;
+            if (holdMillis <= 0) {
+                throw new IllegalStateException("Invalid pose_backpack_gui_hold_millis: " + holdMillis);
+            }
+            boolean longPress = gLongPressConsumed
+                    || System.nanoTime() - gHoldStartedNanos >= holdMillis * 1_000_000L;
+            if (longPress && !gLongPressConsumed) openPoseBackpackGui(minecraft.player);
+            clearGHold();
+            if (!longPress) togglePersonalZeroG(minecraft.player);
+            return;
+        }
+        // Preserve a complete short click that began and ended between client ticks.
+        for (int index = 0; index < queuedPresses; index++) {
+            togglePersonalZeroG(minecraft.player);
+        }
+    }
+
+    private static void captureGHoldContext(Minecraft minecraft) {
+        gHoldPlayer = minecraft.player;
+        gHoldWorld = minecraft.world;
+        gHoldConnection = minecraft.getConnection();
+        gHoldDimension = minecraft.world.provider.getDimension();
+    }
+
+    private static boolean sameGHoldContext(Minecraft minecraft) {
+        return minecraft.player == gHoldPlayer && minecraft.world == gHoldWorld
+                && minecraft.getConnection() == gHoldConnection && minecraft.world != null
+                && minecraft.world.provider.getDimension() == gHoldDimension
+                && minecraft.player != null && minecraft.player.world == minecraft.world;
+    }
+
+    private static void clearGHold() {
+        gHoldTracking = false;
+        gLongPressConsumed = false;
+        gHoldStartedNanos = 0L;
+        gHoldPlayer = null;
+        gHoldWorld = null;
+        gHoldConnection = null;
+        gHoldDimension = Integer.MIN_VALUE;
+    }
+
+    private static void togglePersonalZeroG(EntityPlayerSP player) {
+        if (player == null || !player.isCreative()) {
+            if (player != null) player.sendStatusMessage(
+                    new TextComponentTranslation("message.unigrav.pose_backpack.reason.not_creative"), true);
+            return;
+        }
+        requestPersonalZeroG(player, !requestedPersonalZeroG(player));
+    }
+
+    private static void openPoseBackpackGui(EntityPlayerSP player) {
+        boolean nfr = Loader.isModLoaded("neofontrender");
+        boolean modularUi = Loader.isModLoaded("modularui");
+        if (!nfr || !modularUi) {
+            String missing = !nfr && !modularUi ? "NFR, ModularUI" : (!nfr ? "NFR" : "ModularUI");
+            player.sendStatusMessage(new TextComponentTranslation(
+                    "message.unigrav.pose_backpack.reason.missing_gui", missing), true);
+            return;
+        }
+        NfrPoseBackpackGuiBridge.open();
     }
 }

@@ -7,9 +7,14 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.List;
+import java.util.ArrayList;
+import dev.crlhitbox.api.geometry.Vec3d;
 
+import neofontrender.addons.api.camera.CameraEntityPickGeometry;
 import neofontrender.addons.api.flight.FlightAttitude;
 import neofontrender.addons.api.flight.FlightBodyPose;
+import neofontrender.addons.api.flight.FlightVector;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.entity.AbstractClientPlayer;
 import net.minecraft.client.entity.EntityPlayerSP;
@@ -17,6 +22,7 @@ import net.minecraft.client.network.NetHandlerPlayClient;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.network.INetHandler;
+import net.minecraft.util.math.AxisAlignedBB;
 import net.minecraft.world.World;
 import net.minecraft.client.multiplayer.WorldClient;
 import net.minecraftforge.common.MinecraftForge;
@@ -88,6 +94,16 @@ public final class PlayerRenderPoseMirror {
         return INSTANCE.sampleOnRenderThread(player, partialTicks);
     }
 
+    /** One immutable geometry snapshot per pick; known stale Cardinal entries explicitly suppress native boxes. */
+    public static List<CameraEntityPickGeometry> pickGeometry(World actualWorld, Entity excluded, float partialTicks) {
+        Minecraft mc = Minecraft.getMinecraft();
+        var mirror = INSTANCE;
+        mirror.requireClientThread("tracked pick geometry");
+        if (actualWorld != mc.world || actualWorld != mirror.world || !mirror.currentClientContext(mc)
+                || mirror.cache == null || mirror.welcomeGate.activeRealm() <= 0) return List.of();
+        return mirror.cache.pickGeometry(actualWorld, mirror.localPlayer, excluded, partialTicks, mirror.clientTick);
+    }
+
     private synchronized void enqueue(PlayerRenderPoseProtocol.Packet packet, NetHandlerPlayClient handler) {
         var reservation = inbound.reserve(new Inbound(packet, handler), this::receiveOnClientThread);
         if (reservation == null) {
@@ -134,7 +150,8 @@ public final class PlayerRenderPoseMirror {
         if (packet.kind() == PlayerRenderPoseProtocol.Kind.FREE_LEASE) {
             acceptFreeLease(packet);
         } else if ((packet.kind() == PlayerRenderPoseProtocol.Kind.POSE
-                || packet.kind() == PlayerRenderPoseProtocol.Kind.REMOVE) && cache != null) {
+                || packet.kind() == PlayerRenderPoseProtocol.Kind.REMOVE
+                || packet.kind() == PlayerRenderPoseProtocol.Kind.PRESENTATION_RELEASE) && cache != null) {
             cache.receive(packet, world, localPlayer, clientTick);
         }
     }
@@ -186,10 +203,16 @@ public final class PlayerRenderPoseMirror {
                 || !rendered.isEntityAlive() || rendered.isDead || PlayerKinematics.requiresNative(rendered)) {
             return Optional.empty();
         }
-        Optional<SampledPose> sampled = cache.sample(rendered, currentWorld, localPlayer,
+        Optional<SampledPresentation> sampled = cache.presentation(rendered, currentWorld, localPlayer,
                 Math.max(0.0F, Math.min(1.0F, partialTicks)), clientTick);
         if (sampled.isEmpty()) return Optional.empty();
-        SampledPose pose = sampled.orElseThrow();
+        SampledPresentation presentation = sampled.orElseThrow();
+        SampledPose pose = presentation.pose();
+        if (presentation.geometry() != null) {
+            var offset = presentation.geometry().rootOffset();
+            return Optional.of(FlightBodyPose.modelUpY(attitude(pose.body()), attitude(pose.head()),
+                    new FlightVector(offset.x(), offset.y(), offset.z())));
+        }
         return Optional.of(FlightBodyPose.modelUpY(attitude(pose.body()), attitude(pose.head())));
     }
 
@@ -525,6 +548,8 @@ public final class PlayerRenderPoseMirror {
 
     record SampledPose(PlayerRenderPoseProtocol.Quaternion body,
                        PlayerRenderPoseProtocol.Quaternion head) { }
+    record SampledGeometry(AxisAlignedBB bounds, Vec3d rootOffset) { }
+    record SampledPresentation(SampledPose pose, SampledGeometry geometry) { }
 
     /** Shared production cache seam; the outer mirror supplies the actual current client identities. */
     static final class PoseCache {
@@ -585,7 +610,8 @@ public final class PlayerRenderPoseMirror {
             Objects.requireNonNull(packet, "packet");
             if (!contextMatches(actualWorld, actualLocalPlayer) || packet.serverbound()
                     || (packet.kind() != PlayerRenderPoseProtocol.Kind.POSE
-                    && packet.kind() != PlayerRenderPoseProtocol.Kind.REMOVE)
+                    && packet.kind() != PlayerRenderPoseProtocol.Kind.REMOVE
+                    && packet.kind() != PlayerRenderPoseProtocol.Kind.PRESENTATION_RELEASE)
                     || !boundToken.equals(packet.connectionToken()) || packet.viewerRealm() != boundRealm
                     || packet.dimension() != boundDimension || packet.worldEpoch() != boundWorldEpoch
                     || packet.playerId().equals(boundLocalId) || packet.entityId() == boundLocalEntityId) return false;
@@ -601,9 +627,35 @@ public final class PlayerRenderPoseMirror {
                 return false;
             }
             if (!newerThanFence(packet, priorFence)) return false;
+            if (priorFence != null && priorFence.lifetime == packet.lifetime()
+                    && priorFence.physicsSession != null && packet.geometry() != null
+                    && (!priorFence.physicsSession.equals(packet.geometry().physicsSession())
+                    || priorFence.physicsWorldEpoch != packet.geometry().physicsWorldEpoch())) return false;
             if (priorEntry != null && packet.lifetime() == priorEntry.lifetime) {
                 if (packet.entityId() != priorEntry.entityId || packet.sequence() <= priorEntry.sequence
                         || packet.physicalRevision() < priorEntry.physicalRevision) return false;
+                if (priorEntry.physicsSession != null && packet.geometry() != null
+                        && (!priorEntry.physicsSession.equals(packet.geometry().physicsSession())
+                        || priorEntry.physicsWorldEpoch != packet.geometry().physicsWorldEpoch())) return false;
+                if (priorEntry.geometry != null && packet.geometry() != null
+                        && packet.physicalRevision() == priorEntry.physicalRevision
+                        && !priorEntry.geometry.equals(packet.geometry())) return false;
+            }
+
+            if (packet.kind() == PlayerRenderPoseProtocol.Kind.PRESENTATION_RELEASE) {
+                var release = packet.release();
+                Entity occupant = actualWorld.getEntityByID(packet.entityId());
+                if (priorFence == null || priorFence.lifetime != packet.lifetime()
+                        || priorFence.physicsSession == null
+                        || !priorFence.physicsSession.equals(release.physicsSession())
+                        || priorFence.physicsWorldEpoch != release.physicsWorldEpoch()
+                        || priorFence.entityIdentity != null && priorFence.entityIdentity != occupant
+                        || occupant != null && (!(occupant instanceof EntityPlayer player)
+                        || !player.getUniqueID().equals(packet.playerId()))) return false;
+                advanceFence(packet, true, occupant instanceof EntityPlayer player ? player : null);
+                priorFence.cardinal = false;
+                entries.remove(packet.playerId());
+                return true;
             }
 
             if (packet.kind() == PlayerRenderPoseProtocol.Kind.REMOVE) {
@@ -677,6 +729,61 @@ public final class PlayerRenderPoseMirror {
             return entry != null && entry.lifetime == packet.lifetime() && entry.entityId == packet.entityId()
                     && entry.dimension == packet.dimension() && entry.worldEpoch == packet.worldEpoch()
                     && entry.mode == packet.mode() && entry.cardinalFrame == packet.cardinalFrame();
+        }
+
+        Optional<SampledGeometry> geometry(EntityPlayer entity, World actualWorld, EntityPlayer localPlayer,
+                                           float partialTicks, long tick) {
+            return presentation(entity, actualWorld, localPlayer, partialTicks, tick)
+                    .map(SampledPresentation::geometry);
+        }
+
+        Optional<SampledPresentation> presentation(EntityPlayer entity, World actualWorld, EntityPlayer localPlayer,
+                                                   float partialTicks, long tick) {
+            var pose = sample(entity, actualWorld, localPlayer, partialTicks, tick);
+            if (pose.isEmpty()) return Optional.empty();
+            Entry entry = entries.get(entity.getUniqueID());
+            // A known Cardinal pose without its accepted anchor cannot claim a valid body root.
+            // Returning no render override delegates native rendering; pick remains explicitly suppressed.
+            if (entry.mode == PlayerRenderPoseProtocol.Mode.CARDINAL && entry.geometry == null) return Optional.empty();
+            SampledGeometry geometry = entry.mode != PlayerRenderPoseProtocol.Mode.CARDINAL || entry.geometry == null
+                    ? null : sampleGeometry(entry.geometry, entry.cardinalFrame,
+                    entity.lastTickPosX, entity.lastTickPosY, entity.lastTickPosZ,
+                    entity.posX, entity.posY, entity.posZ, partialTicks);
+            return Optional.of(new SampledPresentation(pose.orElseThrow(), geometry));
+        }
+
+        static SampledGeometry sampleGeometry(PlayerRenderPoseProtocol.CardinalGeometry geometry, int frame,
+                double previousX, double previousY, double previousZ, double x, double y, double z, float partialTicks) {
+            if (!Float.isFinite(partialTicks)) throw new IllegalArgumentException("Non-finite pick interpolation");
+            double alpha = Math.max(0, Math.min(1, partialTicks));
+            var transport = geometry.transport();
+            double dx = previousX + (x - previousX) * alpha - transport.x();
+            double dy = previousY + (y - previousY) * alpha - transport.y();
+            double dz = previousZ + (z - previousZ) * alpha - transport.z();
+            var min = geometry.bounds().min();
+            var max = geometry.bounds().max();
+            return new SampledGeometry(new AxisAlignedBB(min.x() + dx, min.y() + dy, min.z() + dz,
+                    max.x() + dx, max.y() + dy, max.z() + dz), geometry.rootOffset(frame));
+        }
+
+        List<CameraEntityPickGeometry> pickGeometry(World actualWorld, EntityPlayer localPlayer,
+                Entity excluded, float partialTicks, long tick) {
+            if (!contextMatches(actualWorld, localPlayer)) return List.of();
+            var result = new ArrayList<CameraEntityPickGeometry>();
+            // Pending admission below refreshes the access-order fence map. Iterate its bounded snapshot.
+            for (var item : new ArrayList<>(fences.entrySet())) {
+                Fence fence = item.getValue();
+                EntityPlayer entity = fence.entityIdentity;
+                if (entity == null && actualWorld.getEntityByID(fence.entityId) instanceof EntityPlayer arrived
+                        && arrived.getUniqueID().equals(item.getKey())) entity = arrived;
+                if (!fence.cardinal || entity == null || entity == excluded
+                        || entity == localPlayer || entity.world != actualWorld || !entity.isEntityAlive() || entity.isDead
+                        || actualWorld.getEntityByID(fence.entityId) != entity) continue;
+                var geometry = geometry(entity, actualWorld, localPlayer, partialTicks, tick);
+                result.add(geometry.isPresent() ? new CameraEntityPickGeometry(entity, geometry.orElseThrow().bounds())
+                        : CameraEntityPickGeometry.suppressed(entity));
+            }
+            return List.copyOf(result);
         }
 
         Optional<SampledPose> sample(EntityPlayer rendered, World actualWorld, EntityPlayer actualLocalPlayer,
@@ -756,13 +863,24 @@ public final class PlayerRenderPoseMirror {
         private void advanceFence(PlayerRenderPoseProtocol.Packet packet, boolean removed, EntityPlayer identity) {
             Fence prior = fences.get(packet.playerId());
             if (prior == null || packet.lifetime() > prior.lifetime) {
-                fences.put(packet.playerId(), new Fence(packet.lifetime(), packet.sequence(),
-                        packet.physicalRevision(), packet.entityId(), removed, identity));
+                Fence created = new Fence(packet.lifetime(), packet.sequence(),
+                        packet.physicalRevision(), packet.entityId(), removed, identity,
+                        packet.mode() == PlayerRenderPoseProtocol.Mode.CARDINAL);
+                if (packet.geometry() != null) {
+                    created.physicsSession = packet.geometry().physicsSession();
+                    created.physicsWorldEpoch = packet.geometry().physicsWorldEpoch();
+                }
+                fences.put(packet.playerId(), created);
             } else {
                 prior.sequence = packet.sequence();
                 prior.physicalRevision = packet.physicalRevision();
                 prior.entityId = packet.entityId();
                 prior.removed = removed;
+                if (!removed) prior.cardinal = packet.mode() == PlayerRenderPoseProtocol.Mode.CARDINAL;
+                if (packet.geometry() != null) {
+                    prior.physicsSession = packet.geometry().physicsSession();
+                    prior.physicsWorldEpoch = packet.geometry().physicsWorldEpoch();
+                }
                 if (prior.entityIdentity == null) prior.entityIdentity = identity;
                 fences.get(packet.playerId()); // refresh access order
             }
@@ -775,14 +893,18 @@ public final class PlayerRenderPoseMirror {
             private int entityId;
             private boolean removed;
             private EntityPlayer entityIdentity;
+            private boolean cardinal;
+            private UUID physicsSession;
+            private long physicsWorldEpoch;
             private Fence(long lifetime, long sequence, long physicalRevision, int entityId, boolean removed,
-                          EntityPlayer entityIdentity) {
+                          EntityPlayer entityIdentity, boolean cardinal) {
                 this.lifetime = lifetime;
                 this.sequence = sequence;
                 this.physicalRevision = physicalRevision;
                 this.entityId = entityId;
                 this.removed = removed;
                 this.entityIdentity = entityIdentity;
+                this.cardinal = cardinal;
             }
         }
 
@@ -800,6 +922,9 @@ public final class PlayerRenderPoseMirror {
             private PlayerRenderPoseProtocol.Quaternion head;
             private PlayerRenderPoseProtocol.Quaternion previousBody;
             private PlayerRenderPoseProtocol.Quaternion previousHead;
+            private PlayerRenderPoseProtocol.CardinalGeometry geometry;
+            private UUID physicsSession;
+            private long physicsWorldEpoch;
             private long transitionTick;
             private long lastSeenTick;
             private long pendingSinceTick;
@@ -818,6 +943,11 @@ public final class PlayerRenderPoseMirror {
                 cardinalFrame = packet.cardinalFrame();
                 body = packet.body();
                 head = packet.head();
+                geometry = packet.geometry();
+                if (geometry != null) {
+                    physicsSession = geometry.physicsSession();
+                    physicsWorldEpoch = geometry.physicsWorldEpoch();
+                }
                 transitionTick = tick;
                 lastSeenTick = tick;
                 this.pendingSinceTick = pendingSinceTick;
@@ -831,6 +961,10 @@ public final class PlayerRenderPoseMirror {
             private static Entry from(PlayerRenderPoseProtocol.Packet packet, EntityPlayer entity,
                                       Entry previous, long tick) {
                 Entry entry = new Entry(packet, Long.MIN_VALUE, tick, entity);
+                if (previous != null && previous.lifetime == packet.lifetime() && entry.physicsSession == null) {
+                    entry.physicsSession = previous.physicsSession;
+                    entry.physicsWorldEpoch = previous.physicsWorldEpoch;
+                }
                 if (previous != null && previous.lifetime == packet.lifetime()
                         && previous.entityId == packet.entityId() && previous.entityIdentity == entity
                         && previous.mode == packet.mode() && previous.cardinalFrame == packet.cardinalFrame()
@@ -851,6 +985,11 @@ public final class PlayerRenderPoseMirror {
             private void refresh(PlayerRenderPoseProtocol.Packet packet, long tick) {
                 sequence = packet.sequence();
                 physicalRevision = packet.physicalRevision();
+                geometry = packet.geometry();
+                if (geometry != null) {
+                    physicsSession = geometry.physicsSession();
+                    physicsWorldEpoch = geometry.physicsWorldEpoch();
+                }
                 lastSeenTick = tick;
             }
         }

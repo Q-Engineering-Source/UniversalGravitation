@@ -1,31 +1,47 @@
 package wi.unigrav.core.floor;
 
-import java.util.ArrayList;
+import java.util.Objects;
+
+import wi.unigrav.core.player.EnvironmentObservationWork;
+
 import java.util.Collections;
+import java.util.Collection;
 import java.util.EnumMap;
 import java.util.EnumSet;
 import java.util.HashMap;
-import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.Set;
+import java.util.Spliterator;
 import java.util.TreeMap;
+import java.util.function.Consumer;
+import java.util.function.IntFunction;
+import java.util.function.Predicate;
+import java.util.stream.Stream;
 
 import wi.unigrav.api.math.Vec3;
+import wi.unigrav.core.floor.FloorChunkCoverage.PlaneGroup;
+import wi.unigrav.core.floor.FloorChunkCoverage.SectionCoverage;
 import wi.unigrav.core.floor.FloorFieldEmitter.Face;
 
 /**
  * Mutable, single-owner sparse index of floor-field sources for one world.
  *
- * <p>Callers own world isolation and invoke this index from their authoritative
- * server thread. A chunk replacement is validated in full before it replaces
- * that chunk's reverse-owned entries. Samples inspect six face-specific sparse
- * axis columns only; they never scan every registered source.
+ * <p>Each face routes by one tangent page and an ordered normal slice. A routed
+ * slice reads immutable 256-cell coverage instead of retaining a source and
+ * emitter object for every occupied block face.</p>
  */
 public final class FloorFieldIndex {
+    private static final Face[] CANONICAL_FACE_ORDER = Face.values();
+    private static final int ALL_FACE_BITS = (1 << CANONICAL_FACE_ORDER.length) - 1;
+    private static final CanonicalFaceSetTable CANONICAL_FACE_SETS = buildCanonicalFaceSets();
 
-    /** One physical floor block to index. */
+    /** One directional emitter; one physical block may own two opposite-face sources. */
     public record Source(int x, int y, int z, Face face, Kind kind, FloorFieldProfile profile) {
         public Source {
             if (face == null) {
@@ -64,6 +80,9 @@ public final class FloorFieldIndex {
             if (faces == null) {
                 throw new IllegalArgumentException(name + " must not be null");
             }
+            if (faces instanceof CanonicalFaceSet) {
+                return faces;
+            }
             EnumSet<Face> copy = faces.isEmpty()
                     ? EnumSet.noneOf(Face.class)
                     : EnumSet.copyOf(faces);
@@ -71,12 +90,90 @@ public final class FloorFieldIndex {
         }
     }
 
-    /**
-     * One traversal's forces and pre-cancellation standing strengths, in m/s².
-     * Only the index can construct this pair; callers cannot splice observations
-     * from different traversals. Missing strength entries mean zero, not missing
-     * world data. Magnetic strengths already include the actor response.
-     */
+    /** Immutable, privately-created canonical face set used only by indexed samples. */
+    private static final class CanonicalFaceSet implements Set<Face> {
+        private final Set<Face> delegate;
+
+        private CanonicalFaceSet(Set<Face> delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override public int size() { return delegate.size(); }
+        @Override public boolean isEmpty() { return delegate.isEmpty(); }
+        @Override public boolean contains(Object value) { return delegate.contains(value); }
+        @Override public Iterator<Face> iterator() { return delegate.iterator(); }
+        @Override public Object[] toArray() { return delegate.toArray(); }
+        @Override public <T> T[] toArray(T[] target) { return delegate.toArray(target); }
+        @Override public <T> T[] toArray(IntFunction<T[]> generator) { return delegate.toArray(generator); }
+        @Override public boolean containsAll(Collection<?> values) { return delegate.containsAll(values); }
+        @Override public Spliterator<Face> spliterator() { return delegate.spliterator(); }
+        @Override public Stream<Face> stream() { return delegate.stream(); }
+        @Override public Stream<Face> parallelStream() { return delegate.parallelStream(); }
+        @Override public void forEach(Consumer<? super Face> action) { delegate.forEach(action); }
+        @Override public boolean equals(Object other) { return other == this || delegate.equals(other); }
+        @Override public int hashCode() { return delegate.hashCode(); }
+        @Override public String toString() { return delegate.toString(); }
+
+        @Override public boolean add(Face value) { throw immutable(); }
+        @Override public boolean remove(Object value) { throw immutable(); }
+        @Override public boolean addAll(Collection<? extends Face> values) { throw immutable(); }
+        @Override public boolean retainAll(Collection<?> values) { throw immutable(); }
+        @Override public boolean removeAll(Collection<?> values) { throw immutable(); }
+        @Override public void clear() { throw immutable(); }
+        @Override public boolean removeIf(Predicate<? super Face> filter) { throw immutable(); }
+
+        private static UnsupportedOperationException immutable() {
+            return new UnsupportedOperationException("canonical sample face sets are immutable");
+        }
+    }
+
+    private record CanonicalFaceSetTable(CanonicalFaceSet[] sets, int delegateEnumSetCount,
+                                         int unmodifiableDelegateCount, int markerCount) {
+    }
+
+    record CanonicalFaceSetCounts(int tableEntries, int delegateEnumSets,
+                                  int unmodifiableDelegates, int canonicalWrappers) {
+    }
+
+    private static CanonicalFaceSetTable buildCanonicalFaceSets() {
+        if (CANONICAL_FACE_ORDER.length != 6) {
+            throw new ExceptionInInitializerError("canonical floor face table requires exactly six faces");
+        }
+        CanonicalFaceSet[] sets = new CanonicalFaceSet[ALL_FACE_BITS + 1];
+        int delegateEnumSetCount = 0;
+        int unmodifiableDelegateCount = 0;
+        int markerCount = 0;
+        for (int mask = 0; mask < sets.length; mask++) {
+            EnumSet<Face> members = EnumSet.noneOf(Face.class);
+            for (int ordinal = 0; ordinal < CANONICAL_FACE_ORDER.length; ordinal++) {
+                if ((mask & (1 << ordinal)) != 0) {
+                    members.add(CANONICAL_FACE_ORDER[ordinal]);
+                }
+            }
+            delegateEnumSetCount++;
+            Set<Face> immutableDelegate = Collections.unmodifiableSet(members);
+            unmodifiableDelegateCount++;
+            sets[mask] = new CanonicalFaceSet(immutableDelegate);
+            markerCount++;
+        }
+        return new CanonicalFaceSetTable(sets, delegateEnumSetCount,
+                unmodifiableDelegateCount, markerCount);
+    }
+
+    private static Set<Face> canonicalFaces(int mask) {
+        if ((mask & ~ALL_FACE_BITS) != 0) {
+            throw new IllegalArgumentException("sample face mask contains unknown face bits: " + mask);
+        }
+        return CANONICAL_FACE_SETS.sets()[mask];
+    }
+
+    static CanonicalFaceSetCounts canonicalFaceSetCounts() {
+        CanonicalFaceSetTable table = CANONICAL_FACE_SETS;
+        return new CanonicalFaceSetCounts(table.sets().length, table.delegateEnumSetCount(),
+                table.unmodifiableDelegateCount(), table.markerCount());
+    }
+
+    /** Forces and pre-cancellation standing strengths from one traversal. */
     public static final class StandingSample {
         private final Sample forces;
         private final Map<Face, Double> gravityStrengths;
@@ -102,278 +199,1131 @@ public final class FloorFieldIndex {
         }
     }
 
-    private final Map<ChunkKey, ChunkContents> chunks = new HashMap<>();
-    private final Map<ColumnKey, NavigableMap<Integer, IndexedSource>> downColumns = new HashMap<>();
-    private final Map<ColumnKey, NavigableMap<Integer, IndexedSource>> upColumns = new HashMap<>();
-    private final Map<ColumnKey, NavigableMap<Integer, IndexedSource>> northColumns = new HashMap<>();
-    private final Map<ColumnKey, NavigableMap<Integer, IndexedSource>> southColumns = new HashMap<>();
-    private final Map<ColumnKey, NavigableMap<Integer, IndexedSource>> westColumns = new HashMap<>();
-    private final Map<ColumnKey, NavigableMap<Integer, IndexedSource>> eastColumns = new HashMap<>();
-    private final NavigableMap<Double, Integer> registeredRanges = new TreeMap<>();
+    private final Map<ChunkKey, ChunkView> chunks = new HashMap<>();
+    private final EnumMap<Face, Map<PageKey, RoutePage>> routes = new EnumMap<>(Face.class);
+    private final NavigableMap<Double, Long> registeredRanges = new TreeMap<>();
+    private final Runnable beforeLinearizationHook;
+    private final PublicationStageHook publicationStageHook;
     private double maxRegisteredRange;
+    private long clearEpoch;
+    private long rangeEpoch;
+    private boolean closed;
+    private boolean invalid;
+    private Throwable invalidCause;
+
+    public FloorFieldIndex() {
+        this(null);
+    }
+
+    /** Internal pre-publication failure seam; production construction leaves it unset. */
+    FloorFieldIndex(Runnable beforeLinearizationHook) {
+        this(beforeLinearizationHook, null);
+    }
+
+    /** Internal staged-publication failure seam; production construction leaves it unset. */
+    FloorFieldIndex(Runnable beforeLinearizationHook, PublicationStageHook publicationStageHook) {
+        this.beforeLinearizationHook = beforeLinearizationHook;
+        this.publicationStageHook = publicationStageHook;
+        for (Face face : Face.values()) {
+            routes.put(face, new HashMap<>());
+        }
+    }
 
     /**
      * Atomically replaces all indexed sources owned by one loaded chunk generation.
      *
      * <p>The supplied batch must contain only sources belonging to {@code key} and
-     * no duplicate physical block positions. The owner is identity-compared by
-     * {@link #removeChunk(ChunkKey, Object)} so a stale unload cannot erase a
-     * newer chunk generation.
+     * no duplicate emitter identities (block position plus face). Validation and
+     * coverage compilation finish before the prior generation is changed.</p>
      */
     public void replaceChunk(ChunkKey key, Object generationOwner, List<Source> sources) {
         requireChunkAndOwner(key, generationOwner);
-        List<Source> validatedSources = validateBatch(key, sources);
-        List<IndexedSource> indexedSources = new ArrayList<>(validatedSources.size());
-        for (Source source : validatedSources) {
-            indexedSources.add(new IndexedSource(source,
-                    new FloorFieldEmitter(source.x(), source.y(), source.z(), source.face(), source.profile())));
-        }
+        FloorChunkCoverage coverage = FloorChunkCoverage.compile(key, sources);
+        replaceChunkCoverage(key, generationOwner, coverage);
+    }
 
-        ChunkContents previous = chunks.remove(key);
-        if (previous != null) {
-            for (IndexedSource source : previous.sources()) {
-                removeIndexed(source);
-            }
-        }
-        for (IndexedSource source : indexedSources) {
-            addIndexed(source);
-        }
-        chunks.put(key, new ChunkContents(generationOwner, List.copyOf(indexedSources)));
+    /** Publishes a prepared immutable scanner snapshot without expanding it back to per-emitter objects. */
+    void replaceChunkCoverage(ChunkKey key, Object generationOwner, FloorChunkCoverage coverage) {
+        PreparedPublication prepared = prepareReplacement(key, generationOwner, coverage);
+        commitPrepared(prepared);
+    }
+
+    FloorChunkCoverage coverageFor(ChunkKey key, Object generationOwner) {
+        ensureHealthy();
+        ChunkView view = chunks.get(key);
+        PublishedChunk current = view == null ? null : view.current;
+        return current != null && current.owner() == generationOwner ? current.coverage() : null;
     }
 
     /**
-     * Removes a chunk generation if, and only if, {@code generationOwner} is the
-     * exact same object supplied to {@link #replaceChunk(ChunkKey, Object, List)}.
-     *
-     * @return true when this call removed the current generation
+     * Counts the currently published structures for the candidate-only perf diagnostic.
+     * The mask byte count includes only the four primitive {@code long} fields of each
+     * identity-distinct live mask; it is not an estimate of total retained heap.
      */
+    RetainedCounts retainedCounts() {
+        ensureHealthy();
+
+        long publishedChunks = 0L;
+        long coverageCount = 0L;
+        long sections = 0L;
+        long routeBuckets = 0L;
+        long routeShards = 0L;
+        long routePageNormalPrimitivePayloadBytes = 0L;
+        long routePagePresencePrimitivePayloadBytes = 0L;
+        long compactRoutePages = 0L;
+        long wideRoutePages = 0L;
+        long routeShardReferenceSlots = 0L;
+        long coverageBuckets = 0L;
+        long groups = 0L;
+        long physicalBlocks = 0L;
+        long emitters = 0L;
+        Set<FloorChunkCoverage> seenCoverage = Collections.newSetFromMap(new IdentityHashMap<>());
+        Set<FloorChunkCoverage.Mask256> seenMasks = Collections.newSetFromMap(new IdentityHashMap<>());
+        Set<short[]> seenTangentLookups = Collections.newSetFromMap(new IdentityHashMap<>());
+
+        for (ChunkView view : chunks.values()) {
+            PublishedChunk current = view.current;
+            if (current == null) {
+                continue;
+            }
+            publishedChunks = Math.addExact(publishedChunks, 1L);
+            FloorChunkCoverage coverage = current.coverage();
+            if (!seenCoverage.add(coverage)) {
+                continue;
+            }
+
+            coverageCount = Math.addExact(coverageCount, 1L);
+            FloorChunkCoverage.Stats stats = coverage.stats();
+            sections = Math.addExact(sections, stats.nonemptySectionCount());
+            groups = Math.addExact(groups, stats.groupCount());
+            physicalBlocks = Math.addExact(physicalBlocks, stats.physicalBlockCount());
+            emitters = Math.addExact(emitters, stats.emitterCount());
+            coverage.addTangentNormalLookupIdentities(seenTangentLookups);
+
+            for (int sectionIndex = 0; sectionIndex < coverage.sectionCount(); sectionIndex++) {
+                SectionCoverage section = coverage.section(coverage.sectionYAt(sectionIndex));
+                for (Face face : Face.values()) {
+                    int presence = section.normalPresence(face);
+                    while (presence != 0) {
+                        int normal = Integer.numberOfTrailingZeros(presence);
+                        presence &= presence - 1;
+                        coverageBuckets = Math.addExact(coverageBuckets, 1L);
+                        for (PlaneGroup group : section.groups(face, normal)) {
+                            seenMasks.add(group.cells());
+                        }
+                    }
+                }
+            }
+        }
+
+        for (Map<PageKey, RoutePage> faceRoutes : routes.values()) {
+            for (RoutePage routePage : faceRoutes.values()) {
+                if (routePage.normalCount() != 0) {
+                    routeBuckets = Math.addExact(routeBuckets, 1L);
+                    routeShards = Math.addExact(routeShards, routePage.normalCount());
+                    routePageNormalPrimitivePayloadBytes = Math.addExact(routePageNormalPrimitivePayloadBytes,
+                            Math.multiplyExact((long) routePage.normalCount(), Integer.BYTES));
+                    routePagePresencePrimitivePayloadBytes = Math.addExact(routePagePresencePrimitivePayloadBytes,
+                            Long.BYTES);
+                    if (routePage.hasCompactNormalPresence()) {
+                        compactRoutePages = Math.addExact(compactRoutePages, 1L);
+                    } else {
+                        wideRoutePages = Math.addExact(wideRoutePages, 1L);
+                    }
+                    routeShardReferenceSlots = Math.addExact(routeShardReferenceSlots, routePage.normalCount());
+                }
+            }
+        }
+
+        long maskPayloadBytes = Math.multiplyExact((long) seenMasks.size(), 4L * Long.BYTES);
+        long tangentNormalLookupPayloadBytes = Math.multiplyExact((long) seenTangentLookups.size(),
+                256L * Short.BYTES);
+        return new RetainedCounts(publishedChunks, coverageCount, sections, routeBuckets, routeShards,
+                coverageBuckets, groups, physicalBlocks, emitters, seenMasks.size(), maskPayloadBytes,
+                seenTangentLookups.size(), tangentNormalLookupPayloadBytes,
+                routePageNormalPrimitivePayloadBytes, routeShardReferenceSlots,
+                routePagePresencePrimitivePayloadBytes, compactRoutePages, wideRoutePages);
+    }
+
+    long revisionFor(ChunkKey key, Object generationOwner) {
+        ensureHealthy();
+        ChunkView view = chunks.get(key);
+        PublishedChunk current = view == null ? null : view.current;
+        return current != null && current.owner() == generationOwner ? current.revision() : 0L;
+    }
+
+    /** Removes a chunk generation only when its owner is the exact current owner. */
     public boolean removeChunk(ChunkKey key, Object generationOwner) {
         requireChunkAndOwner(key, generationOwner);
-        ChunkContents current = chunks.get(key);
-        if (current == null || current.generationOwner() != generationOwner) {
+        PreparedPublication prepared = prepareRemoval(key, generationOwner);
+        if (prepared == null) {
             return false;
         }
-        chunks.remove(key);
-        for (IndexedSource source : current.sources()) {
-            removeIndexed(source);
-        }
+        commitPrepared(prepared);
         return true;
     }
 
-    /** Releases every indexed source. */
+    /** Releases every indexed source while keeping this index reusable. */
     public void clear() {
+        if (closed) {
+            throw new IllegalStateException("floor field index is closed");
+        }
+        clearPublishedState();
+        invalid = false;
+        invalidCause = null;
+    }
+
+    void close() {
+        if (!closed) {
+            closed = true;
+            clearPublishedState();
+        }
+    }
+
+    private void clearPublishedState() {
+        clearEpoch = Math.incrementExact(clearEpoch);
+        rangeEpoch = Math.incrementExact(rangeEpoch);
+        for (ChunkView view : chunks.values()) {
+            view.invalidate();
+        }
         chunks.clear();
-        downColumns.clear();
-        upColumns.clear();
-        northColumns.clear();
-        southColumns.clear();
-        westColumns.clear();
-        eastColumns.clear();
+        for (Map<PageKey, RoutePage> faceRoutes : routes.values()) {
+            faceRoutes.clear();
+        }
         registeredRanges.clear();
         maxRegisteredRange = 0.0;
     }
 
-    /**
-     * Samples gravity and magnetic acceleration at a finite world point.
-     *
-     * <p>Magnetic acceleration is multiplied by {@code magneticResponse}; a
-     * response of zero reports no magnetic acceleration and no magnetic faces.
-     * The returned face sets record every individually nonzero contribution,
-     * even where opposing vectors cancel in the summed acceleration.
-     */
-    public Sample sample(Vec3 point, double magneticResponse) {
-        return sample(point, magneticResponse, null, null);
+    PreparedPublication prepareReplacement(ChunkKey key, Object generationOwner, FloorChunkCoverage coverage) {
+        requireChunkAndOwner(key, generationOwner);
+        ensureHealthy();
+        if (coverage == null || !coverage.belongsTo(key)) {
+            throw new IllegalArgumentException("coverage must belong to the replacement chunk");
+        }
+
+        ChunkView expectedView = chunks.get(key);
+        PublishedChunk base = expectedView == null ? null : requirePublished(expectedView);
+        ChunkView targetView = base != null && base.owner() == generationOwner ? expectedView : new ChunkView();
+        long revision = base == null ? 1L : Math.incrementExact(base.revision());
+        PublishedChunk next = new PublishedChunk(generationOwner, revision, coverage);
+        RoutePatch[] routePatches = replacementRoutePatches(key, expectedView, targetView,
+                base == null ? null : base.coverage(), coverage);
+        RoutePagePatch[] routePagePatches = prepareRoutePagePatches(routePatches);
+        Map<Double, Long> rangeDeltas = new HashMap<>();
+        if (base != null) {
+            addRangeCounts(rangeDeltas, rangeCounts(base.coverage()), -1);
+        }
+        addRangeCounts(rangeDeltas, rangeCounts(coverage), 1);
+        RangePatch[] rangePatches = prepareRangePatches(rangeDeltas);
+        return new PreparedPublication(key, clearEpoch, rangeEpoch, nextRangeEpoch(rangePatches),
+                expectedView, base, targetView, next,
+                routePatches, routePagePatches, rangePatches, maxRangeAfter(rangePatches));
     }
 
-    /**
-     * Samples the same sparse columns as {@link #sample}, accumulating reference
-     * strengths before opposing vectors cancel. The legacy face sets are not
-     * scores: a positive magnetic response can underflow a contribution to zero,
-     * leaving a legacy face but no effective standing strength.
-     */
+    PreparedPublication prepareDelta(ChunkKey key, Object generationOwner, FloorChunkSources.CoverageDelta delta) {
+        requireChunkAndOwner(key, generationOwner);
+        ensureHealthy();
+        if (delta == null) {
+            throw new IllegalArgumentException("coverage delta must not be null");
+        }
+        ChunkView expectedView = chunks.get(key);
+        PublishedChunk base = expectedView == null ? null : requirePublished(expectedView);
+        if (base == null || base.owner() != generationOwner || base.coverage() != delta.base()) {
+            throw new IllegalStateException("floor coverage delta no longer matches its published generation");
+        }
+        long revision = Math.incrementExact(base.revision());
+        PublishedChunk next = new PublishedChunk(generationOwner, revision, delta.next());
+        RoutePatch[] routePatches = deltaRoutePatches(key, expectedView, delta);
+        RoutePagePatch[] routePagePatches = prepareRoutePagePatches(routePatches);
+        RangePatch[] rangePatches = prepareRangePatches(delta.rangeDeltas());
+        return new PreparedPublication(key, clearEpoch, rangeEpoch, nextRangeEpoch(rangePatches),
+                expectedView, base, expectedView, next,
+                routePatches, routePagePatches, rangePatches, maxRangeAfter(rangePatches));
+    }
+
+    PreparedPublication prepareRemoval(ChunkKey key, Object generationOwner) {
+        requireChunkAndOwner(key, generationOwner);
+        ensureHealthy();
+        ChunkView expectedView = chunks.get(key);
+        PublishedChunk base = expectedView == null ? null : requirePublished(expectedView);
+        if (base == null || base.owner() != generationOwner) {
+            return null;
+        }
+        RoutePatch[] routePatches = removalRoutePatches(key, expectedView, base.coverage());
+        RoutePagePatch[] routePagePatches = prepareRoutePagePatches(routePatches);
+        Map<Double, Long> rangeDeltas = new HashMap<>();
+        addRangeCounts(rangeDeltas, rangeCounts(base.coverage()), -1);
+        RangePatch[] rangePatches = prepareRangePatches(rangeDeltas);
+        return new PreparedPublication(key, clearEpoch, rangeEpoch, nextRangeEpoch(rangePatches),
+                expectedView, base, expectedView, null,
+                routePatches, routePagePatches, rangePatches, maxRangeAfter(rangePatches));
+    }
+
+    boolean isCurrent(PreparedPublication prepared) {
+        if (!isCurrentBase(prepared, false)) {
+            return false;
+        }
+        for (RoutePagePatch patch : prepared.routePagePatches) {
+            if (routes.get(patch.face).get(patch.page) != patch.expectedPage) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean isCurrentBase(PreparedPublication prepared, boolean directoryPutAttempted) {
+        if (prepared == null || closed || invalid || prepared.consumed || prepared.clearEpoch != clearEpoch
+                || prepared.rangeEpoch != rangeEpoch) {
+            return false;
+        }
+        ChunkView expectedDirectory = directoryPutAttempted ? prepared.targetView : prepared.expectedView;
+        if (chunks.get(prepared.key) != expectedDirectory) {
+            return false;
+        }
+        if (prepared.expectedView == null) {
+            return prepared.base == null && prepared.targetView != null && prepared.targetView.current == null
+                    && !prepared.targetView.invalid;
+        }
+        return (prepared.targetView == prepared.expectedView
+                || !prepared.targetView.invalid && prepared.targetView.current == null)
+                && !prepared.expectedView.invalid && prepared.expectedView.current == prepared.base
+                && prepared.base != null
+                && prepared.base.owner() == prepared.expectedOwner()
+                && prepared.base.coverage() == prepared.baseCoverage()
+                && prepared.base.revision() == prepared.baseRevision();
+    }
+
+    ChunkView commitPrepared(PreparedPublication prepared) {
+        if (!isCurrent(prepared)) {
+            throw new IllegalStateException("prepared floor publication is stale or already consumed");
+        }
+        validatePatches(prepared);
+        boolean chunkDirectoryPutAttempted = false;
+        boolean linearized = false;
+        try {
+            stageRouteAndRangeAdditions(prepared);
+            validateStagedPublication(prepared, false);
+            if (beforeLinearizationHook != null) {
+                beforeLinearizationHook.run();
+            }
+            validateStagedPublication(prepared, false);
+            if (prepared.next != null && prepared.targetView != prepared.expectedView) {
+                chunkDirectoryPutAttempted = true;
+                chunks.put(prepared.key, prepared.targetView);
+                afterPublicationStage(PublicationStage.CHUNK_DIRECTORY_INSERTED, 1);
+                validateStagedPublication(prepared, true);
+            }
+
+            // The shared pointer is the publication boundary observed by the scanner and routes.
+            prepared.targetView.current = prepared.next;
+            linearized = true;
+
+            if (prepared.expectedView != null && prepared.expectedView != prepared.targetView) {
+                prepared.expectedView.invalidate();
+            }
+            if (prepared.next == null) {
+                prepared.targetView.invalidate();
+                chunks.remove(prepared.key);
+            }
+            finishRoutePagePatches(prepared.routePagePatches);
+            finishNegativeRangeChanges(prepared.rangePatches);
+            maxRegisteredRange = prepared.nextMaxRange;
+            rangeEpoch = prepared.nextRangeEpoch;
+            prepared.consumed = true;
+            return prepared.next == null ? null : prepared.targetView;
+        } catch (RuntimeException | Error failure) {
+            if (linearized) {
+                invalid = true;
+                invalidCause = failure;
+            } else {
+                rollbackStagedPublication(prepared, chunkDirectoryPutAttempted, failure);
+            }
+            throw failure;
+        }
+    }
+
+    private void validatePatches(PreparedPublication prepared) {
+        for (RoutePatch patch : prepared.routePatches) {
+            RoutedShard current = routeAt(patch.face, patch.page, patch.normal);
+            if (!sameShard(current, patch.expected)) {
+                throw new IllegalStateException("floor route changed after publication preparation");
+            }
+        }
+        for (RangePatch patch : prepared.rangePatches) {
+            Long current = registeredRanges.get(patch.range);
+            if (!sameCount(current, patch.expected)) {
+                throw new IllegalStateException("floor range counts changed after publication preparation");
+            }
+        }
+    }
+
+    private void stageRouteAndRangeAdditions(PreparedPublication prepared) {
+        for (RoutePatch routePatch : prepared.routePatches) {
+            if (routePatch.next == null || sameShard(routePatch.next, routePatch.expected)) {
+                continue;
+            }
+            RoutePagePatch pagePatch = prepared.routePagePatches[routePatch.pagePatchIndex];
+            if (!pagePatch.stageAttempted && pagePatch.stagedPage != pagePatch.expectedPage) {
+                validateStagedPublication(prepared, false);
+                Map<PageKey, RoutePage> byPage = routes.get(pagePatch.face);
+                if (byPage.get(pagePatch.page) != pagePatch.expectedPage) {
+                    throw new IllegalStateException("floor route page changed before staging");
+                }
+                pagePatch.stageAttempted = true;
+                byPage.put(pagePatch.page, pagePatch.stagedPage);
+                if (byPage.get(pagePatch.page) != pagePatch.stagedPage) {
+                    throw new IllegalStateException("floor route page staging did not install its prepared value");
+                }
+            }
+            afterPublicationStage(PublicationStage.ROUTE_PATCH_STAGED, routePatch.hookOrdinal);
+            validateStagedPublication(prepared, false);
+        }
+        int stagedRanges = 0;
+        for (RangePatch patch : prepared.rangePatches) {
+            if (patch.next != null && patch.isIncrease()) {
+                registeredRanges.put(patch.range, patch.next);
+                afterPublicationStage(PublicationStage.RANGE_PATCH_STAGED, ++stagedRanges);
+                validateStagedPublication(prepared, false);
+            }
+        }
+    }
+
+    private void validateStagedPublication(PreparedPublication prepared, boolean directoryPutAttempted) {
+        if (!isCurrentBase(prepared, directoryPutAttempted)) {
+            throw new IllegalStateException("floor publication lost its expected chunk base before linearization");
+        }
+        for (RoutePagePatch patch : prepared.routePagePatches) {
+            RoutePage expected = patch.stageAttempted ? patch.stagedPage : patch.expectedPage;
+            if (routes.get(patch.face).get(patch.page) != expected) {
+                throw new IllegalStateException("floor route page changed during staged publication");
+            }
+        }
+    }
+
+    private void afterPublicationStage(PublicationStage stage, int ordinal) {
+        if (publicationStageHook != null) {
+            publicationStageHook.after(stage, ordinal);
+        }
+    }
+
+    private void rollbackStagedPublication(PreparedPublication prepared, boolean stagedChunkDirectory,
+                                           Throwable failure) {
+        if (stagedChunkDirectory) {
+            try {
+                ChunkView current = chunks.get(prepared.key);
+                if (current == prepared.targetView) {
+                    if (prepared.expectedView == null) {
+                        chunks.remove(prepared.key);
+                    } else {
+                        chunks.put(prepared.key, prepared.expectedView);
+                    }
+                } else if (current != prepared.expectedView) {
+                    throw new IllegalStateException("cannot restore staged chunk view directory entry");
+                }
+            } catch (Throwable restoreFailure) {
+                suppress(failure, restoreFailure);
+                invalid = true;
+                invalidCause = failure;
+            }
+        }
+        for (int i = prepared.rangePatches.length - 1; i >= 0; i--) {
+            RangePatch patch = prepared.rangePatches[i];
+            if (patch.next == null || !patch.isIncrease()) {
+                continue;
+            }
+            try {
+                Long current = registeredRanges.get(patch.range);
+                if (sameCount(current, patch.next)) {
+                    if (patch.expected == null) {
+                        registeredRanges.remove(patch.range);
+                    } else {
+                        registeredRanges.put(patch.range, patch.expected);
+                    }
+                } else if (!sameCount(current, patch.expected)) {
+                    throw new IllegalStateException("cannot restore staged floor range count");
+                }
+            } catch (Throwable restoreFailure) {
+                suppress(failure, restoreFailure);
+                invalid = true;
+                invalidCause = failure;
+            }
+        }
+        for (int i = prepared.routePagePatches.length - 1; i >= 0; i--) {
+            RoutePagePatch patch = prepared.routePagePatches[i];
+            if (!patch.stageAttempted || patch.stagedPage == patch.expectedPage) {
+                continue;
+            }
+            try {
+                Map<PageKey, RoutePage> byPage = routes.get(patch.face);
+                RoutePage current = byPage.get(patch.page);
+                if (current == patch.stagedPage) {
+                    if (patch.expectedPage == null) {
+                        byPage.remove(patch.page);
+                    } else {
+                        byPage.put(patch.page, patch.expectedPage);
+                    }
+                } else if (current != patch.expectedPage) {
+                    throw new IllegalStateException("cannot restore staged floor route page identity");
+                }
+                patch.stageAttempted = false;
+            } catch (Throwable restoreFailure) {
+                suppress(failure, restoreFailure);
+                invalid = true;
+                invalidCause = failure;
+            }
+        }
+    }
+
+    private void finishRoutePagePatches(RoutePagePatch[] patches) {
+        for (RoutePagePatch patch : patches) {
+            if (patch.finalPage == patch.stagedPage) {
+                continue;
+            }
+            Map<PageKey, RoutePage> byPage = routes.get(patch.face);
+            if (patch.finalPage == null) {
+                if (!byPage.remove(patch.page, patch.stagedPage)) {
+                    throw new IllegalStateException("missing floor route page during publication retirement");
+                }
+            } else if (!byPage.replace(patch.page, patch.stagedPage, patch.finalPage)) {
+                throw new IllegalStateException("floor route page changed during publication retirement");
+            }
+        }
+    }
+
+    private void finishNegativeRangeChanges(RangePatch[] patches) {
+        for (RangePatch patch : patches) {
+            if (patch.isIncrease() || patch.expected == null) {
+                continue;
+            }
+            if (patch.next == null) {
+                if (registeredRanges.remove(patch.range) != patch.expected) {
+                    throw new IllegalStateException("missing floor range during publication retirement");
+                }
+            } else {
+                if (!sameCount(registeredRanges.get(patch.range), patch.expected)) {
+                    throw new IllegalStateException("floor range changed during publication retirement");
+                }
+                registeredRanges.put(patch.range, patch.next);
+            }
+        }
+    }
+
+    private static void suppress(Throwable failure, Throwable secondary) {
+        if (failure != secondary) {
+            failure.addSuppressed(secondary);
+        }
+    }
+
+    enum PublicationStage {
+        ROUTE_PATCH_STAGED,
+        RANGE_PATCH_STAGED,
+        CHUNK_DIRECTORY_INSERTED
+    }
+
+    @FunctionalInterface
+    interface PublicationStageHook {
+        void after(PublicationStage stage, int ordinal);
+    }
+
+    private void ensureHealthy() {
+        if (closed) {
+            throw new IllegalStateException("floor field index is closed");
+        }
+        if (invalid) {
+            throw new IllegalStateException("floor field index was invalidated after a failed publication", invalidCause);
+        }
+    }
+
+    private static PublishedChunk requirePublished(ChunkView view) {
+        if (view.invalid || view.current == null) {
+            throw new IllegalStateException("floor chunk view has no current publication");
+        }
+        return view.current;
+    }
+
+    private static boolean sameCount(Long first, Long second) {
+        return first == null ? second == null : second != null && first.longValue() == second.longValue();
+    }
+
+    public Sample sample(Vec3 point, double magneticResponse) {
+        return sample(point, magneticResponse, null, null, null);
+    }
+
+    public Sample sample(Vec3 point, double magneticResponse, EnvironmentObservationWork work) {
+        Objects.requireNonNull(work).requireCurrent();
+        return sample(point, magneticResponse, null, null, work);
+    }
+
+    /** Samples forces and pre-cancellation standing strengths in one pass. */
     public StandingSample sampleForStanding(Vec3 point, double magneticResponse) {
+        return sampleForStandingInternal(point, magneticResponse, null);
+    }
+
+    public StandingSample sampleForStanding(Vec3 point, double magneticResponse,
+            EnvironmentObservationWork work) {
+        Objects.requireNonNull(work).requireCurrent();
+        return sampleForStandingInternal(point, magneticResponse, work);
+    }
+
+    private StandingSample sampleForStandingInternal(Vec3 point, double magneticResponse,
+            EnvironmentObservationWork work) {
         EnumMap<Face, Double> gravityStrengths = new EnumMap<>(Face.class);
         EnumMap<Face, Double> magneticStrengths = new EnumMap<>(Face.class);
-        Sample forces = sample(point, magneticResponse, gravityStrengths, magneticStrengths);
+        Sample forces = sample(point, magneticResponse, gravityStrengths, magneticStrengths, work);
         return new StandingSample(forces, gravityStrengths, magneticStrengths);
     }
 
     private Sample sample(Vec3 point, double magneticResponse, EnumMap<Face, Double> gravityStrengths,
-                          EnumMap<Face, Double> magneticStrengths) {
+                          EnumMap<Face, Double> magneticStrengths,
+                          EnvironmentObservationWork work) {
+        ensureHealthy();
         requireFiniteVector(point, "point");
         requireFinite(magneticResponse, "magneticResponse");
         if (magneticResponse < 0.0) {
             throw new IllegalArgumentException("magneticResponse must be nonnegative");
         }
 
-        Vec3 gravity = Vec3.ZERO;
-        Vec3 magnetic = Vec3.ZERO;
-        EnumSet<Face> gravityFaces = EnumSet.noneOf(Face.class);
-        EnumSet<Face> magneticFaces = EnumSet.noneOf(Face.class);
-
+        double gravityX = 0.0;
+        double gravityY = 0.0;
+        double gravityZ = 0.0;
+        double magneticX = 0.0;
+        double magneticY = 0.0;
+        double magneticZ = 0.0;
+        int gravityFaceMask = 0;
+        int magneticFaceMask = 0;
         if (maxRegisteredRange == 0.0) {
-            return new Sample(gravity, magnetic, gravityFaces, magneticFaces);
+            return new Sample(Vec3.ZERO, Vec3.ZERO, canonicalFaces(0), canonicalFaces(0));
         }
 
         for (Face face : Face.values()) {
-            ColumnKey key = columnKey(face, point);
-            if (key == null) {
+            observationCharge(work, EnvironmentObservationWork.Unit.CLASSIFICATION);
+            observationCharge(work, EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
+            Integer first = tangentA(face, point);
+            observationCharge(work, EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
+            Integer second = tangentB(face, point);
+            if (first == null || second == null) {
                 continue;
             }
-            NavigableMap<Integer, IndexedSource> column = columnsFor(face).get(key);
-            if (column == null) {
+            observationCharge(work, EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
+            PageKey page = pageKey(first, second);
+            RoutePage routePage = routes.get(face).get(page);
+            if (routePage == null) {
                 continue;
             }
+            observationCharge(work, EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
+            int bit = Math.floorMod(first, 16) + 16 * Math.floorMod(second, 16);
+            observationCharge(work, EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
             double coordinate = normalCoordinate(face, point);
-            for (IndexedSource indexed : boundedEntries(face, column, coordinate)) {
-                Vec3 contribution = indexed.emitter().accelerationAt(point);
-                if (!hasNonzeroComponent(contribution)) {
-                    continue;
+            int lower;
+            int upper;
+            switch (face) {
+                case UP, SOUTH, EAST -> {
+                    observationCharge(work, EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
+                    lower = floorBound(coordinate - maxRegisteredRange - 1.0);
+                    observationCharge(work, EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
+                    upper = floorBound(coordinate);
                 }
-                if (indexed.source().kind() == Kind.GRAVITY) {
-                    gravity = addChecked(gravity, contribution, "adding gravity contributions");
-                    gravityFaces.add(face);
-                    addStrength(gravityStrengths, face, contribution);
-                } else if (magneticResponse > 0.0) {
-                    Vec3 scaled = scaleChecked(contribution, magneticResponse);
-                    magnetic = addChecked(magnetic, scaled, "adding magnetic contributions");
-                    magneticFaces.add(face);
-                    addStrength(magneticStrengths, face, scaled);
+                case DOWN, NORTH, WEST -> {
+                    observationCharge(work, EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
+                    lower = floorBound(coordinate);
+                    observationCharge(work, EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
+                    upper = floorBound(coordinate + maxRegisteredRange);
+                }
+                default -> throw new IllegalStateException("unknown floor face");
+            }
+            if (lower > upper) {
+                continue;
+            }
+            observationCharge(work, EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
+            int lowerSlice = Math.floorDiv(lower, 16);
+            observationCharge(work, EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
+            int upperSlice = Math.floorDiv(upper, 16);
+            for (int ordinal = routePage.lowerBound(lowerSlice, work); ordinal < routePage.normalCount(); ordinal++) {
+                observationCharge(work, EnvironmentObservationWork.Unit.COMPARISON);
+                int normalSlice = routePage.normalAt(ordinal);
+                if (normalSlice > upperSlice) {
+                    break;
+                }
+                int sliceBase = Math.multiplyExact(normalSlice, 16);
+                RoutedShard shard = routePage.shardAt(ordinal);
+                PublishedChunk publication = requirePublished(shard.view());
+                SectionCoverage section = publication.coverage().section(shard.sectionY());
+                if (section == null) {
+                    throw new IllegalStateException("routed floor coverage lost its section");
+                }
+                observationCharge(work, EnvironmentObservationWork.Unit.FACE_PREDICATE);
+                int faceNormals = section.normalPresence(face);
+                boolean singleNormalFace = Integer.bitCount(faceNormals) == 1;
+                int presence = (singleNormalFace ? faceNormals : section.normalPresenceAtBit(face, bit))
+                        & localNormalMaskWithinClosedBounds(sliceBase, lower, upper);
+                while (presence != 0) {
+                    observationCharge(work, EnvironmentObservationWork.Unit.CLASSIFICATION);
+                    int localNormal = Integer.numberOfTrailingZeros(presence);
+                    presence &= presence - 1;
+                    int normal = Math.addExact(sliceBase, localNormal);
+                    PlaneGroup group = section.groupAt(face, localNormal, bit);
+                    if (group == null) {
+                        if (singleNormalFace) {
+                            continue;
+                        }
+                        throw new IllegalStateException("tangent lookup points to a missing floor plane group");
+                    }
+                    observationCharge(work, EnvironmentObservationWork.Unit.FACE_PREDICATE);
+                    double contribution = strengthAtMatchedCell(face, normal, coordinate, group.profile(), work);
+                    if (contribution != 0.0) {
+                        double contributionX = 0.0;
+                        double contributionY = 0.0;
+                        double contributionZ = 0.0;
+                        switch (face) {
+                            case DOWN -> contributionY = contribution;
+                            case UP -> contributionY = contribution;
+                            case NORTH -> contributionZ = contribution;
+                            case SOUTH -> contributionZ = contribution;
+                            case WEST -> contributionX = contribution;
+                            case EAST -> contributionX = contribution;
+                            default -> throw new IllegalStateException("unknown floor face");
+                        }
+                        if (group.kind() == Kind.GRAVITY) {
+                            gravityX = checkedFinite(gravityX + contributionX, "adding gravity contributions");
+                            gravityY = checkedFinite(gravityY + contributionY, "adding gravity contributions");
+                            gravityZ = checkedFinite(gravityZ + contributionZ, "adding gravity contributions");
+                            gravityFaceMask |= 1 << face.ordinal();
+                            addStrength(gravityStrengths, face, contributionX, contributionY, contributionZ);
+                        } else if (magneticResponse > 0.0) {
+                            double scaledX = checkedFinite(contributionX * magneticResponse,
+                                    "applying magnetic response");
+                            double scaledY = checkedFinite(contributionY * magneticResponse,
+                                    "applying magnetic response");
+                            double scaledZ = checkedFinite(contributionZ * magneticResponse,
+                                    "applying magnetic response");
+                            magneticX = checkedFinite(magneticX + scaledX, "adding magnetic contributions");
+                            magneticY = checkedFinite(magneticY + scaledY, "adding magnetic contributions");
+                            magneticZ = checkedFinite(magneticZ + scaledZ, "adding magnetic contributions");
+                            magneticFaceMask |= 1 << face.ordinal();
+                            addStrength(magneticStrengths, face, scaledX, scaledY, scaledZ);
+                        }
+                    }
                 }
             }
         }
-        return new Sample(gravity, magnetic, gravityFaces, magneticFaces);
+        Vec3 gravity = gravityFaceMask == 0 ? Vec3.ZERO : new Vec3(gravityX, gravityY, gravityZ);
+        Vec3 magnetic = magneticFaceMask == 0 ? Vec3.ZERO : new Vec3(magneticX, magneticY, magneticZ);
+        return new Sample(gravity, magnetic, canonicalFaces(gravityFaceMask), canonicalFaces(magneticFaceMask));
     }
 
-    private static void addStrength(EnumMap<Face, Double> strengths, Face face, Vec3 contribution) {
+    private static void observationCharge(EnvironmentObservationWork work,
+            EnvironmentObservationWork.Unit unit) {
+        if (work != null) work.charge(unit);
+    }
+
+    private static void addStrength(EnumMap<Face, Double> strengths, Face face,
+                                    double contributionX, double contributionY, double contributionZ) {
         if (strengths == null) {
-            return; // The legacy force-only path allocates no standing maps.
+            return;
         }
-        // Every floor contribution has exactly one axial component; no norm
-        // squaring (which could overflow/underflow) or net-force projection.
-        double strength = Math.max(Math.abs(contribution.x()),
-                Math.max(Math.abs(contribution.y()), Math.abs(contribution.z())));
+        double strength = Math.max(Math.abs(contributionX),
+                Math.max(Math.abs(contributionY), Math.abs(contributionZ)));
         if (strength > 0.0) {
             strengths.put(face, checkedFinite(strengths.getOrDefault(face, 0.0) + strength,
                     "adding standing strengths"));
         }
     }
 
-    private List<Source> validateBatch(ChunkKey key, List<Source> sources) {
-        if (sources == null) {
-            throw new IllegalArgumentException("sources must not be null");
+    /** Calculates face-signed strength after the routed bit has matched this tangent cell. */
+    private static double strengthAtMatchedCell(Face face, int normal, double coordinate,
+                                                FloorFieldProfile profile,
+                                                EnvironmentObservationWork work) {
+        observationCharge(work, EnvironmentObservationWork.Unit.CLASSIFICATION);
+        double outwardDistance = switch (face) {
+            case DOWN, NORTH, WEST -> (double) normal - coordinate;
+            case UP, SOUTH, EAST -> coordinate - ((double) normal + 1.0);
+        };
+        if (outwardDistance < 0.0 || outwardDistance >= profile.range()) {
+            return 0.0;
         }
-        List<Source> copy = new ArrayList<>(sources.size());
-        Set<BlockKey> physicalBlocks = new HashSet<>();
-        for (Source source : sources) {
-            if (source == null) {
-                throw new IllegalArgumentException("sources must not contain null");
-            }
-            if (!sourceChunk(source).equals(key)) {
-                throw new IllegalArgumentException("source does not belong to replacement chunk");
-            }
-            if (!physicalBlocks.add(new BlockKey(source.x(), source.y(), source.z()))) {
-                throw new IllegalArgumentException("sources must not duplicate a physical block");
-            }
-            copy.add(source);
+        double strength = profile.strengthAt(outwardDistance);
+        if (strength == 0.0) {
+            return 0.0;
         }
-        return List.copyOf(copy);
+        return switch (face) {
+            case DOWN, NORTH, WEST -> strength;
+            case UP, SOUTH, EAST -> -strength;
+        };
     }
 
-    private void addIndexed(IndexedSource indexed) {
-        Map<ColumnKey, NavigableMap<Integer, IndexedSource>> columns = columnsFor(indexed.source().face());
-        ColumnKey key = columnKey(indexed.source().face(), indexed.source());
-        int coordinate = normalCoordinate(indexed.source().face(), indexed.source());
-        NavigableMap<Integer, IndexedSource> column = columns.computeIfAbsent(key, ignored -> new TreeMap<>());
-        IndexedSource prior = column.putIfAbsent(coordinate, indexed);
-        if (prior != null) {
-            throw new IllegalStateException("duplicate indexed floor-field source");
-        }
-        addRange(indexed.source().profile().range());
-    }
-
-    private void removeIndexed(IndexedSource indexed) {
-        Map<ColumnKey, NavigableMap<Integer, IndexedSource>> columns = columnsFor(indexed.source().face());
-        ColumnKey key = columnKey(indexed.source().face(), indexed.source());
-        NavigableMap<Integer, IndexedSource> column = columns.get(key);
-        if (column == null) {
-            throw new IllegalStateException("missing indexed floor-field column");
-        }
-        int coordinate = normalCoordinate(indexed.source().face(), indexed.source());
-        IndexedSource removed = column.remove(coordinate);
-        if (removed != indexed) {
-            throw new IllegalStateException("floor-field index ownership mismatch");
-        }
-        if (column.isEmpty()) {
-            columns.remove(key);
-        }
-        removeRange(indexed.source().profile().range());
-    }
-
-    private Iterable<IndexedSource> boundedEntries(Face face, NavigableMap<Integer, IndexedSource> column,
-                                                    double pointCoordinate) {
-        int lower;
-        int upper;
-        switch (face) {
-            case UP, SOUTH, EAST -> {
-                lower = floorBound(pointCoordinate - maxRegisteredRange - 1.0);
-                upper = floorBound(pointCoordinate);
+    private RoutePatch[] replacementRoutePatches(ChunkKey key, ChunkView expectedView, ChunkView targetView,
+                                                  FloorChunkCoverage oldCoverage,
+                                                  FloorChunkCoverage nextCoverage) {
+        Map<RouteSlot, RoutedShard> oldRoutes = oldCoverage == null
+                ? Map.of() : routeMap(routeAddresses(key, expectedView, oldCoverage));
+        Map<RouteSlot, RoutedShard> nextRoutes = routeMap(routeAddresses(key, targetView, nextCoverage));
+        List<RoutePatch> patches = new java.util.ArrayList<>();
+        for (Map.Entry<RouteSlot, RoutedShard> entry : oldRoutes.entrySet()) {
+            RouteSlot slot = entry.getKey();
+            RoutedShard expected = entry.getValue();
+            RoutedShard next = nextRoutes.remove(slot);
+            if (!sameShard(routeAt(slot.face(), slot.page(), slot.normal()), expected)) {
+                throw new IllegalStateException("floor route directory disagrees with its published chunk");
             }
-            case DOWN, NORTH, WEST -> {
-                lower = floorBound(pointCoordinate);
-                upper = floorBound(pointCoordinate + maxRegisteredRange);
+            if (!sameShard(next, expected)) {
+                patches.add(routePatch(slot, expected, next));
             }
-            default -> throw new IllegalStateException("unknown floor face");
         }
-        if (lower > upper) {
-            return List.of();
+        for (Map.Entry<RouteSlot, RoutedShard> entry : nextRoutes.entrySet()) {
+            RouteSlot slot = entry.getKey();
+            if (routeAt(slot.face(), slot.page(), slot.normal()) != null) {
+                throw new IllegalStateException("floor coverage route is already owned by another chunk");
+            }
+            patches.add(routePatch(slot, null, entry.getValue()));
         }
-        return column.subMap(lower, true, upper, true).values();
+        return patches.toArray(RoutePatch[]::new);
     }
 
-    private void addRange(double range) {
-        registeredRanges.merge(range, 1, Integer::sum);
-        maxRegisteredRange = registeredRanges.lastKey();
+    private RoutePatch[] deltaRoutePatches(ChunkKey key, ChunkView view, FloorChunkSources.CoverageDelta delta) {
+        List<RoutePatch> patches = new java.util.ArrayList<>();
+        int previousSectionY = 0;
+        Face previousFace = null;
+        boolean hasPrevious = false;
+        for (FloorChunkCoverage.BucketKey changed : delta.changedBuckets()) {
+            int sectionY = changed.sectionY();
+            Face face = changed.face();
+            if (hasPrevious && previousSectionY == sectionY && previousFace == face) {
+                continue;
+            }
+            previousSectionY = sectionY;
+            previousFace = face;
+            hasPrevious = true;
+            SectionCoverage oldSection = delta.base().section(sectionY);
+            SectionCoverage nextSection = delta.next().section(sectionY);
+            boolean oldPresent = oldSection != null && oldSection.normalPresence(face) != 0;
+            boolean nextPresent = nextSection != null && nextSection.normalPresence(face) != 0;
+            if (oldPresent == nextPresent) {
+                continue;
+            }
+            RouteSlot slot = routeSlot(key, face, sectionY);
+            RoutedShard expected = oldPresent ? new RoutedShard(view, face, sectionY) : null;
+            RoutedShard next = nextPresent ? new RoutedShard(view, face, sectionY) : null;
+            if (!sameShard(routeAt(slot.face(), slot.page(), slot.normal()), expected)) {
+                throw new IllegalStateException("floor route directory disagrees with changed coverage section");
+            }
+            patches.add(routePatch(slot, expected, next));
+        }
+        return patches.toArray(RoutePatch[]::new);
     }
 
-    private void removeRange(double range) {
-        Integer count = registeredRanges.get(range);
-        if (count == null) {
-            throw new IllegalStateException("missing floor-field range ownership");
+    private RoutePatch[] removalRoutePatches(ChunkKey key, ChunkView view, FloorChunkCoverage coverage) {
+        List<RoutePatch> patches = new java.util.ArrayList<>();
+        for (RouteAddress address : routeAddresses(key, view, coverage)) {
+            if (!sameShard(routeAt(address.face(), address.page(), address.normal()), address.shard())) {
+                throw new IllegalStateException("floor route directory disagrees with removal coverage");
+            }
+            patches.add(routePatch(new RouteSlot(address.face(), address.page(), address.normal()),
+                    address.shard(), null));
         }
-        if (count == 1) {
-            registeredRanges.remove(range);
+        return patches.toArray(RoutePatch[]::new);
+    }
+
+    private RoutePatch routePatch(RouteSlot slot, RoutedShard expected, RoutedShard next) {
+        return new RoutePatch(slot.face(), slot.page(), slot.normal(), expected, next);
+    }
+
+    private RoutePagePatch[] prepareRoutePagePatches(RoutePatch[] patches) {
+        if (patches.length == 0) {
+            return new RoutePagePatch[0];
+        }
+        int nextHookOrdinal = 0;
+        for (RoutePatch patch : patches) {
+            if (patch.next != null && !sameShard(patch.next, patch.expected)) {
+                patch.hookOrdinal = Math.incrementExact(nextHookOrdinal);
+                nextHookOrdinal = patch.hookOrdinal;
+            }
+        }
+        Map<RoutePageKey, List<RoutePatch>> grouped = new LinkedHashMap<>();
+        for (RoutePatch patch : patches) {
+            RoutePageKey key = new RoutePageKey(patch.face, patch.page);
+            grouped.computeIfAbsent(key, ignored -> new ArrayList<>()).add(patch);
+        }
+
+        RoutePagePatch[] preparedPages = new RoutePagePatch[grouped.size()];
+        int pageIndex = 0;
+        for (Map.Entry<RoutePageKey, List<RoutePatch>> entry : grouped.entrySet()) {
+            RoutePageKey key = entry.getKey();
+            List<RoutePatch> pagePatches = entry.getValue();
+            pagePatches.sort((first, second) -> Integer.compare(first.normal, second.normal));
+            RoutePage expectedPage = routes.get(key.face).get(key.page);
+            boolean stagedChanges = false;
+            boolean hasRemoval = false;
+            int previousNormal = 0;
+            boolean hasPreviousNormal = false;
+            for (RoutePatch patch : pagePatches) {
+                if (hasPreviousNormal && previousNormal == patch.normal) {
+                    throw new IllegalStateException("duplicate route patch for one face/page/normal");
+                }
+                hasPreviousNormal = true;
+                previousNormal = patch.normal;
+                RoutedShard current = expectedPage == null ? null : expectedPage.shardAtNormal(patch.normal);
+                if (!sameShard(current, patch.expected)) {
+                    throw new IllegalStateException("floor route page disagrees with a prepared route patch");
+                }
+                if (!sameShard(patch.next, patch.expected)) {
+                    stagedChanges |= patch.next != null;
+                    hasRemoval |= patch.next == null;
+                }
+            }
+
+            RoutePage stagedPage = stagedChanges
+                    ? mergeRoutePage(expectedPage, pagePatches, true)
+                    : expectedPage;
+            RoutePage finalPage = hasRemoval
+                    ? mergeRoutePage(expectedPage, pagePatches, false)
+                    : stagedPage;
+            RoutePagePatch routePagePatch = new RoutePagePatch(key.face, key.page, expectedPage,
+                    stagedPage, finalPage, pagePatches.toArray(RoutePatch[]::new));
+            preparedPages[pageIndex] = routePagePatch;
+            for (RoutePatch patch : routePagePatch.logicalPatches) {
+                patch.pagePatchIndex = pageIndex;
+            }
+            pageIndex++;
+        }
+        return preparedPages;
+    }
+
+    private static RoutePage mergeRoutePage(RoutePage base, List<RoutePatch> patches, boolean retainRemovals) {
+        int baseCount = base == null ? 0 : base.normalCount();
+        int resultCount = baseCount;
+        for (RoutePatch patch : patches) {
+            if (patch.expected == null && patch.next != null) {
+                resultCount = Math.incrementExact(resultCount);
+            } else if (!retainRemovals && patch.expected != null && patch.next == null) {
+                resultCount = Math.decrementExact(resultCount);
+            }
+        }
+        if (resultCount == 0) {
+            return null;
+        }
+
+        int[] normals = new int[resultCount];
+        RoutedShard[] shards = new RoutedShard[resultCount];
+        int baseIndex = 0;
+        int patchIndex = 0;
+        int outputIndex = 0;
+        while (baseIndex < baseCount || patchIndex < patches.size()) {
+            if (patchIndex == patches.size()
+                    || baseIndex < baseCount && base.normalAt(baseIndex) < patches.get(patchIndex).normal) {
+                normals[outputIndex] = base.normalAt(baseIndex);
+                shards[outputIndex] = base.shardAt(baseIndex);
+                baseIndex++;
+                outputIndex++;
+                continue;
+            }
+
+            RoutePatch patch = patches.get(patchIndex);
+            if (baseIndex == baseCount || patch.normal < base.normalAt(baseIndex)) {
+                if (patch.expected != null || patch.next == null) {
+                    throw new IllegalStateException("prepared route patch lost its expected normal");
+                }
+                normals[outputIndex] = patch.normal;
+                shards[outputIndex] = patch.next;
+                outputIndex++;
+                patchIndex++;
+                continue;
+            }
+
+            RoutedShard current = base.shardAt(baseIndex);
+            if (!sameShard(current, patch.expected)) {
+                throw new IllegalStateException("prepared route patch no longer matches its base page");
+            }
+            if (patch.next != null || retainRemovals) {
+                normals[outputIndex] = patch.normal;
+                shards[outputIndex] = patch.next == null ? current : patch.next;
+                outputIndex++;
+            }
+            baseIndex++;
+            patchIndex++;
+        }
+        if (outputIndex != resultCount) {
+            throw new IllegalStateException("prepared route page size disagrees with its merged entries");
+        }
+        return new RoutePage(normals, shards);
+    }
+
+    private static Map<RouteSlot, RoutedShard> routeMap(List<RouteAddress> addresses) {
+        Map<RouteSlot, RoutedShard> result = new HashMap<>(addresses.size());
+        for (RouteAddress address : addresses) {
+            RouteSlot slot = new RouteSlot(address.face(), address.page(), address.normal());
+            if (result.putIfAbsent(slot, address.shard()) != null) {
+                throw new IllegalStateException("duplicate route generated for one floor section face");
+            }
+        }
+        return result;
+    }
+
+    private static List<RouteAddress> routeAddresses(ChunkKey key, ChunkView view, FloorChunkCoverage coverage) {
+        java.util.ArrayList<RouteAddress> result = new java.util.ArrayList<>();
+        for (int sectionIndex = 0; sectionIndex < coverage.sectionCount(); sectionIndex++) {
+            int sectionY = coverage.sectionYAt(sectionIndex);
+            SectionCoverage section = coverage.section(sectionY);
+            for (Face face : Face.values()) {
+                if (section.normalPresence(face) == 0) {
+                    continue;
+                }
+                RouteSlot slot = routeSlot(key, face, sectionY);
+                result.add(new RouteAddress(slot.face(), slot.page(), slot.normal(),
+                        new RoutedShard(view, face, sectionY)));
+            }
+        }
+        return result;
+    }
+
+    private static RouteSlot routeSlot(ChunkKey key, Face face, int sectionY) {
+        int normalSlice = switch (face) {
+            case DOWN, UP -> sectionY;
+            case NORTH, SOUTH -> key.z();
+            case WEST, EAST -> key.x();
+        };
+        PageKey page = switch (face) {
+            case DOWN, UP -> new PageKey(key.x(), key.z());
+            case NORTH, SOUTH -> new PageKey(key.x(), sectionY);
+            case WEST, EAST -> new PageKey(sectionY, key.z());
+        };
+        return new RouteSlot(face, page, normalSlice);
+    }
+
+    private static int localNormalMaskWithinClosedBounds(int sliceBase, int lowerInclusive, int upperInclusive) {
+        long low = Math.max(0L, (long) lowerInclusive - sliceBase);
+        long high = Math.min(15L, (long) upperInclusive - sliceBase);
+        if (low > high) {
+            return 0;
+        }
+        return (0xFFFF << (int) low) & (0xFFFF >>> (15 - (int) high));
+    }
+
+    private static Map<Double, Long> rangeCounts(FloorChunkCoverage coverage) {
+        return rangeCounts(coverage, null);
+    }
+
+    private static Map<Double, Long> rangeCounts(FloorChunkCoverage coverage, int[] sectionYs) {
+        Map<Double, Long> counts = new HashMap<>();
+        if (sectionYs == null) {
+            for (int sectionIndex = 0; sectionIndex < coverage.sectionCount(); sectionIndex++) {
+                addSectionRangeCounts(counts, coverage.section(coverage.sectionYAt(sectionIndex)));
+            }
         } else {
-            registeredRanges.put(range, count - 1);
+            for (int sectionY : sectionYs) {
+                addSectionRangeCounts(counts, coverage.section(sectionY));
+            }
         }
-        maxRegisteredRange = registeredRanges.isEmpty() ? 0.0 : registeredRanges.lastKey();
+        return counts;
     }
 
-    private static ColumnKey columnKey(Face face, Source source) {
+    private static void addSectionRangeCounts(Map<Double, Long> counts, SectionCoverage section) {
+        if (section == null) {
+            return;
+        }
+        for (Face face : Face.values()) {
+            int presence = section.normalPresence(face);
+            while (presence != 0) {
+                int localNormal = Integer.numberOfTrailingZeros(presence);
+                presence &= presence - 1;
+                for (PlaneGroup group : section.groups(face, localNormal)) {
+                    long count = group.cells().cardinality();
+                    counts.merge(group.profile().range(), count, Math::addExact);
+                }
+            }
+        }
+    }
+
+    private static void addRangeCounts(Map<Double, Long> target, Map<Double, Long> changes, int sign) {
+        for (Map.Entry<Double, Long> entry : changes.entrySet()) {
+            long delta = sign > 0 ? entry.getValue() : Math.negateExact(entry.getValue());
+            long next = Math.addExact(target.getOrDefault(entry.getKey(), 0L), delta);
+            if (next == 0L) {
+                target.remove(entry.getKey());
+            } else {
+                target.put(entry.getKey(), next);
+            }
+        }
+    }
+
+    private RangePatch[] prepareRangePatches(Map<Double, Long> deltas) {
+        List<RangePatch> patches = new java.util.ArrayList<>(deltas.size());
+        for (Map.Entry<Double, Long> entry : deltas.entrySet()) {
+            long delta = entry.getValue();
+            if (delta == 0L) {
+                continue;
+            }
+            Double range = entry.getKey();
+            Long oldCount = registeredRanges.get(range);
+            long nextValue = Math.addExact(oldCount == null ? 0L : oldCount, delta);
+            if (nextValue < 0L) {
+                throw new IllegalStateException("floor range delta would remove unowned emitters");
+            }
+            Long nextCount = nextValue == 0L ? null : Long.valueOf(nextValue);
+            patches.add(new RangePatch(range, oldCount, nextCount));
+        }
+        return patches.toArray(RangePatch[]::new);
+    }
+
+    private long nextRangeEpoch(RangePatch[] patches) {
+        return patches.length == 0 ? rangeEpoch : Math.incrementExact(rangeEpoch);
+    }
+
+    private double maxRangeAfter(RangePatch[] patches) {
+        Map<Double, RangePatch> byRange = new HashMap<>(patches.length);
+        for (RangePatch patch : patches) {
+            byRange.put(patch.range, patch);
+        }
+        double result = maxRegisteredRange;
+        for (RangePatch patch : patches) {
+            if (patch.next != null && patch.range > result) {
+                result = patch.range;
+            }
+        }
+        if (result == maxRegisteredRange) {
+            RangePatch maximumPatch = byRange.get(maxRegisteredRange);
+            if (maximumPatch != null && maximumPatch.next == null) {
+                Double prior = registeredRanges.lowerKey(maxRegisteredRange);
+                while (prior != null) {
+                    RangePatch patch = byRange.get(prior);
+                    if (patch == null || patch.next != null) {
+                        result = prior;
+                        break;
+                    }
+                    prior = registeredRanges.lowerKey(prior);
+                }
+                if (prior == null) {
+                    result = 0.0;
+                }
+            }
+        }
+        return result;
+    }
+
+    private RoutedShard routeAt(Face face, PageKey page, int normal) {
+        RoutePage routePage = routes.get(face).get(page);
+        return routePage == null ? null : routePage.shardAtNormal(normal);
+    }
+
+    private static boolean sameShard(RoutedShard first, RoutedShard second) {
+        return first == second || first != null && second != null && first.view() == second.view()
+                && first.face() == second.face() && first.sectionY() == second.sectionY();
+    }
+
+    private static PageKey pageKey(int first, int second) {
+        return new PageKey(Math.floorDiv(first, 16), Math.floorDiv(second, 16));
+    }
+
+    private static Integer tangentA(Face face, Vec3 point) {
         return switch (face) {
-            case DOWN, UP -> new ColumnKey(source.x(), source.z());
-            case NORTH, SOUTH -> new ColumnKey(source.x(), source.y());
-            case WEST, EAST -> new ColumnKey(source.y(), source.z());
+            case DOWN, UP, NORTH, SOUTH -> blockCoordinate(point.x());
+            case WEST, EAST -> blockCoordinate(point.y());
         };
     }
 
-    private static ColumnKey columnKey(Face face, Vec3 point) {
+    private static Integer tangentB(Face face, Vec3 point) {
         return switch (face) {
-            case DOWN, UP -> columnKey(blockCoordinate(point.x()), blockCoordinate(point.z()));
-            case NORTH, SOUTH -> columnKey(blockCoordinate(point.x()), blockCoordinate(point.y()));
-            case WEST, EAST -> columnKey(blockCoordinate(point.y()), blockCoordinate(point.z()));
-        };
-    }
-
-    private static ColumnKey columnKey(Integer first, Integer second) {
-        return first == null || second == null ? null : new ColumnKey(first, second);
-    }
-
-    private static int normalCoordinate(Face face, Source source) {
-        return switch (face) {
-            case DOWN, UP -> source.y();
-            case NORTH, SOUTH -> source.z();
-            case WEST, EAST -> source.x();
+            case DOWN, UP, WEST, EAST -> blockCoordinate(point.z());
+            case NORTH, SOUTH -> blockCoordinate(point.y());
         };
     }
 
@@ -385,19 +1335,35 @@ public final class FloorFieldIndex {
         };
     }
 
-    private Map<ColumnKey, NavigableMap<Integer, IndexedSource>> columnsFor(Face face) {
-        return switch (face) {
-            case DOWN -> downColumns;
-            case UP -> upColumns;
-            case NORTH -> northColumns;
-            case SOUTH -> southColumns;
-            case WEST -> westColumns;
-            case EAST -> eastColumns;
-        };
+    private static void requireFiniteVector(Vec3 vector, String name) {
+        if (vector == null) {
+            throw new IllegalArgumentException(name + " must not be null");
+        }
+        requireFinite(vector.x(), name + ".x");
+        requireFinite(vector.y(), name + ".y");
+        requireFinite(vector.z(), name + ".z");
     }
 
-    private static ChunkKey sourceChunk(Source source) {
-        return new ChunkKey(Math.floorDiv(source.x(), 16), Math.floorDiv(source.z(), 16));
+    private static double checkedFinite(double value, String operation) {
+        if (!Double.isFinite(value)) {
+            throw new IllegalStateException("floor-field acceleration overflow while " + operation);
+        }
+        return value;
+    }
+
+    private static void requireChunkAndOwner(ChunkKey key, Object generationOwner) {
+        if (key == null) {
+            throw new IllegalArgumentException("key must not be null");
+        }
+        if (generationOwner == null) {
+            throw new IllegalArgumentException("generationOwner must not be null");
+        }
+    }
+
+    private static void requireFinite(double value, String name) {
+        if (!Double.isFinite(value)) {
+            throw new IllegalArgumentException(name + " must be finite");
+        }
     }
 
     private static Integer blockCoordinate(double coordinate) {
@@ -417,64 +1383,244 @@ public final class FloorFieldIndex {
         return (int) Math.floor(value);
     }
 
-    private static Vec3 addChecked(Vec3 left, Vec3 right, String operation) {
-        return new Vec3(
-                checkedFinite(left.x() + right.x(), operation),
-                checkedFinite(left.y() + right.y(), operation),
-                checkedFinite(left.z() + right.z(), operation));
+    private record PageKey(int a, int b) {
     }
 
-    private static Vec3 scaleChecked(Vec3 vector, double factor) {
-        return new Vec3(
-                checkedFinite(vector.x() * factor, "applying magnetic response"),
-                checkedFinite(vector.y() * factor, "applying magnetic response"),
-                checkedFinite(vector.z() * factor, "applying magnetic response"));
+    private record RoutePageKey(Face face, PageKey page) {
     }
 
-    private static double checkedFinite(double value, String operation) {
-        if (!Double.isFinite(value)) {
-            throw new IllegalStateException("floor-field acceleration overflow while " + operation);
+    private static final class RoutePage {
+        private final int[] normals;
+        private final RoutedShard[] shards;
+        private final long compactNormalPresence;
+
+        private RoutePage(int[] normals, RoutedShard[] shards) {
+            if (normals == null || shards == null || normals.length == 0 || normals.length != shards.length) {
+                throw new IllegalArgumentException("route page arrays must be nonempty and have equal lengths");
+            }
+            for (int index = 0; index < normals.length; index++) {
+                if (shards[index] == null || index > 0 && normals[index - 1] >= normals[index]) {
+                    throw new IllegalArgumentException("route page normals must be strictly ordered with no null shards");
+                }
+            }
+            long first = normals[0];
+            long last = normals[normals.length - 1];
+            long width = last - first + 1L;
+            long presence = 0L;
+            if (width <= Long.SIZE) {
+                for (int normal : normals) {
+                    int offset = (int) ((long) normal - first);
+                    presence |= 1L << offset;
+                }
+            }
+            this.normals = normals;
+            this.shards = shards;
+            this.compactNormalPresence = presence;
         }
-        return value;
-    }
 
-    private static boolean hasNonzeroComponent(Vec3 vector) {
-        return vector.x() != 0.0 || vector.y() != 0.0 || vector.z() != 0.0;
-    }
-
-    private static void requireChunkAndOwner(ChunkKey key, Object generationOwner) {
-        if (key == null) {
-            throw new IllegalArgumentException("key must not be null");
+        private int normalCount() {
+            return normals.length;
         }
-        if (generationOwner == null) {
-            throw new IllegalArgumentException("generationOwner must not be null");
+
+        private int lowerBound(int normal) {
+            return lowerBound(normal, null);
+        }
+
+        private int lowerBound(int normal, EnvironmentObservationWork work) {
+            observationCharge(work, EnvironmentObservationWork.Unit.COMPARISON);
+            if (normal <= normals[0]) {
+                return 0;
+            }
+            observationCharge(work, EnvironmentObservationWork.Unit.COMPARISON);
+            if (normal > normals[normals.length - 1]) {
+                return normals.length;
+            }
+            if (compactNormalPresence != 0L) {
+                int offset = (int) ((long) normal - (long) normals[0]);
+                long before = -1L >>> (Long.SIZE - offset);
+                return Long.bitCount(compactNormalPresence & before);
+            }
+            int low = 0;
+            int high = normals.length;
+            while (low < high) {
+                observationCharge(work, EnvironmentObservationWork.Unit.COMPARISON);
+                int middle = (low + high) >>> 1;
+                if (normals[middle] < normal) {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            return low;
+        }
+
+        private boolean hasCompactNormalPresence() {
+            return compactNormalPresence != 0L;
+        }
+
+        private int normalAt(int ordinal) {
+            return normals[ordinal];
+        }
+
+        private RoutedShard shardAt(int ordinal) {
+            return shards[ordinal];
+        }
+
+        private RoutedShard shardAtNormal(int normal) {
+            int ordinal = lowerBound(normal);
+            return ordinal < normals.length && normals[ordinal] == normal ? shards[ordinal] : null;
         }
     }
 
-    private static void requireFiniteVector(Vec3 vector, String name) {
-        if (vector == null) {
-            throw new IllegalArgumentException(name + " must not be null");
-        }
-        requireFinite(vector.x(), name + ".x");
-        requireFinite(vector.y(), name + ".y");
-        requireFinite(vector.z(), name + ".z");
-    }
-
-    private static void requireFinite(double value, String name) {
-        if (!Double.isFinite(value)) {
-            throw new IllegalArgumentException(name + " must be finite");
+    private record PublishedChunk(Object owner, long revision, FloorChunkCoverage coverage) {
+        private PublishedChunk {
+            if (owner == null || revision <= 0L || coverage == null) {
+                throw new IllegalArgumentException("published chunk fields must be valid");
+            }
         }
     }
 
-    private record BlockKey(int x, int y, int z) {
+    /** Immutable actual-live-structure counts; not a JVM heap-size estimate. */
+    record RetainedCounts(long publishedChunks, long coverages, long sections,
+                          long routeBuckets, long routeShards, long coverageBuckets,
+                          long groups, long physicalBlocks, long emitters,
+                          long identityDistinctMasks, long maskPayloadBytes,
+                          long tangentNormalLookupFaces, long tangentNormalLookupPayloadBytes,
+                          long routePageNormalPrimitivePayloadBytes, long routeShardReferenceSlots,
+                          long routePagePresencePrimitivePayloadBytes, long compactRoutePages,
+                          long wideRoutePages) {
     }
 
-    private record ColumnKey(int firstTangent, int secondTangent) {
+    static final class ChunkView {
+        private PublishedChunk current;
+        private boolean invalid;
+
+        FloorChunkCoverage currentCoverage(Object expectedOwner) {
+            PublishedChunk publication = requirePublished(this);
+            if (publication.owner() != expectedOwner) {
+                throw new IllegalStateException("floor scanner attachment no longer owns the shared chunk view");
+            }
+            return publication.coverage();
+        }
+
+        private void invalidate() {
+            current = null;
+            invalid = true;
+        }
     }
 
-    private record IndexedSource(Source source, FloorFieldEmitter emitter) {
+    static final class PreparedPublication {
+        private final ChunkKey key;
+        private final long clearEpoch;
+        private final long rangeEpoch;
+        private final long nextRangeEpoch;
+        private final ChunkView expectedView;
+        private final PublishedChunk base;
+        private final ChunkView targetView;
+        private final PublishedChunk next;
+        private final RoutePatch[] routePatches;
+        private final RoutePagePatch[] routePagePatches;
+        private final RangePatch[] rangePatches;
+        private final double nextMaxRange;
+        private boolean consumed;
+
+        private PreparedPublication(ChunkKey key, long clearEpoch, long rangeEpoch, long nextRangeEpoch,
+                                    ChunkView expectedView,
+                                    PublishedChunk base, ChunkView targetView, PublishedChunk next,
+                                    RoutePatch[] routePatches, RoutePagePatch[] routePagePatches,
+                                    RangePatch[] rangePatches,
+                                    double nextMaxRange) {
+            this.key = key;
+            this.clearEpoch = clearEpoch;
+            this.rangeEpoch = rangeEpoch;
+            this.nextRangeEpoch = nextRangeEpoch;
+            this.expectedView = expectedView;
+            this.base = base;
+            this.targetView = targetView;
+            this.next = next;
+            this.routePatches = routePatches;
+            this.routePagePatches = routePagePatches;
+            this.rangePatches = rangePatches;
+            this.nextMaxRange = nextMaxRange;
+        }
+
+        private Object expectedOwner() {
+            return base == null ? null : base.owner();
+        }
+
+        ChunkView targetView() {
+            return targetView;
+        }
+
+        private FloorChunkCoverage baseCoverage() {
+            return base == null ? null : base.coverage();
+        }
+
+        private long baseRevision() {
+            return base == null ? 0L : base.revision();
+        }
     }
 
-    private record ChunkContents(Object generationOwner, List<IndexedSource> sources) {
+    private record RoutedShard(ChunkView view, Face face, int sectionY) {
+    }
+
+    private record RouteSlot(Face face, PageKey page, int normal) {
+    }
+
+    private record RouteAddress(Face face, PageKey page, int normal, RoutedShard shard) {
+    }
+
+    private static final class RoutePagePatch {
+        private final Face face;
+        private final PageKey page;
+        private final RoutePage expectedPage;
+        private final RoutePage stagedPage;
+        private final RoutePage finalPage;
+        private final RoutePatch[] logicalPatches;
+        private boolean stageAttempted;
+
+        private RoutePagePatch(Face face, PageKey page, RoutePage expectedPage, RoutePage stagedPage,
+                               RoutePage finalPage, RoutePatch[] logicalPatches) {
+            this.face = face;
+            this.page = page;
+            this.expectedPage = expectedPage;
+            this.stagedPage = stagedPage;
+            this.finalPage = finalPage;
+            this.logicalPatches = logicalPatches;
+        }
+    }
+
+    private static final class RoutePatch {
+        private final Face face;
+        private final PageKey page;
+        private final int normal;
+        private final RoutedShard expected;
+        private final RoutedShard next;
+        private int pagePatchIndex;
+        private int hookOrdinal;
+
+        private RoutePatch(Face face, PageKey page, int normal, RoutedShard expected, RoutedShard next) {
+            this.face = face;
+            this.page = page;
+            this.normal = normal;
+            this.expected = expected;
+            this.next = next;
+        }
+    }
+
+    private static final class RangePatch {
+        private final Double range;
+        private final Long expected;
+        private final Long next;
+
+        private RangePatch(Double range, Long expected, Long next) {
+            this.range = range;
+            this.expected = expected;
+            this.next = next;
+        }
+
+        private boolean isIncrease() {
+            return next != null && (expected == null || next.longValue() > expected.longValue());
+        }
     }
 }

@@ -56,7 +56,10 @@ class CapsulePlacementMathTest {
         }
         var ordinary = CapsulePlacementMath.pose(free(new Vec3d(30_000_000, 0, -30_000_000),
                 ROTATIONS.get(2), new PlayerBodyShape.Dimensions(0.6, 1.8, 1.62)));
-        assertTrue(ordinary.orientationRadius() < 0.900000007);
+        assertTrue(ordinary.orientationRadius() > 0.900000007,
+                "the stored one-axis realization domain adds a finite endpoint-derived envelope");
+        assertTrue(ordinary.orientationRadius() < 0.900000013,
+                "the strict stored-realization envelope remains tightly bounded at world-border coordinates");
     }
 
     @Test
@@ -119,7 +122,12 @@ class CapsulePlacementMathTest {
         var actualEnd = CapsulePlacementMath.pose(free(delta.multiply(fraction), start.placement().attitude(), EXACT_SIZE));
         // This exact assertion precedes the production cross-check that previously failed.
         assertResidualAndLinearFamily(start, actualEnd, delta, fraction, tube.roundingRadius());
-        assertEquals(actualEnd.placement(), CapsulePlacementMath.atPrefix(tube, fraction).placement());
+        var reconstructed = CapsulePlacementMath.atPrefix(tube, fraction);
+        assertEquals(actualEnd.placement().center(), reconstructed.placement().center());
+        assertEquals(actualEnd.capsule(), reconstructed.capsule());
+        assertEquals(start.placement().storedCapsuleGeometry().relation(),
+                reconstructed.placement().storedCapsuleGeometry().relation(),
+                "fixed translation retains the original reference proof instead of minting a new nominal identity");
     }
 
     @Test
@@ -171,6 +179,97 @@ class CapsulePlacementMathTest {
         assertTrue(tube.roundingRadius() > 0);
         assertTrue(tube.roundingRadius() < 2e-8);
         assertLessOrEqual(exactActualX.subtract(idealX), exact(tube.roundingRadius()));
+    }
+
+    @Test
+    void translatedStoredCapsuleProxyContainsAllSixActualBoundsIncludingKnownOneUlpCase() {
+        var dimensions = new PlayerBodyShape.Dimensions(0.6F, 1.8F, 1.62F);
+        Vec3d center = new Vec3d(0, 3.0 / 37.0, 0);
+        var start = CapsulePlacementMath.pose(free(center, Rotation3d.identity(), dimensions));
+        Vec3d delta = new Vec3d(0, -0.1, 0);
+        var tube = CapsulePlacementMath.translationTube(start, delta);
+
+        var movedProxyBeforeGeometryMerge = new Aabb(
+                start.placement().bounds().min().add(delta), start.placement().bounds().max().add(delta));
+        assertEquals(0xBFED67C8994109AFL,
+                Double.doubleToRawLongBits(movedProxyBeforeGeometryMerge.min().y()));
+
+        for (double fraction : new double[]{0.0, 0.25, 0.5, 1.0}) {
+            var end = CapsulePlacementMath.atPrefix(tube, fraction);
+            assertBoundsContain(end.placement().bounds(), end.capsule().bounds());
+            assertEquals(end.placement().bounds().min().y(), end.placement().transport().y());
+            assertSame(start.placement().storedCapsuleGeometry().relation(),
+                    end.placement().storedCapsuleGeometry().relation());
+            assertRawVectorEquals(start.placement().storedCapsuleGeometry().storedHalfLine(),
+                    end.placement().storedCapsuleGeometry().storedHalfLine());
+            assertSame(start.placement().attitude(), end.placement().attitude());
+            assertSame(start.placement().shape(), end.placement().shape());
+            assertSame(start.placement().storedCapsuleGeometry().dimensions(),
+                    end.placement().storedCapsuleGeometry().dimensions());
+            assertEquals(center.add(delta.multiply(fraction)), end.placement().center());
+        }
+
+        var fullPrefix = CapsulePlacementMath.atPrefix(tube, 1.0);
+        assertEquals(0xBFED67C8994109B0L,
+                Double.doubleToRawLongBits(fullPrefix.capsule().bounds().min().y()));
+        assertEquals(0xBFED67C8994109B0L,
+                Double.doubleToRawLongBits(fullPrefix.placement().bounds().min().y()));
+    }
+
+    @Test
+    void translatedExpandedOwnerProxyMergesWithActualCapsuleAcrossBinadeAndTransportUsesMergedMinY() {
+        var dimensions = new PlayerBodyShape.Dimensions(0.6F, 1.8F, 1.62F);
+        var attitude = new Rotation3d(0, 0, 0.3826834323650898, 0.9238795325112867);
+        Vec3d center = new Vec3d(16_777_215.95, Double.longBitsToDouble(0x3fe72d2bcfebf80aL), 0);
+        StoredDyadic.Work work = new StoredDyadic.Work();
+        StoredRealizationLimits limits = StoredRealizationLimits.derive(center, attitude, dimensions, work);
+        Vec3d nominalHalfLine = limits.nominalHalfLine();
+        Vec3d storedHalfLine = new Vec3d(nominalHalfLine.x(),
+                Double.longBitsToDouble(0x3fdb27245fd7f014L), nominalHalfLine.z());
+        RealizationRelation relation = RealizationRelation.axisPlane(
+                limits, 1, 1, 0, center, storedHalfLine, work);
+        StoredCapsuleGeometry geometry = StoredCapsuleGeometry.fromRecipe(
+                center, attitude, dimensions, storedHalfLine, relation);
+        Vec3d margin = new Vec3d(0.125, 0.25, 0.375);
+        Aabb actualProxy = new Aabb(geometry.capsule().bounds().min().subtract(margin),
+                geometry.capsule().bounds().max().add(margin));
+        Vec3d actualTransport = new Vec3d(center.x() + 0.25, actualProxy.min().y(), center.z() - 0.5);
+        var accepted = PlayerBodyPlacement.fromAcceptedFreeGeometry(center, attitude,
+                new PlayerBodyShape.FreeCapsule(dimensions), geometry, actualProxy, actualTransport);
+        var start = CapsulePlacementMath.pose(accepted);
+        Vec3d delta = new Vec3d(0.1, -0.1, 0.2);
+        var tube = CapsulePlacementMath.translationTube(start, delta);
+
+        assertTrue(start.placement().center().x() < 16_777_216.0);
+        for (double fraction : new double[]{0.0, 0.25, 0.5, 1.0}) {
+            var end = CapsulePlacementMath.atPrefix(tube, fraction);
+            assertBoundsContain(end.placement().bounds(), end.capsule().bounds());
+            Vec3d realizedDelta = end.placement().center().subtract(start.placement().center());
+            Aabb translatedOwnerProxy = new Aabb(start.placement().bounds().min().add(realizedDelta),
+                    start.placement().bounds().max().add(realizedDelta));
+            assertBoundsContain(end.placement().bounds(), translatedOwnerProxy);
+            assertEquals(end.placement().bounds().min().y(), end.placement().transport().y());
+            assertSame(start.placement().storedCapsuleGeometry().relation(),
+                    end.placement().storedCapsuleGeometry().relation());
+            assertRawVectorEquals(start.placement().storedCapsuleGeometry().storedHalfLine(),
+                    end.placement().storedCapsuleGeometry().storedHalfLine());
+            assertSame(start.placement().attitude(), end.placement().attitude());
+            assertSame(start.placement().shape(), end.placement().shape());
+            assertSame(start.placement().storedCapsuleGeometry().dimensions(),
+                    end.placement().storedCapsuleGeometry().dimensions());
+        }
+        var fullPrefix = CapsulePlacementMath.atPrefix(tube, 1.0);
+        assertTrue(fullPrefix.placement().center().x() > 16_777_216.0,
+                "the fixed-Hs translation crosses the binary64 binade at 2^24");
+        Vec3d fullPrefixCenterDelta = fullPrefix.placement().center().subtract(start.placement().center());
+        Vec3d expectedTransport = accepted.transport().add(fullPrefixCenterDelta);
+        assertEquals(expectedTransport.x(), fullPrefix.placement().transport().x());
+        assertEquals(expectedTransport.z(), fullPrefix.placement().transport().z());
+
+        Vec3d proposedTransport = accepted.transport().add(delta);
+        var transportProposal = accepted.proposalFromTransport(proposedTransport);
+        assertBoundsContain(transportProposal.bounds(), transportProposal.capsule().bounds());
+        assertEquals(transportProposal.bounds().min().y(), transportProposal.transport().y());
     }
 
     @Test
@@ -270,6 +369,21 @@ class CapsulePlacementMathTest {
                 assertLessOrEqual(exact(component(endpoint, axis)).add(exact(capsule.radius())), exact(component(bounds.max(), axis)));
             }
         }
+    }
+
+    private static void assertBoundsContain(Aabb outer, Aabb inner) {
+        for (int axis = 0; axis < 3; axis++) {
+            assertTrue(component(outer.min(), axis) <= component(inner.min(), axis),
+                    "proxy minimum escaped actual bound on axis " + axis);
+            assertTrue(component(outer.max(), axis) >= component(inner.max(), axis),
+                    "proxy maximum escaped actual bound on axis " + axis);
+        }
+    }
+
+    private static void assertRawVectorEquals(Vec3d expected, Vec3d actual) {
+        assertEquals(Double.doubleToRawLongBits(expected.x()), Double.doubleToRawLongBits(actual.x()));
+        assertEquals(Double.doubleToRawLongBits(expected.y()), Double.doubleToRawLongBits(actual.y()));
+        assertEquals(Double.doubleToRawLongBits(expected.z()), Double.doubleToRawLongBits(actual.z()));
     }
 
     private static List<Vec3d> endpoints(Capsule capsule) {

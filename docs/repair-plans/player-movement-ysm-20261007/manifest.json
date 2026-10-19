@@ -1,0 +1,426 @@
+{
+  "artifact_type": "repair_plan",
+  "status": "PLAN",
+  "date": "2026-10-07",
+  "timezone": "Asia/Shanghai",
+  "target_thread_id": "01a0de5a-10b9-7b72-aa03-dea31f312383",
+  "repository_head": "111f5c99ea228067f882dfb9bbeb0de68cd77b5b",
+  "files": [
+    {
+      "path": "01-目标与验收合同.md",
+      "bytes": 10488,
+      "lines": 80,
+      "sha256": "351285972838E66C24A1DEABDAF503577480D181837E7468CA8CABAE18C3797D",
+      "utf8_without_bom": true
+    },
+    {
+      "path": "02-证据与方法地图.md",
+      "bytes": 15824,
+      "lines": 98,
+      "sha256": "1D8D6F0DF175F20B2EDD80A3D19247A597BE6E1DFBA1AE920E7E80788796AF38",
+      "utf8_without_bom": true
+    },
+    {
+      "path": "03-移动与尺寸修复.md",
+      "bytes": 21256,
+      "lines": 190,
+      "sha256": "E0E61D24E1CB8EC5D1EA8084492393EE69FAF84F8E943B0C33BDC215F9A5F32D",
+      "utf8_without_bom": true
+    },
+    {
+      "path": "04-YSM可选适配.md",
+      "bytes": 16533,
+      "lines": 95,
+      "sha256": "0D6380C2E2314FB8001F84A7B47823C05F823357CA99E23C4A89EBA5406ADFA7",
+      "utf8_without_bom": true
+    },
+    {
+      "path": "05-执行与验收.md",
+      "bytes": 15904,
+      "lines": 125,
+      "sha256": "B9EEA6B694E84FC33DC571CB221B6ADC205F16E064657902AADDCD5BA5370AAC",
+      "utf8_without_bom": true
+    },
+    {
+      "path": "06-主会话目标模式提示词.md",
+      "bytes": 4947,
+      "lines": 37,
+      "sha256": "75F28AFD635CAF5B31AAE615CF3346A62AAA17B8527E8EC270D5BCEF99D18232",
+      "utf8_without_bom": true
+    },
+    {
+      "path": "07-双面重力地板追加需求.md",
+      "bytes": 12673,
+      "lines": 93,
+      "sha256": "20B914A360A9F9A990E1570B06AEBE93DB5969B3F5BB9A84F16E29048F40D4F8",
+      "utf8_without_bom": true
+    },
+    {
+      "path": "08-重力地板聚合与增量发布.md",
+      "bytes": 52231,
+      "lines": 253,
+      "sha256": "C9AE903DF0725DFC9559786B6A37E92E38599DBA4A19EA91933246095E0526DE",
+      "utf8_without_bom": true
+    },
+    {
+      "path": "README.md",
+      "bytes": 8996,
+      "lines": 67,
+      "sha256": "F7A8B1FD8461582407BCB4635D9A0B55B77633F00035B62EDD1B506C152FBE0B",
+      "utf8_without_bom": true
+    }
+  ],
+  "document_checks": {
+    "broken_local_markdown_links": [],
+    "ug_source_paths_checked": 26,
+    "missing_ug_source_paths": [],
+    "existing_test_classes_checked": 11,
+    "missing_existing_test_classes": [],
+    "uie_existing_source_paths_checked": 7,
+    "missing_uie_source_paths": [],
+    "ysm_render_descriptors_verified_by": "Java25 javap -p -s on provided YSM 1.1.9 JAR",
+    "double_sided_floor_addendum": {
+      "source_paths_checked": 12,
+      "missing_source_paths": [],
+      "existing_test_classes_checked": 9,
+      "missing_existing_test_classes": [],
+      "implementation_or_runtime_acceptance": "not executed by planning task"
+    },
+    "broken_local_markdown_fragments": [],
+    "floor_aggregation_addendum": {
+      "date": "2026-10-08",
+      "status": "PLAN",
+      "current_source_paths_checked": 9,
+      "missing_source_paths": [],
+      "existing_test_methods_checked": 9,
+      "existing_product_method_signatures": "checked by file/CLI after IDEA returned UG project not open",
+      "proposed_symbols_tasks_and_tests": "explicitly proposed; not implemented or executed by planning task",
+      "unchanged_documents": [
+        "02-证据与方法地图.md",
+        "03-移动与尺寸修复.md",
+        "04-YSM可选适配.md",
+        "07-双面重力地板追加需求.md"
+      ],
+      "implementation_or_runtime_acceptance": "not executed by planning task",
+      "source_snapshots": "08 section 2 hashes are read-time design input before concurrent scalar fixes, not a frozen performance baseline",
+      "mainline_review_pending": [
+        "final document revision approval and implementation release",
+        "confirmation of planned engineering closure thresholds at implementation release"
+      ],
+      "final_staging_path": "D:/0_Minecraft_Server/Wi_Server/Q-Eng-Server/Q-Eng-mods",
+      "staging_is_overall_completion": false,
+      "review_constraints_incorporated": [
+        "new owner/generation requires new ChunkView; old scanner attachment unavailable",
+        "isCurrent includes current directory view identity, closed/invalid and clear epoch",
+        "preallocated undo arrays; old keys retained until linearization; no iterator/key/boxing/log allocations after linearization",
+        "optional immutable normal presence bits preserving scalar order",
+        "common driver compiled against frozen scalar; candidate diagnostics isolated in separate source set and child classpath",
+        "baseline NoChange consumes existing forces/standing; new revision and identity are candidate structural gates",
+        "explicit linkage preflight before performance measurement",
+        "explicit FloorChunkCoverage.section(sectionY) then immutable SectionCoverage.groups(face, localNormal); wall-height isolation regression planned"
+      ],
+      "accepted_scalar_baseline": {
+        "directory": "C:/GradleCaches/artifacts/UniversalGravitation-f07-double-sided-floor-20261008-R114/evidence/f07/scalar-baseline-r1",
+        "identity_file": "scalar-baseline.json",
+        "identity_sha256": "879C36117ECDFCDC925A9A8C04069E3EB164D7FF46F210AECD23C61BC81F3A42",
+        "acceptance": "Mainline supplied independent SolLow acceptance; planning task verified identity file hash only",
+        "source_input_files": 355,
+        "compiled_class_files": 763,
+        "uie_api10_compile_input_files": 866,
+        "focused_xml": 9,
+        "tests": 81,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "numeric_perf": "not executed"
+      },
+      "closure_threshold_status": "Mainline intends to adopt 50 percent retained-wrapper and dirty-allocation reductions, with 10 percent p50 / 20 percent p95 regression review triggers; confirm at implementation release, no numeric result claimed.",
+      "final_document_checks": "all 9 Markdown files checked after review revision; local links/fragments and manifest identities valid; historical document hashes preserved",
+      "final_revision": "Mainline review constraints fully incorporated; document-only checks passed; awaiting final Mainline implementation release."
+    }
+  },
+  "updated_date": "2026-10-11",
+  "historical_file_records": [
+    {
+      "path": "01-目标与验收合同.md",
+      "bytes": 10488,
+      "lines": 80,
+      "sha256": "351285972838E66C24A1DEABDAF503577480D181837E7468CA8CABAE18C3797D",
+      "utf8_without_bom": true
+    },
+    {
+      "path": "02-证据与方法地图.md",
+      "bytes": 12539,
+      "lines": 79,
+      "sha256": "AD2F30E62A901CD93CD6426F5966048D2E3F78EDA1E69D7F3C9C76BCD34D1DEC",
+      "utf8_without_bom": true
+    },
+    {
+      "path": "03-移动与尺寸修复.md",
+      "bytes": 21256,
+      "lines": 190,
+      "sha256": "E0E61D24E1CB8EC5D1EA8084492393EE69FAF84F8E943B0C33BDC215F9A5F32D",
+      "utf8_without_bom": true
+    },
+    {
+      "path": "04-YSM可选适配.md",
+      "bytes": 13542,
+      "lines": 105,
+      "sha256": "6103FC9BADB4BD95B8362811225CB975832025305BB642F50FE5421893D7205C",
+      "utf8_without_bom": true
+    },
+    {
+      "path": "05-执行与验收.md",
+      "bytes": 15904,
+      "lines": 125,
+      "sha256": "B9EEA6B694E84FC33DC571CB221B6ADC205F16E064657902AADDCD5BA5370AAC",
+      "utf8_without_bom": true
+    },
+    {
+      "path": "06-主会话目标模式提示词.md",
+      "bytes": 4947,
+      "lines": 37,
+      "sha256": "75F28AFD635CAF5B31AAE615CF3346A62AAA17B8527E8EC270D5BCEF99D18232",
+      "utf8_without_bom": true
+    },
+    {
+      "path": "07-双面重力地板追加需求.md",
+      "bytes": 12673,
+      "lines": 93,
+      "sha256": "20B914A360A9F9A990E1570B06AEBE93DB5969B3F5BB9A84F16E29048F40D4F8",
+      "utf8_without_bom": true
+    },
+    {
+      "path": "08-重力地板聚合与增量发布.md",
+      "bytes": 43969,
+      "lines": 224,
+      "sha256": "FC2B54F6D43A790ADC400065277C843E4A0BF0F5910D362421CCE5C5E225DF8E",
+      "utf8_without_bom": true
+    },
+    {
+      "path": "README.md",
+      "bytes": 7485,
+      "lines": 59,
+      "sha256": "C7D5037F99BF450673A0DB87E973B2348F2E5782C1DE913C5AFB800ACEA5C957",
+      "utf8_without_bom": true
+    }
+  ],
+  "document_sync_receipt": {
+    "date": "2026-10-11",
+    "status": "DOCUMENTS_UPDATED_PLAN_NOT_DELIVERED",
+    "applied_to_shared_tree": true,
+    "current_mainline_thread_id": "01a1292c-33f1-77b1-8cc8-65f645c2b374",
+    "current_source_head": "e0bf44489d36cfd944a31a28625783313655333d",
+    "artifact_root": "C:\\GradleCaches\\artifacts\\ug-ysm-plan-sync-20261011-r1",
+    "allowed_files": [
+      "04-YSM可选适配.md",
+      "02-证据与方法地图.md",
+      "README.md",
+      "manifest.json"
+    ],
+    "changed_markdown_files": [
+      "02-证据与方法地图.md",
+      "04-YSM可选适配.md",
+      "README.md"
+    ],
+    "source_evidence_index": {
+      "path": "C:\\GradleCaches\\artifacts\\ug-ysm-plan-sync-20261011-r1\\source-index.json",
+      "sha256": "99393EC67687B555D36E806E6C0E8C9B8EA03AD4CF5FB2B31223D1D71AA0DE4A"
+    },
+    "frozen_root464": {
+      "zip": "C:\\GradleCaches\\artifacts\\ug-free-owner-components-integration-20261011-r1\\combination-r1\\complete-source464-post-validation.zip",
+      "sha256": "2781B0A976D0F84715B72D90B76DAFA2B21CB18F415C5100D67B92A813C4A5DA",
+      "xml_index_sha256": "28FD0AED1A78F3453D90371205AB56EC539DF43C9E2FCA3909E8185D27CC1844",
+      "selected_test_tests": 219,
+      "selected_chbRuntimeTest_tests": 219,
+      "selected_failure_error_skipped_hash_mismatch": 0,
+      "f05_specialized_suites": 0
+    },
+    "before_actual_vs_recorded": [
+      {
+        "path": "01-目标与验收合同.md",
+        "recorded": {
+          "bytes": 10488,
+          "lines": 80,
+          "sha256": "351285972838E66C24A1DEABDAF503577480D181837E7468CA8CABAE18C3797D"
+        },
+        "before_actual": {
+          "bytes": 10488,
+          "lines": 80,
+          "sha256": "351285972838E66C24A1DEABDAF503577480D181837E7468CA8CABAE18C3797D"
+        },
+        "comparison": "MATCH"
+      },
+      {
+        "path": "02-证据与方法地图.md",
+        "recorded": {
+          "bytes": 12539,
+          "lines": 79,
+          "sha256": "AD2F30E62A901CD93CD6426F5966048D2E3F78EDA1E69D7F3C9C76BCD34D1DEC"
+        },
+        "before_actual": {
+          "bytes": 12539,
+          "lines": 79,
+          "sha256": "AD2F30E62A901CD93CD6426F5966048D2E3F78EDA1E69D7F3C9C76BCD34D1DEC"
+        },
+        "comparison": "MATCH"
+      },
+      {
+        "path": "03-移动与尺寸修复.md",
+        "recorded": {
+          "bytes": 21256,
+          "lines": 190,
+          "sha256": "E0E61D24E1CB8EC5D1EA8084492393EE69FAF84F8E943B0C33BDC215F9A5F32D"
+        },
+        "before_actual": {
+          "bytes": 21256,
+          "lines": 190,
+          "sha256": "E0E61D24E1CB8EC5D1EA8084492393EE69FAF84F8E943B0C33BDC215F9A5F32D"
+        },
+        "comparison": "MATCH"
+      },
+      {
+        "path": "04-YSM可选适配.md",
+        "recorded": {
+          "bytes": 13542,
+          "lines": 105,
+          "sha256": "6103FC9BADB4BD95B8362811225CB975832025305BB642F50FE5421893D7205C"
+        },
+        "before_actual": {
+          "bytes": 13542,
+          "lines": 105,
+          "sha256": "6103FC9BADB4BD95B8362811225CB975832025305BB642F50FE5421893D7205C"
+        },
+        "comparison": "MATCH"
+      },
+      {
+        "path": "05-执行与验收.md",
+        "recorded": {
+          "bytes": 15904,
+          "lines": 125,
+          "sha256": "B9EEA6B694E84FC33DC571CB221B6ADC205F16E064657902AADDCD5BA5370AAC"
+        },
+        "before_actual": {
+          "bytes": 15904,
+          "lines": 125,
+          "sha256": "B9EEA6B694E84FC33DC571CB221B6ADC205F16E064657902AADDCD5BA5370AAC"
+        },
+        "comparison": "MATCH"
+      },
+      {
+        "path": "06-主会话目标模式提示词.md",
+        "recorded": {
+          "bytes": 4947,
+          "lines": 37,
+          "sha256": "75F28AFD635CAF5B31AAE615CF3346A62AAA17B8527E8EC270D5BCEF99D18232"
+        },
+        "before_actual": {
+          "bytes": 4947,
+          "lines": 37,
+          "sha256": "75F28AFD635CAF5B31AAE615CF3346A62AAA17B8527E8EC270D5BCEF99D18232"
+        },
+        "comparison": "MATCH"
+      },
+      {
+        "path": "07-双面重力地板追加需求.md",
+        "recorded": {
+          "bytes": 12673,
+          "lines": 93,
+          "sha256": "20B914A360A9F9A990E1570B06AEBE93DB5969B3F5BB9A84F16E29048F40D4F8"
+        },
+        "before_actual": {
+          "bytes": 12673,
+          "lines": 93,
+          "sha256": "20B914A360A9F9A990E1570B06AEBE93DB5969B3F5BB9A84F16E29048F40D4F8"
+        },
+        "comparison": "MATCH"
+      },
+      {
+        "path": "08-重力地板聚合与增量发布.md",
+        "recorded": {
+          "bytes": 43969,
+          "lines": 224,
+          "sha256": "FC2B54F6D43A790ADC400065277C843E4A0BF0F5910D362421CCE5C5E225DF8E"
+        },
+        "before_actual": {
+          "bytes": 52231,
+          "lines": 253,
+          "sha256": "C9AE903DF0725DFC9559786B6A37E92E38599DBA4A19EA91933246095E0526DE"
+        },
+        "comparison": "PREEXISTING_DRIFT_NOT_ATTRIBUTED_TO_2026_10_11_SYNC"
+      },
+      {
+        "path": "README.md",
+        "recorded": {
+          "bytes": 7485,
+          "lines": 59,
+          "sha256": "C7D5037F99BF450673A0DB87E973B2348F2E5782C1DE913C5AFB800ACEA5C957"
+        },
+        "before_actual": {
+          "bytes": 8276,
+          "lines": 63,
+          "sha256": "AFBA7815ED2DBE667CD2B34EE2DD6E9C02EB43A501F2D1864846004114370493"
+        },
+        "comparison": "PREEXISTING_DRIFT_NOT_ATTRIBUTED_TO_2026_10_11_SYNC"
+      }
+    ],
+    "checks": {
+      "utf8_no_bom_all_9_markdown": "PASS",
+      "local_markdown_links_changed_documents": {
+        "status": "PASS",
+        "files": [
+          "02-证据与方法地图.md",
+          "04-YSM可选适配.md",
+          "README.md"
+        ],
+        "valid_links": 13
+      },
+      "local_markdown_fragments_changed_documents": {
+        "status": "PASS",
+        "files": [
+          "02-证据与方法地图.md",
+          "04-YSM可选适配.md",
+          "README.md"
+        ],
+        "valid_fragments": 1
+      },
+      "targeted_current_source_presence": {
+        "status": "PASS_PRESENCE_ONLY",
+        "checks": 15,
+        "meaning": "Targeted source symbol/method presence checks only; not behavior, complete contract verification, or executed tests."
+      },
+      "source_file_identity": {
+        "status": "PASS",
+        "indexed_files": 29,
+        "missing_paths": 0,
+        "sha256_differences": 0
+      },
+      "java_tests": "NOT_RUN",
+      "build": "NOT_RUN",
+      "mixin_fml_runtime": "NOT_RUN",
+      "dedicated_server": "NOT_RUN",
+      "real_gpu": "NOT_RUN",
+      "two_player_game": "NOT_RUN"
+    },
+    "scope": "Four-file documentation update only. No product Java, build, instance, unique progress ledger, other authority, or Pensieve files changed. No commit, push, Java/product tests, build, game, or runtime action; artifact-only documentation validation ran.",
+    "unresolved_owner_items": [
+      "Bind the exact final complete UIE runtime JAR and its source/class input identity before FML/GPU acceptance.",
+      "Server owner decides and supplies an accepted-Free read-only presentation ABI bound to connection/scope/lifetime/revision and the authoritative head source when no live report exists.",
+      "Choose/confirm the Free pose interpolation and transition contract before declaring the current no-previous-Q sample path an NG."
+    ],
+    "validation_artifacts": {
+      "script": "C:\\GradleCaches\\artifacts\\ug-ysm-plan-sync-20261011-r1\\validate-docs.ps1",
+      "result": "C:\\GradleCaches\\artifacts\\ug-ysm-plan-sync-20261011-r1\\validation-result.json",
+      "result_sha256": "0DB7D8B21000737263D334823FCFEAF1E0EC9FE32E343950B23AE94196F0E684"
+    },
+    "independent_review": {
+      "report": "C:\\GradleCaches\\artifacts\\ug-ysm-plan-sync-20261011-r1\\INDEPENDENT-REVIEW-FINAL.md",
+      "report_sha256": "36692C597B68B181DEBA6B24D0495D9464446C0464AC0AB29B3E190A1B18407B",
+      "metadata": "C:\\GradleCaches\\artifacts\\ug-ysm-plan-sync-20261011-r1\\INDEPENDENT-REVIEW-METADATA.json",
+      "scope": "Independent read-only content review of the three changed Markdown documents only; not product/runtime acceptance.",
+      "source_index_sha256_as_read": "C3E3573013E5EBC7AE1CAC042E30767562C5E5038EB96F0E0496D24A4ECBEA57"
+    }
+  },
+  "scope_of_work": "2026-10-11 document synchronization prepares the four allowed planning files against current source snapshots. It does not claim product implementation, Java test execution, build, Mixin/FML application, dedicated server, real GPU, or two-player game acceptance. Earlier planning-only scope is retained in historical_scope_of_work.",
+  "historical_scope_of_work": "This planning task only created/updated plan documents and research authority pointers. On 2026-10-08 it appended F07/S6 and later F08/S7 highest-tier floor aggregation, compressed scanner cache, local delta publication, same-data scalar performance baseline/runner, and candidate staging/manual-acceptance requirements. The F08 pass wrote only 08 plus README/01/05/06/manifest. It did not edit product Java, build/configuration inputs, running JARs, worlds, staging output, active progress ledger or runtime receipts; did not execute product tests/build/game/deployment, create or update a goal, or dispatch a message. Concurrent Mainline/writer implementation and supplied test receipts are outside this document-only receipt."
+}

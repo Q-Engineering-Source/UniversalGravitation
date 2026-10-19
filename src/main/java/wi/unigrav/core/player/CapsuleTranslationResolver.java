@@ -167,7 +167,6 @@ public final class CapsuleTranslationResolver {
         }
 
         private CapsuleAabbCastResult3d query(int index, Aabb box, Stage stage, Capsule capsule, Vec3d delta) {
-            if (evidence.size() == limits.maxQueries()) throw new QueryLimitReached(index);
             var result = CapsuleAabbCast3d.cast(capsule, delta, box);
             evidence.add(new QueryEvidence(index, box, stage, result));
             return result;

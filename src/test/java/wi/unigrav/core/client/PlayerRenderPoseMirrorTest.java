@@ -2,6 +2,9 @@ package wi.unigrav.core.client;
 
 import java.nio.file.Path;
 import java.util.UUID;
+import dev.crlhitbox.api.geometry.Vec3d;
+import dev.crlhitbox.api.geometry.Aabb;
+import wi.unigrav.core.player.CardinalFrame;
 
 import net.minecraft.entity.player.EntityPlayerMP;
 import net.minecraft.init.Bootstrap;
@@ -17,6 +20,178 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /** Headless real-WorldServer coverage for the cache seam; it does not simulate a WorldClient or GPU render. */
 class PlayerRenderPoseMirrorTest {
+    @Test void presentationReleaseAfterRemoveClearsRootAndPickButCannotReleaseANewLifetime(@TempDir Path directory) {
+        try (var fixture = BootWorldFixture.open(directory, new UUID(0, 72921), true)) {
+            var world = fixture.world();
+            var local = fixture.serverPlayer(new UUID(0, 72922));
+            var subject = fixture.serverPlayer(new UUID(0, 72923));
+            assertTrue(world.spawnEntity(local)); assertTrue(world.spawnEntity(subject));
+            UUID token = UUID.randomUUID(), physics = UUID.randomUUID();
+            var cache = cache(world, local, token, 12, 9010);
+            var geometry = new PlayerRenderPoseProtocol.CardinalGeometry(physics, 3,
+                    new Vec3d(0, 0, 0), new Aabb(new Vec3d(-.3, 0, -.3), new Vec3d(.3, 1.8, .3)));
+            var pose = new PlayerRenderPoseProtocol.Packet(PlayerRenderPoseProtocol.Kind.POSE, token, 12, 0,
+                    subject.getUniqueID(), subject.getEntityId(), 0, 9010, 1, 1, 1,
+                    PlayerRenderPoseProtocol.Mode.CARDINAL, CardinalFrame.Y_POS.ordinal(), IDENTITY, IDENTITY, geometry);
+            assertTrue(cache.receive(pose, world, local, 1));
+            assertTrue(cache.presentation(subject, world, local, .5F, 1).isPresent());
+            subject.noClip = true;
+            assertTrue(cache.presentation(subject, world, local, .5F, 1).isEmpty());
+            assertEquals(1, cache.pickGeometry(world, local, local, .5F, 1).size());
+            assertTrue(cache.pickGeometry(world, local, local, .5F, 1).getFirst().isSuppressed(),
+                    "native-required flags cannot release a known Cardinal before the authoritative transition");
+            subject.noClip = false;
+            assertTrue(cache.receive(PlayerRenderPoseProtocol.Packet.remove(token, 12, subject.getUniqueID(),
+                    subject.getEntityId(), 0, 9010, 1, 2, 1), world, local, 2));
+            assertTrue(cache.pickGeometry(world, local, local, .5F, 2).getFirst().isSuppressed());
+            var release = PlayerRenderPoseProtocol.Packet.presentationRelease(token, 12, subject.getUniqueID(),
+                    subject.getEntityId(), 0, 9010, 1, 3, 2,
+                    new PlayerRenderPoseProtocol.PresentationRelease(physics, 3, 1));
+            assertTrue(cache.receive(PlayerRenderPoseProtocol.decode(PlayerRenderPoseProtocol.encode(release)), world, local, 3));
+            assertTrue(cache.presentation(subject, world, local, .5F, 3).isEmpty());
+            assertTrue(cache.geometry(subject, world, local, .5F, 3).isEmpty());
+            assertTrue(cache.pickGeometry(world, local, local, .5F, 3).isEmpty());
+            assertFalse(cache.receive(pose, world, local, 4));
+            var fresh = new PlayerRenderPoseProtocol.Packet(PlayerRenderPoseProtocol.Kind.POSE, token, 12, 0,
+                    subject.getUniqueID(), subject.getEntityId(), 0, 9010, 2, 1, 3,
+                    PlayerRenderPoseProtocol.Mode.CARDINAL, CardinalFrame.Y_POS.ordinal(), IDENTITY, IDENTITY, geometry);
+            assertTrue(cache.receive(fresh, world, local, 4));
+            assertFalse(cache.receive(release, world, local, 5));
+            assertFalse(cache.pickGeometry(world, local, local, .5F, 5).getFirst().isSuppressed());
+            var wrong = PlayerRenderPoseProtocol.Packet.presentationRelease(token, 12, subject.getUniqueID(),
+                    subject.getEntityId(), 0, 9010, 2, 2, 3,
+                    new PlayerRenderPoseProtocol.PresentationRelease(UUID.randomUUID(), 3, 2));
+            assertFalse(cache.receive(wrong, world, local, 5));
+            int entityId = subject.getEntityId(); UUID subjectId = subject.getUniqueID();
+            world.removeEntity(subject);
+            var replacement = fixture.serverPlayer(subjectId); replacement.setEntityId(entityId);
+            assertTrue(world.spawnEntity(replacement));
+            var reusedIdentityRelease = PlayerRenderPoseProtocol.Packet.presentationRelease(token, 12, subjectId,
+                    entityId, 0, 9010, 2, 2, 3,
+                    new PlayerRenderPoseProtocol.PresentationRelease(physics, 3, 2));
+            assertFalse(cache.receive(reusedIdentityRelease, world, local, 6));
+            cache.clear();
+            assertFalse(cache.receive(reusedIdentityRelease, world, local, 7));
+            assertTrue(cache.pickGeometry(world, local, local, .5F, 7).isEmpty());
+        }
+    }
+
+    @Test void twoPendingTrackedPlayersCanArriveDuringOneImmutablePickSnapshot(@TempDir Path directory) {
+        try (var fixture = BootWorldFixture.open(directory, new UUID(0, 72911), true)) {
+            var world = fixture.world();
+            var local = fixture.serverPlayer(new UUID(0, 72912));
+            var first = fixture.serverPlayer(new UUID(0, 72913));
+            var second = fixture.serverPlayer(new UUID(0, 72914));
+            assertTrue(world.spawnEntity(local));
+            UUID token = UUID.randomUUID();
+            var cache = cache(world, local, token, 12, 9010);
+            var geometry = new PlayerRenderPoseProtocol.CardinalGeometry(UUID.randomUUID(), 3,
+                    new Vec3d(0, 0, 0), new Aabb(new Vec3d(-.3, 0, -.3), new Vec3d(.3, 1.8, .3)));
+            for (var player : java.util.List.of(first, second)) {
+                var packet = new PlayerRenderPoseProtocol.Packet(PlayerRenderPoseProtocol.Kind.POSE, token, 12, 0,
+                        player.getUniqueID(), player.getEntityId(), 0, 9010, 1, 1, 0,
+                        PlayerRenderPoseProtocol.Mode.CARDINAL, CardinalFrame.Y_POS.ordinal(), IDENTITY, IDENTITY, geometry);
+                assertTrue(cache.receive(packet, world, local, 1));
+            }
+            assertTrue(world.spawnEntity(first));
+            assertTrue(world.spawnEntity(second));
+            var samples = assertDoesNotThrow(() -> cache.pickGeometry(world, local, local, .5F, 2));
+            assertEquals(2, samples.size());
+            assertTrue(samples.stream().anyMatch(sample -> sample.entity() == first && !sample.isSuppressed()));
+            assertTrue(samples.stream().anyMatch(sample -> sample.entity() == second && !sample.isSuppressed()));
+            assertThrows(UnsupportedOperationException.class, samples::clear);
+        }
+    }
+
+    @Test void trackedGeometryRefreshAbsenceScopeAndExpiryNeverReviveNativeYBox(@TempDir Path directory) {
+        try (var fixture = BootWorldFixture.open(directory, new UUID(0, 72901), true)) {
+            var world = fixture.world();
+            var local = fixture.serverPlayer(new UUID(0, 72902));
+            var subject = fixture.serverPlayer(new UUID(0, 72903));
+            assertTrue(world.spawnEntity(local));
+            assertTrue(world.spawnEntity(subject));
+            UUID token = UUID.randomUUID(), physics = UUID.randomUUID();
+            var cache = cache(world, local, token, 12, 9010);
+            var body = PlayerRenderPoseProtocol.Quaternion.fromUpForward(CardinalFrame.X_POS.up(), new Vec3d(0, 0, 1));
+            var geometry = new PlayerRenderPoseProtocol.CardinalGeometry(physics, 3, new Vec3d(33.9, 88.1, 8.5),
+                    new Aabb(new Vec3d(33, 88.1, 8.2), new Vec3d(34.8, 88.7, 8.8)));
+            var first = new PlayerRenderPoseProtocol.Packet(PlayerRenderPoseProtocol.Kind.POSE, token, 12, 0,
+                    subject.getUniqueID(), subject.getEntityId(), 0, 9010, 1, 1, 1,
+                    PlayerRenderPoseProtocol.Mode.CARDINAL, CardinalFrame.X_POS.ordinal(), body, body, geometry);
+            assertTrue(cache.receive(first, world, local, 1));
+            assertTrue(cache.geometry(subject, world, local, .5F, 1).isPresent());
+            var absent = new PlayerRenderPoseProtocol.Packet(PlayerRenderPoseProtocol.Kind.POSE, token, 12, 0,
+                    subject.getUniqueID(), subject.getEntityId(), 0, 9010, 1, 2, 2,
+                    PlayerRenderPoseProtocol.Mode.CARDINAL, CardinalFrame.X_POS.ordinal(), body, body);
+            assertTrue(cache.receive(absent, world, local, 2));
+            assertTrue(cache.geometry(subject, world, local, .5F, 2).isEmpty());
+            assertTrue(cache.presentation(subject, world, local, .5F, 2).isEmpty(),
+                    "missing Cardinal geometry withdraws render ownership, not a Q with a guessed root");
+            assertTrue(cache.pickGeometry(world, local, local, .5F, 2).getFirst().isSuppressed());
+            var wrongScope = new PlayerRenderPoseProtocol.CardinalGeometry(UUID.randomUUID(), 3, geometry.transport(), geometry.bounds());
+            var stale = new PlayerRenderPoseProtocol.Packet(PlayerRenderPoseProtocol.Kind.POSE, token, 12, 0,
+                    subject.getUniqueID(), subject.getEntityId(), 0, 9010, 1, 3, 3,
+                    PlayerRenderPoseProtocol.Mode.CARDINAL, CardinalFrame.X_POS.ordinal(), body, body, wrongScope);
+            assertFalse(cache.receive(stale, world, local, 3));
+            var wrongEpoch = new PlayerRenderPoseProtocol.CardinalGeometry(physics, 4, geometry.transport(), geometry.bounds());
+            var epochPacket = new PlayerRenderPoseProtocol.Packet(PlayerRenderPoseProtocol.Kind.POSE, token, 12, 0,
+                    subject.getUniqueID(), subject.getEntityId(), 0, 9010, 1, 3, 3,
+                    PlayerRenderPoseProtocol.Mode.CARDINAL, CardinalFrame.X_POS.ordinal(), body, body, wrongEpoch);
+            assertFalse(cache.receive(epochPacket, world, local, 3));
+            var restored = new PlayerRenderPoseProtocol.Packet(PlayerRenderPoseProtocol.Kind.POSE, token, 12, 0,
+                    subject.getUniqueID(), subject.getEntityId(), 0, 9010, 1, 3, 3,
+                    PlayerRenderPoseProtocol.Mode.CARDINAL, CardinalFrame.X_POS.ordinal(), body, body, geometry);
+            assertTrue(cache.receive(restored, world, local, 3));
+            assertFalse(cache.pickGeometry(world, local, local, .5F, 3).getFirst().isSuppressed());
+            var resized = new PlayerRenderPoseProtocol.CardinalGeometry(physics, 3, new Vec3d(33.9, 88.1, 8.5),
+                    new Aabb(new Vec3d(32.1, 88.1, 7.9), new Vec3d(35.7, 89.3, 9.1)));
+            var resizePacket = new PlayerRenderPoseProtocol.Packet(PlayerRenderPoseProtocol.Kind.POSE, token, 12, 0,
+                    subject.getUniqueID(), subject.getEntityId(), 0, 9010, 1, 4, 4,
+                    PlayerRenderPoseProtocol.Mode.CARDINAL, CardinalFrame.X_POS.ordinal(), body, body, resized);
+            assertTrue(cache.receive(resizePacket, world, local, 4));
+            var resizedSample = cache.geometry(subject, world, local, .5F, 4).orElseThrow();
+            assertEquals(3.6, resizedSample.bounds().maxX - resizedSample.bounds().minX, 1e-10,
+                    "same body quaternion must still refresh actual Resize dimensions");
+            assertEquals(1.2, resizedSample.bounds().maxY - resizedSample.bounds().minY, 1e-10);
+            cache.expire(world, local, 45);
+            assertTrue(cache.pickGeometry(world, local, local, .5F, 45).getFirst().isSuppressed());
+            var delayedWrongScope = new PlayerRenderPoseProtocol.Packet(PlayerRenderPoseProtocol.Kind.POSE, token, 12, 0,
+                    subject.getUniqueID(), subject.getEntityId(), 0, 9010, 1, 5, 5,
+                    PlayerRenderPoseProtocol.Mode.CARDINAL, CardinalFrame.X_POS.ordinal(), body, body, wrongScope);
+            assertFalse(cache.receive(delayedWrongScope, world, local, 45),
+                    "numeric sequence advancement cannot replace the physics scope after entry TTL");
+            var free = PlayerRenderPoseProtocol.Packet.pose(token, 12, subject.getUniqueID(), subject.getEntityId(),
+                    0, 9010, 2, 1, 0, PlayerRenderPoseProtocol.Mode.FREE, -1, IDENTITY, IDENTITY);
+            assertTrue(cache.receive(free, world, local, 46));
+            assertTrue(cache.pickGeometry(world, local, local, .5F, 46).isEmpty());
+            assertTrue(cache.presentation(subject, world, local, .5F, 46).isPresent(),
+                    "a valid Free report retains its established render pose without a stale Cardinal box");
+            var fresh = new PlayerRenderPoseProtocol.Packet(PlayerRenderPoseProtocol.Kind.POSE, token, 12, 0,
+                    subject.getUniqueID(), subject.getEntityId(), 0, 9010, 3, 1, 1,
+                    PlayerRenderPoseProtocol.Mode.CARDINAL, CardinalFrame.X_POS.ordinal(), body, body, geometry);
+            assertTrue(cache.receive(fresh, world, local, 47));
+            assertTrue(cache.receive(PlayerRenderPoseProtocol.Packet.remove(token, 12, subject.getUniqueID(),
+                    subject.getEntityId(), 0, 9010, 3, 2, 1), world, local, 48));
+            assertTrue(cache.presentation(subject, world, local, .5F, 48).isEmpty());
+            assertTrue(cache.pickGeometry(world, local, local, .5F, 48).getFirst().isSuppressed());
+            cache.clear();
+            assertTrue(cache.pickGeometry(world, local, local, .5F, 44).isEmpty());
+        }
+    }
+
+    @Test void acceptedHorizontalBoxAndRootShareTransportInterpolationAndExcludeOldYOnlyRay() {
+        var geometry = new PlayerRenderPoseProtocol.CardinalGeometry(UUID.randomUUID(), 3, new Vec3d(33.9, 88.1, 8.5),
+                new Aabb(new Vec3d(33, 88.1, 8.2), new Vec3d(34.8, 88.7, 8.8)));
+        var sample = PlayerRenderPoseMirror.PoseCache.sampleGeometry(geometry, CardinalFrame.X_POS.ordinal(),
+                33.9, 88.1, 8.5, 35.9, 88.1, 8.5, .5F);
+        assertEquals(34, sample.bounds().minX, 1e-10);
+        assertEquals(-.9, sample.rootOffset().x(), 1e-10);
+        assertEquals(.3, sample.rootOffset().y(), 1e-10);
+        assertNotNull(sample.bounds().calculateIntercept(new net.minecraft.util.math.Vec3d(33, 88.4, 8.5),
+                new net.minecraft.util.math.Vec3d(35, 88.4, 8.5)));
+        assertNull(sample.bounds().calculateIntercept(new net.minecraft.util.math.Vec3d(34.9, 89.5, 7),
+                new net.minecraft.util.math.Vec3d(34.9, 89.5, 10)));
+    }
     private static final PlayerRenderPoseProtocol.Quaternion IDENTITY =
             new PlayerRenderPoseProtocol.Quaternion(0, 0, 0, 1);
 

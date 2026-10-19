@@ -14,14 +14,45 @@ import wi.unigrav.UnigravMod;
 /** Optional geometry hooks never load the third-party class during common-side Mixin selection. */
 public final class PlayerGeometryMixinPlugin implements IMixinConfigPlugin {
     @Override public boolean shouldApplyMixin(String targetClassName, String mixinClassName) {
+        if (mixinClassName.endsWith(".DraconicJumpInputMixin"))
+            return supports("com/brandon3055/draconicevolution/items/armor/WyvernArmor.class", Set.of(
+                    "getJumpModifier(Lnet/minecraft/item/ItemStack;Lnet/minecraft/entity/player/EntityPlayer;)F"));
+        if (mixinClassName.endsWith(".DraconicFlightInputMixin"))
+            return supports("com/brandon3055/draconicevolution/items/armor/DraconicArmor.class", Set.of(
+                    "getFlightSpeedModifier(Lnet/minecraft/item/ItemStack;Lnet/minecraft/entity/player/EntityPlayer;)F",
+                    "getFlightVModifier(Lnet/minecraft/item/ItemStack;Lnet/minecraft/entity/player/EntityPlayer;)F"));
         if (mixinClassName.endsWith(".AquaPlayerGeometryMixin"))
-            return supports("com/fuzs/aquaacrobatics/core/mixin/EntityPlayerMixin.class", Set.of("recalculateSize()V",
-                    "recalculateSize(Lcom/fuzs/aquaacrobatics/entity/EntitySize;Lcom/fuzs/aquaacrobatics/entity/EntitySize;)V"));
+            return supportsAqua();
         if (mixinClassName.endsWith(".ArtemisPlayerGeometryMixin"))
             return supports("com/artemis/artemislib/util/AttachAttributes.class", Set.of(
                     "onPlayerTick(Lnet/minecraftforge/fml/common/gameevent/TickEvent$PlayerTickEvent;)V",
                     "onLivingUpdate(Lnet/minecraftforge/event/entity/living/LivingEvent$LivingUpdateEvent;)V"));
         return true;
+    }
+
+    private boolean supportsAqua() {
+        String resource = "com/fuzs/aquaacrobatics/core/mixin/EntityPlayerMixin.class";
+        try (InputStream source = getClass().getClassLoader().getResourceAsStream(resource)) {
+            if (source == null) return false;
+            ClassNode node = new ClassNode();
+            new ClassReader(source).accept(node, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+            Set<String> methods = new HashSet<>();
+            node.methods.forEach(method -> methods.add(method.name + method.desc));
+            Set<String> required = Set.of("recalculateEyeHeight()V", "findEyeScaleFactor()F",
+                    "recalculateSize()V",
+                    "getSize(Lcom/fuzs/aquaacrobatics/entity/Pose;)Lcom/fuzs/aquaacrobatics/entity/EntitySize;",
+                    "recalculateSize(Lcom/fuzs/aquaacrobatics/entity/EntitySize;Lcom/fuzs/aquaacrobatics/entity/EntitySize;)V",
+                    "isPoseClear(Lcom/fuzs/aquaacrobatics/entity/Pose;)Z",
+                    "getBoundingBox(Lcom/fuzs/aquaacrobatics/entity/Pose;)Lnet/minecraft/util/math/AxisAlignedBB;");
+            boolean cachedEyeField = node.fields.stream().anyMatch(field ->
+                    field.name.equals("playerEyeHeight") && field.desc.equals("F"));
+            if (methods.containsAll(required) && cachedEyeField) return true;
+            UnigravMod.LOGGER.warn("UG Aqua geometry adapter unsupported ABI: {} requires methods {}",
+                    resource, required);
+            return false;
+        } catch (IOException failure) {
+            throw new IllegalStateException("Cannot inspect optional Aqua geometry ABI " + resource, failure);
+        }
     }
 
     private boolean supports(String resource, Set<String> required) {

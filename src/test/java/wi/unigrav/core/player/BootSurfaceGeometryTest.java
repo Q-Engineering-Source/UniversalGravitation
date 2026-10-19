@@ -199,9 +199,12 @@ class BootSurfaceGeometryTest {
     @Test
     void unrepresentableDistanceIsExplicitlyUnavailableRatherThanNoCandidate() {
         var source = BootSurfaceGeometry.fromAccepted(snapshot(new PlayerBodyPlacement(
-                new Vec3d(-Double.MAX_VALUE / 2, 0, 0), Rotation3d.identity(), new PlayerBodyShape.FreeCapsule(SPHERE))));
-        var target = face(box(Double.MAX_VALUE, 0, 0, Double.MAX_VALUE, 1, 1), CardinalFrame.X_NEG);
-        assertInstanceOf(BootSurfaceGeometry.Unavailable.class, BootSurfaceGeometry.measure(source, target, 1.5));
+                new Vec3d(0, 0, 0), Rotation3d.identity(), new PlayerBodyShape.FreeCapsule(SPHERE))));
+        var target = face(box(Double.MAX_VALUE, Double.MAX_VALUE / 2, Double.MAX_VALUE / 2,
+                Double.MAX_VALUE, Double.MAX_VALUE, Double.MAX_VALUE), CardinalFrame.X_NEG);
+        var unavailable = assertInstanceOf(BootSurfaceGeometry.Unavailable.class,
+                BootSurfaceGeometry.measure(source, target, 1.5));
+        assertEquals("distance is not finite in binary64", unavailable.cause().getMessage());
     }
 
     @Test

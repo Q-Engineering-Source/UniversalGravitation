@@ -1,0 +1,7 @@
+{
+  "variants": {
+    "axis=y": { "model": "unigrav:double_sided_gravity_floor" },
+    "axis=z": { "model": "unigrav:double_sided_gravity_floor", "x": 90 },
+    "axis=x": { "model": "unigrav:double_sided_gravity_floor", "x": 90, "y": 90 }
+  }
+}

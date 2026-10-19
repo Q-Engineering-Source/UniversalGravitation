@@ -105,6 +105,37 @@ public final class RemoteBoostClient {
     /** Persistent key intent after the existing key drain, not a movement/propulsion grant. */
     public static boolean requestedPersonalZeroG() { return INSTANCE.session.requestedIntent(); }
 
+    /** Records an explicit client choice; only a current server STATE can confirm it. */
+    public static boolean requestPersonalZeroG(boolean enabled) {
+        Minecraft minecraft = Minecraft.getMinecraft();
+        if (!minecraft.isCallingFromMinecraftThread()) {
+            throw new IllegalStateException("Remote G intent requested off client thread");
+        }
+        EntityPlayerSP player = minecraft.player;
+        if (minecraft.world == null || player == null || player.world != minecraft.world
+                || !player.isCreative()) return false;
+        if (!enabled) INSTANCE.nativeCorrectionCue.clearPending();
+        BoostProtocol.Packet request = INSTANCE.session.requestMode(enabled, player.dimension);
+        if (request != null) {
+            if (enabled) INSTANCE.captureNoGravity(player);
+            BoostNetwork.sendToServer(request);
+        }
+        player.sendStatusMessage(new TextComponentTranslation(enabled
+                ? "message.unigrav.remote_boost.requested_on"
+                : "message.unigrav.remote_boost.requested_off"), true);
+        return true;
+    }
+
+    /** Exact server-confirmed mode for the current actor; READY is confirmed OFF. */
+    public static Optional<Boolean> acknowledgedPersonalZeroG(EntityPlayerSP player) {
+        if (player == null || !INSTANCE.targets(player)) return Optional.empty();
+        return switch (INSTANCE.session.mode()) {
+            case ACTIVE -> Optional.of(true);
+            case READY -> Optional.of(false);
+            default -> Optional.empty();
+        };
+    }
+
     /** Same-client-thread transfer: retire old writes without restoring noGravity underneath the new owner. */
     public static Optional<Boolean> retireForPhysics(EntityPlayerSP actor) {
         Minecraft minecraft = Minecraft.getMinecraft();
@@ -212,40 +243,16 @@ public final class RemoteBoostClient {
         if (owner != null && (minecraft.player != owner || minecraft.world != ownerWorld)) {
             clearOwned();
         }
-        if (minecraft.world == null || minecraft.player == null) {
-            drainUnavailableZeroGPresses();
-            return;
-        }
+        if (minecraft.world == null || minecraft.player == null) return;
         EntityPlayerSP player = minecraft.player;
         if (PlayerPhysicsClient.owns(player)) {
-            consumeUnavailableKeyIntent(player);
             return;
         }
         if (!targets(player)) {
-            if (consumeUnavailableKeyIntent(player)) {
-                showUnavailable(player);
-            }
             return;
         }
         if (minecraft.isGamePaused()) {
             return;
-        }
-        while (ClientGravityTicker.ZERO_G_KEY.isPressed()) {
-            // Only this physical G-key edge changes the persistent intent.
-            boolean enable = !session.requestedIntent();
-            if (!enable) {
-                nativeCorrectionCue.clearPending();
-            }
-            BoostProtocol.Packet request = session.requestMode(enable, player.dimension);
-            if (request != null) {
-                if (enable) {
-                    captureNoGravity(player);
-                }
-                BoostNetwork.sendToServer(request);
-            }
-            player.sendStatusMessage(new TextComponentTranslation(enable
-                    ? "message.unigrav.remote_boost.requested_on"
-                    : "message.unigrav.remote_boost.requested_off"), true);
         }
         updateOwnedNoGravity(player);
         sendEligibleModeRequest(player);
@@ -426,26 +433,6 @@ public final class RemoteBoostClient {
             return false;
         }
         return true;
-    }
-
-    /** Do not replay a G press made before this connection was negotiated. */
-    private static boolean drainUnavailableZeroGPresses() {
-        boolean drained = false;
-        while (ClientGravityTicker.ZERO_G_KEY.isPressed()) {
-            // The KeyBinding click queue is intentionally consumed without a mode request.
-            drained = true;
-        }
-        return drained;
-    }
-
-    /** The key remains an explicit intent edge before an OFFER attaches an actor. */
-    private boolean consumeUnavailableKeyIntent(EntityPlayerSP player) {
-        boolean changed = false;
-        while (ClientGravityTicker.ZERO_G_KEY.isPressed()) {
-            session.requestMode(!session.requestedIntent(), player.dimension);
-            changed = true;
-        }
-        return changed;
     }
 
     /** Exact cached 1.12.2 packet shapes; CPacketPlayer exposes no isMoving accessor. */

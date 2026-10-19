@@ -1,5 +1,7 @@
 package wi.unigrav.core.floor;
 
+import wi.unigrav.core.player.EnvironmentObservationWork;
+
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
@@ -130,10 +132,21 @@ public final class MagneticBlockReader {
      * explicit ordered selector that matched. No default selector or rule-set revision is inferred.
      */
     public static QualifiedResult readQualified(WorldServer world, BlockPos position, RuleSet ruleSet) {
+        return readQualifiedInternal(world, position, ruleSet, null);
+    }
+
+    public static QualifiedResult readQualified(WorldServer world, BlockPos position, RuleSet ruleSet,
+            EnvironmentObservationWork work) {
+        Objects.requireNonNull(work).requireCurrent(world);
+        return readQualifiedInternal(world, position, ruleSet, work);
+    }
+
+    private static QualifiedResult readQualifiedInternal(WorldServer world, BlockPos position, RuleSet ruleSet,
+            EnvironmentObservationWork work) {
         Objects.requireNonNull(ruleSet, "ruleSet");
         InternalResult result = readInternal(world, position,
                 (state, tileNbt) -> {
-                    Optional<MaterialMatch> match = matchQualifiedStored(state, tileNbt, ruleSet);
+                    Optional<MaterialMatch> match = selectQualified(state, tileNbt, ruleSet.bindings(), work).materialMatch();
                     return new Selection(match.isPresent(), match);
                 });
         if (result instanceof Unavailable unavailable) return unavailable;
@@ -176,15 +189,18 @@ public final class MagneticBlockReader {
 
     /** Production matching seam: serializes at most once, and only for a matching state that needs NBT. */
     static boolean matchesStored(IBlockState state, Supplier<NBTTagCompound> tileNbt, List<MagneticBlockRule> rules) {
-        boolean needsNbt = false;
-        for (MagneticBlockRule rule : rules) {
+        int firstStateMatch = -1;
+        for (int index = 0; index < rules.size(); index++) {
+            MagneticBlockRule rule = rules.get(index);
             if (!rule.matchesState(state)) continue;
+            firstStateMatch = index;
             if (!rule.requiresTileEntityNbt()) return true;
-            needsNbt = true;
+            break;
         }
-        if (!needsNbt) return false;
+        if (firstStateMatch < 0) return false;
         NBTTagCompound actualNbt = tileNbt.get();
-        for (MagneticBlockRule rule : rules) {
+        for (int index = firstStateMatch; index < rules.size(); index++) {
+            MagneticBlockRule rule = rules.get(index);
             if (rule.matches(state, actualNbt)) return true;
         }
         return false;
@@ -197,23 +213,43 @@ public final class MagneticBlockReader {
         return selectQualified(state, tileNbt, ruleSet.bindings()).materialMatch();
     }
 
+    static Optional<MaterialMatch> matchQualifiedStored(IBlockState state, Supplier<NBTTagCompound> tileNbt,
+            RuleSet ruleSet, EnvironmentObservationWork work) {
+        Objects.requireNonNull(work).requireCurrent();
+        return selectQualified(state, tileNbt, ruleSet.bindings(), work).materialMatch();
+    }
+
     private static Selection selectQualified(IBlockState state, Supplier<NBTTagCompound> tileNbt,
                                              List<RuleBinding> bindings) {
-        boolean needsNbt = false;
-        for (RuleBinding binding : bindings) {
-            MagneticBlockRule rule = binding.rule();
+        return selectQualified(state, tileNbt, bindings, null);
+    }
+
+    private static Selection selectQualified(IBlockState state, Supplier<NBTTagCompound> tileNbt,
+            List<RuleBinding> bindings, EnvironmentObservationWork work) {
+        int firstStateMatch = -1;
+        for (int index = 0; index < bindings.size(); index++) {
+            if (work != null) work.charge(EnvironmentObservationWork.Unit.CLASSIFICATION);
+            MagneticBlockRule rule = bindings.get(index).rule();
+            if (work != null) work.charge(EnvironmentObservationWork.Unit.DISPATCH);
             if (!rule.matchesState(state)) continue;
+            firstStateMatch = index;
             if (!rule.requiresTileEntityNbt()) {
-                return new Selection(true, Optional.of(new MaterialMatch(binding.selectionId(), EvidenceKind.STORED_STATE)));
+                return new Selection(true, Optional.of(new MaterialMatch(bindings.get(index).selectionId(),
+                        EvidenceKind.STORED_STATE)));
             }
-            needsNbt = true;
+            break;
         }
-        if (!needsNbt) return Selection.NO_MATCH;
+        if (firstStateMatch < 0) return Selection.NO_MATCH;
+        if (work != null) work.charge(EnvironmentObservationWork.Unit.DISPATCH);
         NBTTagCompound actualNbt = tileNbt.get();
-        for (RuleBinding binding : bindings) {
+        for (int index = firstStateMatch; index < bindings.size(); index++) {
+            if (work != null) work.charge(EnvironmentObservationWork.Unit.CLASSIFICATION);
+            RuleBinding binding = bindings.get(index);
+            if (work != null) work.charge(EnvironmentObservationWork.Unit.DISPATCH);
             if (binding.rule().matches(state, actualNbt)) {
                 return new Selection(true, Optional.of(new MaterialMatch(binding.selectionId(),
-                        EvidenceKind.MATCHED_TILE_ENTITY_NBT)));
+                        binding.rule().requiresTileEntityNbt()
+                                ? EvidenceKind.MATCHED_TILE_ENTITY_NBT : EvidenceKind.STORED_STATE)));
             }
         }
         return Selection.NO_MATCH;

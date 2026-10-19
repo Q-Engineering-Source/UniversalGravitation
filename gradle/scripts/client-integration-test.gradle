@@ -1,0 +1,223 @@
+// Optional provenance-only invocation; default raw25 gate is unchanged.
+def nativeProvenanceMode = providers.gradleProperty("nativeProvenanceIntegration").map { it == "true" }.getOrElse(false)
+def sleepNativeResumeMode = providers.gradleProperty("sleepNativeResumeIntegration").map { it == "true" }.getOrElse(false)
+def nativeTransferRecoveryMode = providers.gradleProperty("nativeTransferRecoveryIntegration").map { it == "true" }.getOrElse(false)
+def serverEnvironmentRecoveryMode = providers.gradleProperty("serverEnvironmentRecoveryIntegration").map { it == "true" }.getOrElse(false)
+def nativeBodyConstructorProbeMode = providers.gradleProperty("nativeBodyConstructorProbeIntegration").map { it == "true" }.getOrElse(false)
+def artemisBodyScaleMode = providers.gradleProperty("artemisBodyScaleIntegration").map { it == "true" }.getOrElse(false)
+def nativeDoubleSpaceMode = providers.gradleProperty("nativeDoubleSpaceIntegration").map { it == "true" }.getOrElse(false)
+def gOnActualInputMode = providers.gradleProperty("gOnActualInputIntegration").map { it == "true" }.getOrElse(false)
+def aquaNativeEyeMode = providers.gradleProperty("aquaNativeEyeIntegration").map { it == "true" }.getOrElse(false)
+def installedFreeImpactMode = providers.gradleProperty("installedFreeImpactIntegration").map { it == "true" }.getOrElse(false)
+if ([nativeProvenanceMode, sleepNativeResumeMode, nativeTransferRecoveryMode, serverEnvironmentRecoveryMode, installedFreeImpactMode, aquaNativeEyeMode, gOnActualInputMode, nativeBodyConstructorProbeMode, nativeDoubleSpaceMode, artemisBodyScaleMode].count { it } > 1)
+    throw new GradleException('Select one integration profile')
+sourceSets {
+    clientIntegration {
+        java.srcDir('src/clientIntegration/java')
+        compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+        compileClasspath += sourceSets.test.output
+        runtimeClasspath += sourceSets.main.output + sourceSets.main.runtimeClasspath
+    }
+}
+
+configurations {
+    clientIntegrationImplementation.extendsFrom(testImplementation)
+    clientIntegrationRuntimeOnly.extendsFrom(testRuntimeOnly)
+}
+
+dependencies {
+    // The fixture uses LauncherDiscoveryRequestBuilder and LauncherFactory in its own source.
+    // Match the project's JUnit 6.0.3 pin without exposing Launcher to main/test code.
+    clientIntegrationImplementation 'org.junit.platform:junit-platform-launcher:6.0.3'
+    // Direct public ABI only: these files never enter main or the host runtime classpath.
+    clientIntegrationCompileOnly files(providers.gradleProperty('aquaIntegrationAquaJar').getOrElse('MISSING-aquaIntegrationAquaJar'))
+    clientIntegrationCompileOnly files(providers.gradleProperty('aquaIntegrationArtemisJar').getOrElse('MISSING-aquaIntegrationArtemisJar'))
+}
+
+tasks.named('compileClientIntegrationJava', JavaCompile).configure {
+    sourceCompatibility = targetCompatibility = JavaVersion.VERSION_25
+    dependsOn tasks.named('compileTestJava')
+    doFirst {
+        [aquaIntegrationAquaJar: '506EE8E264C347FAD33302183B8F4DADDB05D5E5F75C0B6D833266C886E127CE',
+         aquaIntegrationArtemisJar: 'B2726A32550776D39BB4419BF2864DAD55DCDA1F452D4F567CAE778A117DB84E'].each { name, expected ->
+            if (!project.hasProperty(name)) throw new GradleException("Client integration public Aqua ABI requires -P${name}=<exact jar>")
+            File dependency = file(project.property(name))
+            if (!dependency.isFile() || java.security.MessageDigest.getInstance('SHA-256').digest(dependency.bytes).encodeHex().toString().toUpperCase(java.util.Locale.ROOT) != expected)
+                throw new GradleException("Unexpected actual Aqua integration compile dependency: ${name}")
+        }
+    }
+}
+
+def clientIntegrationResult = layout.buildDirectory.file(
+        "reports/client-integration/${java.util.UUID.randomUUID()}/result.txt")
+def routeFixtureJar = tasks.register('clientIntegrationFixtureJar', Jar) {
+    dependsOn tasks.named('clientIntegrationClasses')
+    archiveFileName = 'ug-client-route-integration-fixture.jar'
+    destinationDirectory = layout.buildDirectory.dir('client-integration-fixture')
+    from sourceSets.clientIntegration.output
+    if (aquaNativeEyeMode || gOnActualInputMode || nativeDoubleSpaceMode || artemisBodyScaleMode) {
+        from(sourceSets.test.output) {
+            include 'wi/unigrav/core/floor/SleepingNativeResumeServerTestSupport*.class'
+            include 'wi/unigrav/core/floor/BootWorldFixture*.class'
+        }
+    }
+    if (installedFreeImpactMode) {
+        // Original test classes only; transformed headless TEST bridge output is never packaged.
+        from(sourceSets.test.output) {
+            include 'wi/unigrav/core/player/InstalledFreeImpactTest*.class'
+            include 'wi/unigrav/core/player/FreeNativeTailTest*.class'
+            include 'wi/unigrav/core/player/InstalledFreeEndpointTest*.class'
+            include 'wi/unigrav/core/player/FreeImpactAttackTestListener*.class'
+            include 'wi/unigrav/core/floor/BootWorldFixture*.class'
+        }
+    }
+    if (nativeProvenanceMode) {
+        from(sourceSets.test.output) {
+            include 'wi/unigrav/core/player/NativeCollisionProvenanceTest*.class'
+            include 'wi/unigrav/core/floor/BootWorldFixture*.class'
+        }
+    }
+}
+
+// Separate deterministic artifact lets the evidence gate rehash this exact profile
+// without selecting or starting a normal-client invocation.
+def sleepFixtureJar = tasks.register('sleepNativeFixtureJar', Jar) {
+    dependsOn tasks.named('clientIntegrationClasses')
+    archiveFileName = 'ug-client-route-integration-fixture.jar'
+    destinationDirectory = layout.buildDirectory.dir('sleep-native-fixture')
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+    from sourceSets.clientIntegration.output
+    from(sourceSets.test.output) {
+        include 'wi/unigrav/core/floor/SleepingNativeResumeServerTestSupport*.class'
+        include 'wi/unigrav/core/floor/BootWorldFixture*.class'
+    }
+}
+def fixtureJar = sleepNativeResumeMode ? sleepFixtureJar : routeFixtureJar
+
+def clientIntegrationTask = tasks.register('clientIntegrationTest') {
+    group = 'verification'
+    description = 'Runs the raw client-route cases inside the normal Cleanroom client host.'
+    dependsOn fixtureJar
+    dependsOn tasks.named('runClient')
+    // runClient produces the result before this verifier starts. Declaring it as
+    // this task's output lets Gradle remove the freshly produced dependency output.
+    doNotTrackState('Verifies the fresh normal-client result produced by runClient')
+
+    doLast {
+        File resultFile = clientIntegrationResult.get().asFile
+        if (!resultFile.isFile()) {
+            throw new GradleException(
+                    "Client route integration host produced no result file: ${resultFile}")
+        }
+        String result = resultFile.getText('UTF-8')
+        String expected = ('PASS tests=25 succeeded=25 failed=0 aborted=0 skipped=0' + System.lineSeparator()
+                + 'cases=endpointActorSuccessorCannotBeRetiredByOldPrediction,endpointGetterFailureKeepsOriginalCauseAtActualClientBoundary,endpointScopeSuccessorCannotBeRetiredByOldPrediction,endpointUnsupportedLandingSuspendsOnlyPredictionAndKeepsCanonicalOrdinaryInput,firstOwnedFailureEndsItsDrainAndEmitsSameRecoverIdentityFromFencedEndTicks,higherRevisionServerSuspensionInstallsCanonicalBAndRearmsOnlyItsPublishedOwner,inFlightServerSuspensionAdoptsLocalClientTransactionWithoutRetiringRestartedC,initialMobilityAdoptionRejectsHealthZeroProofAndAcceptsExactCanonicalRetransmission,mobilityFreeToWalkRearmsSameCustodyWithAndWithoutPreviousPrediction,nestedSuccessfulStateCannotAuthorizeOldTailAndMissingBoundaryRebases,normalConstructionAndRawOfferStayOnRealClientTickOwner,ordinaryTeleportWithNoPartialPredictionKeepsCustodyWithoutRecovery,partialPredictionTeleportSetterTailIsQuarantinedUntilUnwindAndRecoversOnce,predictionFirstInputProvidersAndStrictRetransmissionShareActualCurrentPose,predictionPartialThrowCleanupCallbackCannotResetSuccessorOwner,publishedSuspensionQueuedStateRemainsFifoAndCannotReplaceTransaction,realApplyOwnedStateAndBoundsFailureFenceExactActorLifetime,rearmSamplingGetterCannotSendOldEndAcrossStateScopeActorOrClear,replayRefusalAfterStateBInstallationRestoresLatestBAndAcknowledgesItsExactState,sampleRefusalAfterCommittedPredictionRestoresCanonicalWithoutGaitOrFailedMetadata,serverUnmappedSuspensionKeepsClientCanonicalAndRearmsSameScopeWithRealFirstBoundary,synchronousSuspensionProofDeathCannotCommitOldAdoption,synchronousSuspensionProofTeleportCannotCommitOldAdoption,teleportCorrectionAndPostCompletionAckRefusalSettleOnlyTheirExactDecode,uncertainCleanupStillEscapesWithOriginalInstallationCauseAndSuppressedCleanup' + System.lineSeparator())
+        if (nativeProvenanceMode) expected = ('PASS tests=5 succeeded=5 failed=0 aborted=0 skipped=0' + System.lineSeparator()
+                + 'cases=actualForgeCopiedObjectHasNoBlockAuthorityWhileSameObjectReinsertDoes,actualSlimeHasNativeProducerWithoutExpandingBootQualification,actualWorldStoneAndForgeRemovalUseSameCapture,equalGeometryFromSurvivingBIsNeverAssignedToRemovedAAndHiddenOutputChangeInvalidatesRecapture,realCustomProducerExceptionRetainsCauseAndStopsOldOwnerAfterTeleport' + System.lineSeparator())
+        if (sleepNativeResumeMode) expected = ('PASS tests=1 succeeded=1 failed=0 aborted=0 skipped=0' + System.lineSeparator()
+                + 'cases=actualSleepWakeCompletesNativeTransferAndResumesOriginalBudget' + System.lineSeparator())
+        if (nativeTransferRecoveryMode) expected = ('PASS tests=2 succeeded=2 failed=0 aborted=0 skipped=0' + System.lineSeparator()
+                + 'cases=actualClientBasePartialFailureSchedulesExactRecoveryAndInstallsNewBase,actualClientMotionPartialFailureSchedulesExactRecoveryAndInstallsNewBase' + System.lineSeparator()
+                + 'profile=nativeTransferRecovery' + System.lineSeparator() + 'started=2' + System.lineSeparator())
+        if (serverEnvironmentRecoveryMode) expected = ('PASS tests=2 succeeded=2 failed=0 aborted=0 skipped=0' + System.lineSeparator()
+                + 'cases=healthyOwnerAcceptsExactRecoveryAndDuplicatesPreserveInstalledSuccessor,ordinaryHigherEpochAndRecoveryAfterNewTeleportCannotReplaceHealthyCustody' + System.lineSeparator()
+                + 'profile=serverEnvironmentRecovery' + System.lineSeparator() + 'started=2' + System.lineSeparator())
+        if (installedFreeImpactMode) expected = ('PASS tests=4 succeeded=4 failed=0 aborted=0 skipped=0' + System.lineSeparator()
+                + 'cases=actualLandingConsumesConfiguredSpeedAfterNativeFallExactlyOnce,duplicateAxisAndTwoAxisClipsAggregateIntoOneWallAttack,impactCallbackRetirementStopsTheOldTailWithoutASecondAttack,realDamageCallbackFailureKeepsOriginalCauseAndCannotReplayAttack' + System.lineSeparator()
+                + 'profile=installedFreeImpact' + System.lineSeparator() + 'started=4' + System.lineSeparator())
+        if (nativeBodyConstructorProbeMode) expected = ('PASS tests=1 succeeded=1 failed=0 aborted=0 skipped=0' + System.lineSeparator()
+                + 'cases=actualEntityConstructorCapturesFullFieldsBeforeVirtualInitialization' + System.lineSeparator()
+                + 'profile=nativeBodyConstructorProbe' + System.lineSeparator() + 'started=1' + System.lineSeparator())
+        if (artemisBodyScaleMode) expected = ('PASS tests=1 succeeded=1 failed=0 aborted=0 skipped=0' + System.lineSeparator()
+                + 'cases=actualArtemisScaleProducerSurvivesManualLockAndFreeUnlock' + System.lineSeparator()
+                + 'profile=artemisBodyScale' + System.lineSeparator() + 'started=1' + System.lineSeparator())
+        if (nativeDoubleSpaceMode) expected = ('PASS tests=1 succeeded=1 failed=0 aborted=0 skipped=0' + System.lineSeparator()
+                + 'cases=actualNativeDoubleSpaceSendsAbilitiesAndKeepsOwnedState' + System.lineSeparator()
+                + 'profile=nativeDoubleSpaceAbilitiesOwnedState' + System.lineSeparator() + 'started=1' + System.lineSeparator())
+        if (gOnActualInputMode) expected = ('PASS tests=1 succeeded=1 failed=0 aborted=0 skipped=0' + System.lineSeparator()
+                + 'cases=actualKeyboardFrameTraversesOwnedGOnInputAndAdvancesFree' + System.lineSeparator()
+                + 'profile=gOnActualInput' + System.lineSeparator() + 'started=1' + System.lineSeparator())
+        if (aquaNativeEyeMode) expected = ('PASS tests=1 succeeded=1 failed=0 aborted=0 skipped=0' + System.lineSeparator()
+                + 'cases=actualAquaCrouchEyePublishesAndReversesThroughOwnedState' + System.lineSeparator()
+                + 'profile=aquaNativeEye' + System.lineSeparator() + 'started=1' + System.lineSeparator())
+        if (sleepNativeResumeMode ? !result.startsWith(expected + 'profile=sleepNativeResume' + System.lineSeparator()) : result != expected) {
+            throw new GradleException(
+                    "Client integration did not meet its ${artemisBodyScaleMode ? 1 : nativeDoubleSpaceMode ? 1 : aquaNativeEyeMode ? 1 : installedFreeImpactMode ? 4 : serverEnvironmentRecoveryMode ? 2 : nativeTransferRecoveryMode ? 2 : sleepNativeResumeMode ? 1 : nativeProvenanceMode ? 5 : 25}-case contract. Result: ${resultFile}\n${result}")
+        }
+        logger.lifecycle("Client route integration passed in normal runClient: ${resultFile}")
+    }
+}
+
+tasks.named('runClient').configure {
+    mustRunAfter fixtureJar
+}
+
+tasks.named('runClient', JavaExec).configure { JavaExec clientRun ->
+    clientRun.doFirst {
+        if (gradle.taskGraph.hasTask(clientIntegrationTask.get())) {
+            File aquaReport = null
+            if (aquaNativeEyeMode || artemisBodyScaleMode) {
+                def report = new File(layout.buildDirectory.get().asFile, "reports/${artemisBodyScaleMode ? 'artemis-body-scale' : 'aqua-native-eye'}/${java.util.UUID.randomUUID()}")
+                report.mkdirs()
+                aquaReport = report
+                project.ext.ugPrepareHostMappingIdentity.call(report)
+            }
+            // The normal host already owns main and mod runtime entries. Adding the full
+            // test runtime also adds compile-only UIE development classes and another
+            // patched Forge universe, which defeats LaunchWrapper loader isolation.
+            def junitRuntime = sourceSets.clientIntegration.runtimeClasspath.filter { dependency ->
+                ['junit-', 'opentest4j-', 'apiguardian-'].any { dependency.name.startsWith(it) }
+            }
+            def originalHost = clientRun.classpath.files.collect { it.absolutePath }.sort()
+            clientRun.classpath = clientRun.classpath.plus(junitRuntime)
+            // FML discovers this fixture through its normal mods-directory scanner.
+            def modsDirectory = new File(clientRun.workingDir, 'mods')
+            modsDirectory.mkdirs()
+            java.nio.file.Files.copy(fixtureJar.get().archiveFile.get().asFile.toPath(),
+                    new File(modsDirectory, 'ug-client-route-integration-fixture.jar').toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            def receipt = layout.buildDirectory.file('reports/client-integration/host-classpath.txt').get().asFile
+            receipt.parentFile.mkdirs()
+            receipt.setText('NORMAL HOST\n' + originalHost.join('\n') + '\nWITH FIXTURE\n'
+                    + clientRun.classpath.files.collect { it.absolutePath }.sort().join('\n') + '\n', 'UTF-8')
+            clientRun.systemProperty(
+                    'unigrav.clientIntegration.result',
+                    clientIntegrationResult.get().asFile.absolutePath)
+            clientRun.systemProperty('junit.jupiter.execution.parallel.enabled', 'false')
+            clientRun.systemProperty('unigrav.clientIntegration.nativeProvenance', nativeProvenanceMode.toString())
+            clientRun.systemProperty('unigrav.clientIntegration.sleepNativeResume', sleepNativeResumeMode.toString())
+            clientRun.systemProperty('unigrav.clientIntegration.nativeTransferRecovery', nativeTransferRecoveryMode.toString())
+            clientRun.systemProperty('unigrav.clientIntegration.serverEnvironmentRecovery', serverEnvironmentRecoveryMode.toString())
+            clientRun.systemProperty('unigrav.clientIntegration.installedFreeImpact', installedFreeImpactMode.toString())
+            clientRun.systemProperty('unigrav.clientIntegration.aquaNativeEye', aquaNativeEyeMode.toString())
+            clientRun.systemProperty('unigrav.clientIntegration.artemisBodyScale', artemisBodyScaleMode.toString())
+            clientRun.systemProperty('unigrav.clientIntegration.nativeDoubleSpace', nativeDoubleSpaceMode.toString())
+            clientRun.systemProperty('unigrav.clientIntegration.gOnActualInput', gOnActualInputMode.toString())
+            clientRun.systemProperty('unigrav.clientIntegration.nativeBodyConstructorProbe', nativeBodyConstructorProbeMode.toString())
+            if (aquaNativeEyeMode || artemisBodyScaleMode) {
+                // AQ/Artemis must be real FML mods as well as exact compile-only ABIs.
+                def abiInputs = []
+                [aquaIntegrationAquaJar: '506EE8E264C347FAD33302183B8F4DADDB05D5E5F75C0B6D833266C886E127CE',
+                 aquaIntegrationArtemisJar: 'B2726A32550776D39BB4419BF2864DAD55DCDA1F452D4F567CAE778A117DB84E'].each { name, expected ->
+                    File dependency = file(project.property(name))
+                    File installed = new File(modsDirectory, dependency.name)
+                    if (!installed.isFile() || java.security.MessageDigest.getInstance('SHA-256').digest(installed.bytes).encodeHex().toString().toUpperCase(java.util.Locale.ROOT) != expected)
+                        throw new GradleException("AQ profile requires exact actual normal-FML mod: ${installed}")
+                    abiInputs.add([property: name, compilePath: dependency.canonicalPath, bytes: dependency.length(),
+                            sha256: expected, hostModPath: installed.canonicalPath])
+                }
+                java.nio.file.Files.writeString(new File(aquaReport, 'actual-aqua-inputs.json').toPath(),
+                        groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson([
+                                profile: artemisBodyScaleMode ? 'artemisBodyScale' : 'aquaNativeEye', inputs: abiInputs,
+                                mods: modsDirectory.listFiles().findAll { it.isFile() }.collect { input ->
+                                    [path: input.canonicalPath, bytes: input.length(),
+                                     sha256: java.security.MessageDigest.getInstance('SHA-256').digest(input.bytes).encodeHex().toString().toUpperCase(java.util.Locale.ROOT)]
+                                }.sort { it.path }])), java.nio.charset.StandardCharsets.UTF_8,
+                        java.nio.file.StandardOpenOption.CREATE_NEW)
+                project.ext.ugVerifyHostMappingIdentity.call()
+            }
+            if (sleepNativeResumeMode) project.ext.ugVerifyHostMappingIdentity.call()
+        }
+    }
+}

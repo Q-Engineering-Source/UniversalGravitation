@@ -21,9 +21,8 @@ import wi.unigrav.api.math.Vec3;
 
 /**
  * Per-world persisted gravity regions: name → contribution (shape + mode).
- * Stored in the overworld's map storage; like everything else in the
- * current field model the regions are dimension-agnostic (same coordinates
- * in every dimension).
+ * Stored in the server map storage under a dimension-specific key; dimension zero
+ * retains its original key and serialized format.
  */
 public final class RegionGravityData extends WorldSavedData {
 
@@ -42,14 +41,16 @@ public final class RegionGravityData extends WorldSavedData {
         super(name);
     }
 
-    /** Returns the data attached to the overworld's map storage. */
+    /** Returns this dimension's persisted data; field ownership remains the actual World object. */
     public static RegionGravityData get(WorldServer overworld) {
         MapStorage storage = overworld.getMapStorage();
+        String key = overworld.provider.getDimension() == 0 ? DATA_NAME
+                : DATA_NAME + "_dimension_" + overworld.provider.getDimension();
         RegionGravityData data = (RegionGravityData) storage.getOrLoadData(
-                RegionGravityData.class, DATA_NAME);
+                RegionGravityData.class, key);
         if (data == null) {
-            data = new RegionGravityData();
-            storage.setData(DATA_NAME, data);
+            data = new RegionGravityData(key);
+            storage.setData(key, data);
         }
         return data;
     }

@@ -50,6 +50,17 @@ public final class CollisionQueryFootprint {
     }
 
     public static CollisionQueryFootprint plan(Aabb requestedBounds, double entityRadius, QueryPolicy policy, Limits limits) {
+        return planInternal(requestedBounds, entityRadius, policy, limits, null);
+    }
+
+    static CollisionQueryFootprint plan(Aabb requestedBounds, double entityRadius, QueryPolicy policy, Limits limits,
+            EnvironmentObservationWork work) {
+        Objects.requireNonNull(work).requireCurrent();
+        return planInternal(requestedBounds, entityRadius, policy, limits, work);
+    }
+
+    private static CollisionQueryFootprint planInternal(Aabb requestedBounds, double entityRadius,
+            QueryPolicy policy, Limits limits, EnvironmentObservationWork work) {
         Objects.requireNonNull(requestedBounds, "requestedBounds");
         Objects.requireNonNull(policy, "policy");
         Objects.requireNonNull(limits, "limits");
@@ -61,14 +72,19 @@ public final class CollisionQueryFootprint {
         // original strict emptiness result, including exact edge contact.
         Aabb nativeBounds = policy == QueryPolicy.NATIVE_STRICT ? requestedBounds
                 : new Aabb(outward(requestedBounds.min(), false), outward(requestedBounds.max(), true));
-        long minX = nativeIndex(nativeBounds.min().x(), false) - 1L;
-        long minY = nativeIndex(nativeBounds.min().y(), false) - 1L;
-        long minZ = nativeIndex(nativeBounds.min().z(), false) - 1L;
-        long maxX = nativeIndex(nativeBounds.max().x(), true);
-        long maxY = nativeIndex(nativeBounds.max().y(), true);
-        long maxZ = nativeIndex(nativeBounds.max().z(), true);
-        long cells = productWithin(productWithin(maxX - minX + 1, maxY - minY + 1, limits.maxBlockCells()),
-                maxZ - minZ + 1, limits.maxBlockCells());
+        long minX = nativeIndex(nativeBounds.min().x(), false, work) - 1L;
+        long minY = nativeIndex(nativeBounds.min().y(), false, work) - 1L;
+        long minZ = nativeIndex(nativeBounds.min().z(), false, work) - 1L;
+        long maxX = nativeIndex(nativeBounds.max().x(), true, work);
+        long maxY = nativeIndex(nativeBounds.max().y(), true, work);
+        long maxZ = nativeIndex(nativeBounds.max().z(), true, work);
+        long cellsX = maxX - minX + 1;
+        long cellsY = maxY - minY + 1;
+        long cellsZ = maxZ - minZ + 1;
+        long cellsXY = productWithin(cellsX, cellsY, limits.maxBlockCells(), "block-cell XY",
+                cellsX, cellsY, cellsZ);
+        long cells = productWithin(cellsXY, cellsZ, limits.maxBlockCells(), "block-cell XYZ",
+                cellsX, cellsY, cellsZ);
 
         // Reproduce the rounded native grow(.25), radius and /16 chains. These
         // are bounds of the actual native loop, not an ideal unrounded formula.
@@ -76,11 +92,16 @@ public final class CollisionQueryFootprint {
         int minChunkZ = Math.min((int) Math.floorDiv(minZ, 16), entityChunk(nativeBounds.min().z(), entityRadius, false));
         int maxChunkX = Math.max((int) Math.floorDiv(maxX, 16), entityChunk(nativeBounds.max().x(), entityRadius, true));
         int maxChunkZ = Math.max((int) Math.floorDiv(maxZ, 16), entityChunk(nativeBounds.max().z(), entityRadius, true));
-        long columnCount = productWithin((long) maxChunkX - minChunkX + 1,
-                (long) maxChunkZ - minChunkZ + 1, limits.maxChunkColumns());
+        long columnsX = (long) maxChunkX - minChunkX + 1;
+        long columnsZ = (long) maxChunkZ - minChunkZ + 1;
+        long columnCount = productWithin(columnsX, columnsZ, limits.maxChunkColumns(), "chunk-columns XZ",
+                columnsX, columnsZ, -1);
         List<Column> columns = new ArrayList<>((int) columnCount);
         for (int x = minChunkX; x <= maxChunkX; x++) {
-            for (int z = minChunkZ; z <= maxChunkZ; z++) columns.add(new Column(x, z));
+            for (int z = minChunkZ; z <= maxChunkZ; z++) {
+                if (work != null) work.charge(EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
+                columns.add(new Column(x, z));
+            }
         }
         return new CollisionQueryFootprint(requestedBounds, nativeBounds, policy, entityRadius, cells, columns,
                 entitySection(nativeBounds.min().y(), entityRadius, false),
@@ -103,6 +124,11 @@ public final class CollisionQueryFootprint {
     }
 
     private static int nativeIndex(double coordinate, boolean ceiling) {
+        return nativeIndex(coordinate, ceiling, null);
+    }
+
+    private static int nativeIndex(double coordinate, boolean ceiling, EnvironmentObservationWork work) {
+        if (work != null) work.charge(EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
         double integer = ceiling ? Math.ceil(coordinate) : Math.floor(coordinate);
         if (!Double.isFinite(integer) || integer < Integer.MIN_VALUE + 2.0 || integer > Integer.MAX_VALUE - 2.0) {
             throw new IllegalArgumentException("native query exceeds safe int-indexed coordinates");
@@ -126,9 +152,16 @@ public final class CollisionQueryFootprint {
         return (int) Math.clamp(entitySectionCoordinate(bound, radius, upper), 0, 15);
     }
 
-    private static long productWithin(long a, long b, long limit) {
+    private static long productWithin(long a, long b, long limit, String phase,
+                                      long firstExtent, long secondExtent, long thirdExtent) {
         if (a <= 0 || b <= 0 || a > limit / b) {
-            throw new IllegalArgumentException("native query footprint exceeds the configured work limit");
+            String extents = thirdExtent < 0
+                    ? "extents=(xChunks=" + firstExtent + ", zChunks=" + secondExtent + ")"
+                    : "extents=(xCells=" + firstExtent + ", yCells=" + secondExtent
+                            + ", zCells=" + thirdExtent + ")";
+            throw new IllegalArgumentException("native query footprint exceeds the configured work limit"
+                    + ": phase=" + phase + ", left=" + a + ", right=" + b + ", limit=" + limit
+                    + ", " + extents);
         }
         return a * b;
     }

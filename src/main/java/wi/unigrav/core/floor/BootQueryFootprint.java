@@ -1,5 +1,7 @@
 package wi.unigrav.core.floor;
 
+import wi.unigrav.core.player.EnvironmentObservationWork;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -55,23 +57,50 @@ public final class BootQueryFootprint {
     }
 
     public static BootQueryFootprint plan(BootSurfaceGeometry.Source source, double reachMetres, Limits limits) {
+        return plan(source, reachMetres, limits, null);
+    }
+
+    /**
+     * Plans the ordinary sensor envelope and optionally unions an already accepted body AABB
+     * into the raw-observation envelope. The additional bounds are for same-capture collision
+     * evidence only: they do not change the source, tier reach, gap calculation, or force range.
+     * The three-argument overload retains its original footprint semantics.
+     */
+    public static BootQueryFootprint plan(BootSurfaceGeometry.Source source, double reachMetres, Limits limits,
+                                          Aabb additionalObservationBounds) {
+        return planInternal(source, reachMetres, limits, additionalObservationBounds, null);
+    }
+
+    public static BootQueryFootprint plan(BootSurfaceGeometry.Source source, double reachMetres, Limits limits,
+            Aabb additionalObservationBounds, EnvironmentObservationWork work) {
+        Objects.requireNonNull(work).requireCurrent();
+        return planInternal(source, reachMetres, limits, additionalObservationBounds, work);
+    }
+
+    private static BootQueryFootprint planInternal(BootSurfaceGeometry.Source source, double reachMetres, Limits limits,
+            Aabb additionalObservationBounds, EnvironmentObservationWork work) {
         Objects.requireNonNull(source, "source");
         Objects.requireNonNull(limits, "limits");
         Aabb sensorQuery = source.queryBounds(reachMetres);
         // Native addCollisionBoxToList uses strict intersects. Expand the query,
         // not the actual surface or capture reach, to retain exact face contacts.
         Aabb nativeQuery = new Aabb(outward(sensorQuery.min(), false), outward(sensorQuery.max(), true));
+        if (additionalObservationBounds != null) {
+            Aabb outwardBody = new Aabb(outward(additionalObservationBounds.min(), false),
+                    outward(additionalObservationBounds.max(), true));
+            nativeQuery = union(nativeQuery, outwardBody);
+        }
         // The declared native profile has no producer below Y=0 or above
         // the highest cell's 1.5m extension. Empty space needs no chunk reads.
         if (nativeQuery.max().y() < 0.0 || nativeQuery.min().y() > 256.5) {
             return new BootQueryFootprint(source, reachMetres, nativeQuery, List.of(), List.of(), List.of(), limits);
         }
-        int minX = index(nativeQuery.min().x()) - 1;
-        int maxX = index(nativeQuery.max().x());
-        int minZ = index(nativeQuery.min().z()) - 1;
-        int maxZ = index(nativeQuery.max().z());
-        int minY = nativeQuery.min().y() <= 0.0 ? 0 : Math.max(0, index(nativeQuery.min().y()) - 1);
-        int maxY = nativeQuery.max().y() >= 255.0 ? 255 : Math.min(255, index(nativeQuery.max().y()));
+        int minX = index(nativeQuery.min().x(), work) - 1;
+        int maxX = index(nativeQuery.max().x(), work);
+        int minZ = index(nativeQuery.min().z(), work) - 1;
+        int maxZ = index(nativeQuery.max().z(), work);
+        int minY = nativeQuery.min().y() <= 0.0 ? 0 : Math.max(0, index(nativeQuery.min().y(), work) - 1);
+        int maxY = nativeQuery.max().y() >= 255.0 ? 255 : Math.min(255, index(nativeQuery.max().y(), work));
         if (minY > maxY) {
             return new BootQueryFootprint(source, reachMetres, nativeQuery, List.of(), List.of(), List.of(), limits);
         }
@@ -91,14 +120,24 @@ public final class BootQueryFootprint {
                 limits.maxChunkColumns());
 
         // All cardinalities are checked before allocating or iterating a planned domain.
-        List<BlockPos> producers = cells(minX, minY, minZ, maxX, maxY, maxZ, producerCount);
+        List<BlockPos> producers = cells(minX, minY, minZ, maxX, maxY, maxZ, producerCount, work);
         List<BlockPos> dependencies = cells(minX - 2, dependencyMinY, minZ - 2, maxX + 2, dependencyMaxY, maxZ + 2,
-                dependencyCount);
+                dependencyCount, work);
         List<Column> columns = new ArrayList<>(columnCount);
         for (int x = minChunkX; x <= maxChunkX; x++) {
-            for (int z = minChunkZ; z <= maxChunkZ; z++) columns.add(new Column(x, z));
+            for (int z = minChunkZ; z <= maxChunkZ; z++) {
+                if (work != null) work.charge(EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
+                columns.add(new Column(x, z));
+            }
         }
         return new BootQueryFootprint(source, reachMetres, nativeQuery, producers, dependencies, columns, limits);
+    }
+
+    private static Aabb union(Aabb left, Aabb right) {
+        return new Aabb(new Vec3d(Math.min(left.min().x(), right.min().x()),
+                        Math.min(left.min().y(), right.min().y()), Math.min(left.min().z(), right.min().z())),
+                new Vec3d(Math.max(left.max().x(), right.max().x()),
+                        Math.max(left.max().y(), right.max().y()), Math.max(left.max().z(), right.max().z())));
     }
 
     public BootSurfaceGeometry.Source source() { return source; }
@@ -109,11 +148,15 @@ public final class BootQueryFootprint {
     public List<Column> columns() { return columns; }
     public Limits limits() { return limits; }
 
-    private static List<BlockPos> cells(int x0, int y0, int z0, int x1, int y1, int z1, int count) {
+    private static List<BlockPos> cells(int x0, int y0, int z0, int x1, int y1, int z1, int count,
+            EnvironmentObservationWork work) {
         List<BlockPos> cells = new ArrayList<>(count);
         for (int x = x0; x <= x1; x++) {
             for (int y = y0; y <= y1; y++) {
-                for (int z = z0; z <= z1; z++) cells.add(new BlockPos(x, y, z));
+                for (int z = z0; z <= z1; z++) {
+                    if (work != null) work.charge(EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
+                    cells.add(new BlockPos(x, y, z));
+                }
             }
         }
         return cells;
@@ -131,6 +174,11 @@ public final class BootQueryFootprint {
     }
 
     private static int index(double value) {
+        return index(value, null);
+    }
+
+    private static int index(double value, EnvironmentObservationWork work) {
+        if (work != null) work.charge(EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
         double floor = Math.floor(value);
         if (!Double.isFinite(floor) || floor < Integer.MIN_VALUE + 3.0 || floor > Integer.MAX_VALUE - 3.0) {
             throw new IllegalArgumentException("boot query is outside safe int-indexed coordinates");

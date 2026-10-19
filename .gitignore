@@ -46,6 +46,7 @@ AGENTS.md
 CLAUDE.md
 CONTEXT.md
 docs/progress/
+docs/evidence/
 tools/progress/
 
 # Template workflows need external CHB/UIE inputs before public CI can run.

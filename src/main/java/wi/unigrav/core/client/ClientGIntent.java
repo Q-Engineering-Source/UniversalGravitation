@@ -97,10 +97,16 @@ public final class ClientGIntent {
     public static void reset() { INSTANCE.clear(); }
 
     public static boolean acknowledgedOn(EntityPlayerSP actor) {
+        return acknowledgedIntent(actor).orElse(false);
+    }
+
+    /** Empty until the current actor, world, connection, and negotiated G state are all exact. */
+    public static java.util.Optional<Boolean> acknowledgedIntent(EntityPlayerSP actor) {
         Minecraft mc = Minecraft.getMinecraft();
-        return actor != null && actor == INSTANCE.player && actor == mc.player && actor.world == INSTANCE.world
+        if (actor != null && actor == INSTANCE.player && actor == mc.player && actor.world == INSTANCE.world
                 && INSTANCE.connection == mc.getConnection() && actor.dimension == INSTANCE.dimension
-                && INSTANCE.session != null && INSTANCE.session.acknowledgedIntent().orElse(false);
+                && INSTANCE.session != null) return INSTANCE.session.acknowledgedIntent();
+        return java.util.Optional.empty();
     }
 
     private void clear() {

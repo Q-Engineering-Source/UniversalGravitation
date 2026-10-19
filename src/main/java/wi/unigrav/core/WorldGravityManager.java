@@ -1,5 +1,8 @@
 package wi.unigrav.core;
 
+import net.minecraft.server.MinecraftServer;
+import java.util.IdentityHashMap;
+import java.util.Map;
 import net.minecraft.world.World;
 import net.minecraft.world.WorldServer;
 import net.minecraftforge.common.MinecraftForge;
@@ -8,16 +11,15 @@ import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 
 import wi.unigrav.UnigravMod;
 import wi.unigrav.api.field.GravityField;
-import wi.unigrav.api.field.GravityFields;
 import wi.unigrav.api.gravity.UniformGravityContribution;
 import wi.unigrav.api.math.Vec3;
 import wi.unigrav.core.event.WorldGravityChangeEvent;
 
 /**
- * Owns the per-world uniform gravity contribution: on overworld load the
+ * Owns the per-world uniform gravity contribution: on each server-world load the
  * persisted {@link WorldGravityData} is read (first-time worlds are seeded
- * from {@link UnigravConfig#worldGravityStrength}) and registered into the
- * global field under {@code unigrav:world}; on unload it is unregistered.
+ * from {@link UnigravConfig#worldGravityStrength}) and registered into their
+ * world field under {@code unigrav:world}; on unload it is unregistered.
  *
  * <p>All changes go through {@link #setWorldGravity(Vec3, Boolean)}, the
  * unified entry point that persists the new value, swaps the registration,
@@ -31,6 +33,26 @@ public final class WorldGravityManager {
     public static final String PATH = "world";
 
     private WorldGravityData data;
+    private WorldServer owner;
+    private final Map<WorldServer, WorldGravityManager> worlds = new IdentityHashMap<>();
+
+    private WorldGravityManager primary() {
+        for (var entry : worlds.entrySet()) {
+            if (entry.getKey().provider.getDimension() == 0) return entry.getValue();
+        }
+        return null;
+    }
+    public void stop(MinecraftServer server) {
+        var iterator = worlds.entrySet().iterator();
+        while (iterator.hasNext()) {
+            var entry = iterator.next();
+            if (entry.getKey().getMinecraftServer() == server) {
+                entry.getValue().unload();
+                iterator.remove();
+            }
+        }
+    }
+
     private GravityField.Registration registration;
 
     /** Subscribes this manager to the Forge event bus. */
@@ -41,10 +63,29 @@ public final class WorldGravityManager {
     @SubscribeEvent
     public void onWorldLoad(WorldEvent.Load event) {
         World world = event.getWorld();
-        if (world.isRemote || world.provider.getDimension() != 0) {
-            return;
+        if (world.isRemote || !(world instanceof WorldServer serverWorld)) return;
+        if (worlds.containsKey(serverWorld)) return;
+        AmbientWorldFields.prepare(serverWorld);
+        WorldGravityManager context = new WorldGravityManager();
+        context.owner = serverWorld;
+        try {
+            context.load();
+            worlds.put(serverWorld, context);
+        } catch (RuntimeException | Error failure) {
+            try { context.unload(); } catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+            throw failure;
         }
-        data = WorldGravityData.get((WorldServer) world);
+    }
+
+    @SubscribeEvent
+    public void onWorldUnload(WorldEvent.Unload event) {
+        WorldGravityManager context = worlds.remove(event.getWorld());
+        if (context != null) context.unload();
+    }
+
+
+    private void load() {
+        data = WorldGravityData.get(owner);
         if (!data.isInitialized()) {
             // First load of this world: seed from the config default.
             data.setAcceleration(
@@ -60,13 +101,7 @@ public final class WorldGravityManager {
         UnigravMod.LOGGER.info("Registered world gravity {} m/s^2 (enabled={}) as {}:{}",
                 data.getAcceleration(), data.isEnabled(), NAMESPACE, PATH);
     }
-
-    @SubscribeEvent
-    public void onWorldUnload(WorldEvent.Unload event) {
-        World world = event.getWorld();
-        if (world.isRemote || world.provider.getDimension() != 0) {
-            return;
-        }
+    private void unload() {
         if (registration != null) {
             registration.close();
             registration = null;
@@ -75,16 +110,16 @@ public final class WorldGravityManager {
     }
 
     /** Whether a world is currently loaded and its gravity is registered. */
-    public boolean isLoaded() {
+    private boolean localIsLoaded() {
         return data != null;
     }
 
     /** The persisted world gravity acceleration, in m/s²; null when no world is loaded. */
-    public Vec3 getAcceleration() {
+    private Vec3 localGetAcceleration() {
         return data != null ? data.getAcceleration() : null;
     }
 
-    public boolean isEnabled() {
+    private boolean localIsEnabled() {
         return data != null && data.isEnabled();
     }
 
@@ -96,7 +131,7 @@ public final class WorldGravityManager {
      * @return false when no world is loaded or a {@link WorldGravityChangeEvent.Pre}
      *         listener vetoed the change
      */
-    public boolean setWorldGravity(Vec3 newAcceleration, Boolean newEnabled) {
+    private boolean localSetWorldGravity(Vec3 newAcceleration, Boolean newEnabled) {
         if (data == null) {
             return false;
         }
@@ -121,8 +156,8 @@ public final class WorldGravityManager {
     }
 
     /** Resets to the config default: straight down at the configured strength, enabled. */
-    public boolean resetToDefault() {
-        return setWorldGravity(
+    private boolean localResetToDefault() {
+        return localSetWorldGravity(
                 UniformGravityContribution.downward(UnigravConfig.worldGravityStrength)
                         .acceleration(),
                 Boolean.TRUE);
@@ -132,7 +167,47 @@ public final class WorldGravityManager {
         // A disabled field is a zero field: the registration stays so that
         // /unigrav accel and downstream reads see an explicit value.
         Vec3 effective = data.isEnabled() ? data.getAcceleration() : Vec3.ZERO;
-        registration = GravityFields.get().registerContribution(
+        registration = AmbientWorldFields.field(owner).registerContribution(
                 NAMESPACE, PATH, new UniformGravityContribution(effective));
+    }
+    public boolean isLoaded() {
+        WorldGravityManager context = primary();
+        return context == null ? false : context.localIsLoaded();
+    }
+    public boolean isLoaded(WorldServer world) {
+        WorldGravityManager context = worlds.get(world);
+        return context == null ? false : context.localIsLoaded();
+    }
+    public Vec3 getAcceleration() {
+        WorldGravityManager context = primary();
+        return context == null ? null : context.localGetAcceleration();
+    }
+    public Vec3 getAcceleration(WorldServer world) {
+        WorldGravityManager context = worlds.get(world);
+        return context == null ? null : context.localGetAcceleration();
+    }
+    public boolean isEnabled() {
+        WorldGravityManager context = primary();
+        return context == null ? false : context.localIsEnabled();
+    }
+    public boolean isEnabled(WorldServer world) {
+        WorldGravityManager context = worlds.get(world);
+        return context == null ? false : context.localIsEnabled();
+    }
+    public boolean setWorldGravity(Vec3 newAcceleration, Boolean newEnabled) {
+        WorldGravityManager context = primary();
+        return context == null ? false : context.localSetWorldGravity(newAcceleration, newEnabled);
+    }
+    public boolean setWorldGravity(WorldServer world, Vec3 newAcceleration, Boolean newEnabled) {
+        WorldGravityManager context = worlds.get(world);
+        return context == null ? false : context.localSetWorldGravity(newAcceleration, newEnabled);
+    }
+    public boolean resetToDefault() {
+        WorldGravityManager context = primary();
+        return context == null ? false : context.localResetToDefault();
+    }
+    public boolean resetToDefault(WorldServer world) {
+        WorldGravityManager context = worlds.get(world);
+        return context == null ? false : context.localResetToDefault();
     }
 }

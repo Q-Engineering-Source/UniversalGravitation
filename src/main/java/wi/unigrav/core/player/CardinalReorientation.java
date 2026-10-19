@@ -2,6 +2,7 @@ package wi.unigrav.core.player;
 
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.BooleanSupplier;
 
 import dev.crlhitbox.api.geometry.Aabb;
 import dev.crlhitbox.api.geometry.Vec3d;
@@ -49,7 +50,7 @@ public final class CardinalReorientation {
         INSTALL_REJECTED
     }
 
-    public sealed interface Outcome permits Installed, Rejected { }
+    public sealed interface Outcome permits Installed, Recovered, CommittedFailure, Rejected { }
 
     /**
      * The whole new physical state. {@code onGround} is re-derived from a real zero-gap
@@ -58,7 +59,15 @@ public final class CardinalReorientation {
     public record Installed(PlayerPhysicalSnapshot snapshot, CardinalFrame frame, boolean onGround)
             implements Outcome { }
 
-    public record Rejected(Reason reason, String detail) implements Outcome { }
+    /** A verified center path and installation consumed the entire owner tick. */
+    public record Recovered(PlayerPhysicalSnapshot snapshot, CardinalFrame frame, boolean onGround) implements Outcome { }
+    /** The CLEARANCE journal is authoritative; callers must not restore the pre-move state. */
+    public record CommittedFailure(PlayerPhysicalSnapshot snapshot, RuntimeException cause,
+            Optional<FreeOwnerTransaction.InstallationCustody> custody) implements Outcome { }
+
+    public record Rejected(Reason reason, String detail, Optional<RuntimeException> cause) implements Outcome {
+        public Rejected(Reason reason, String detail) { this(reason, detail, Optional.empty()); }
+    }
 
     private CardinalReorientation() { }
 
@@ -71,21 +80,61 @@ public final class CardinalReorientation {
      */
     public static Outcome adopt(WorldServer world, EntityPlayerMP actor, PlayerPhysicalSnapshot accepted,
                                 CardinalFrame target, BoostMovementBudget budget, long budgetTick) {
+        return adopt(world, actor, accepted, target, budget, budgetTick, () -> true);
+    }
+
+    /** Owner-tick adoption also fences world-query reentry before it can rebase the shared budget. */
+    static Outcome adopt(WorldServer world, EntityPlayerMP actor, PlayerPhysicalSnapshot accepted,
+                         CardinalFrame target, BoostMovementBudget budget, long budgetTick,
+                         BooleanSupplier ownerCurrent) {
+        return reorient(world, actor, accepted, target, budget, budgetTick, false, ownerCurrent, null);
+    }
+
+    /**
+     * Restores an already accepted cardinal body to the canonical Y+ collider before native
+     * movement takes custody. This transition is authorized only by its current physical owner;
+     * it still validates the accepted actor geometry and runs the same target, sweep, support and
+     * atomic-install transaction as an ordinary adoption.
+     */
+    public static Outcome restoreForNative(WorldServer world, EntityPlayerMP actor,
+                                           PlayerPhysicalSnapshot accepted, BoostMovementBudget budget,
+                                           long budgetTick) {
+        return reorient(world, actor, accepted, CardinalFrame.Y_POS, budget, budgetTick, true, () -> true, null);
+    }
+
+    static Outcome adopt(FreeOwnerTransaction transaction, CardinalFrame target,
+            BoostMovementBudget budget, long budgetTick) {
+        return reorient(transaction.world(), transaction.actor(), transaction.accepted(), target, budget,
+                budgetTick, false, () -> { transaction.requireOwnerFence(); return true; }, transaction);
+    }
+
+    static Outcome restoreForNative(FreeOwnerTransaction transaction, BoostMovementBudget budget, long budgetTick) {
+        return reorient(transaction.world(), transaction.actor(), transaction.accepted(), CardinalFrame.Y_POS,
+                budget, budgetTick, true, () -> { transaction.requireOwnerFence(); return true; }, transaction);
+    }
+
+    private static Outcome reorient(WorldServer world, EntityPlayerMP actor, PlayerPhysicalSnapshot accepted,
+                                    CardinalFrame target, BoostMovementBudget budget, long budgetTick,
+                                    boolean nativeRestore, BooleanSupplier ownerCurrent, FreeOwnerTransaction transaction) {
         Objects.requireNonNull(world, "world");
         Objects.requireNonNull(actor, "actor");
         Objects.requireNonNull(accepted, "accepted");
         Objects.requireNonNull(target, "target");
         Objects.requireNonNull(budget, "budget");
+        Objects.requireNonNull(ownerCurrent, "ownerCurrent");
         if (!world.isCallingFromMinecraftThread())
             throw new IllegalStateException("cardinal reorientation requires the server thread");
         if (!(accepted.placement().shape() instanceof PlayerBodyShape.Cardinal shape))
             return new Rejected(Reason.UNSUPPORTED_SHAPE, "only an installed cardinal body may reorient");
         if (shape.frame() == target)
             return new Rejected(Reason.SAME_FRAME, "target already is the accepted standing reference");
-        // Native callbacks may legitimately have relocated or killed the actor; never force a frame onto that.
-        if (actor.world != world || actor.isDead || actor.noClip || actor.isRiding() || actor.isPlayerSleeping()
-                || actor.isSpectator() || ((Entity) actor).isInWeb)
-            return new Rejected(Reason.ACTOR_CHANGED, "native actor state forbids a physical reorientation");
+        // Ordinary standing adoption must defer to native transitions. An active physical owner
+        // may restore the exact accepted collider before releasing native custody; that explicit
+        // path bypasses only these movement-state flags, never actor identity, geometry or world
+        // occupancy validation below.
+        if (actor.world != world || actor.isDead || !nativeRestore && (actor.noClip || actor.isRiding()
+                || actor.isPlayerSleeping() || actor.isSpectator() || ((Entity) actor).isInWeb))
+            return new Rejected(Reason.ACTOR_CHANGED, "native actor state forbids this physical reorientation");
         PlayerBodyShape.Dimensions dimensions = shape.dimensions();
         if (!dimensions.supportsCapsule())
             return new Rejected(Reason.UNSUPPORTED_SHAPE,
@@ -96,28 +145,46 @@ public final class CardinalReorientation {
         if (!toChb(actor.getEntityBoundingBox()).equals(accepted.placement().bounds())
                 || !position(actor).equals(accepted.placement().transport()))
             return new Rejected(Reason.ACTOR_CHANGED, "native actor differs from the accepted placement");
+        if (!ownerCurrent.getAsBoolean())
+            return new Rejected(Reason.ACTOR_CHANGED, "physical owner changed before reorientation");
         Vec3d center = accepted.placement().center();
         var targetShape = new PlayerBodyShape.Cardinal(target, dimensions);
         // Same centre, same dimensions: only the frame changes. This is a transition
         // proposal; it authorizes nothing until the world queries below accept it.
         var proposed = new PlayerBodyPlacement(center, target.attitude(), targetShape);
         Aabb targetBounds = proposed.bounds();
-        Aabb pathEnvelope = rotationSweepEnvelope(center, shape.frame().up(), target.up(),
-                dimensions.height(), dimensions.width());
+        if (transaction == null) {
+            Aabb pathEnvelope = rotationSweepEnvelope(center, shape.frame().up(), target.up(),
+                    dimensions.height(), dimensions.width());
 
-        // Target occupancy first: a more specific diagnosis than a blocked path.
-        var occupied = occupancy(world, actor, targetBounds);
-        if (occupied.isPresent()) {
-            CardinalReorientation.Rejected rejection = occupied.orElseThrow();
-            return rejection.reason() == Reason.WORLD_UNAVAILABLE
-                    ? rejection : new Rejected(Reason.TARGET_OCCUPIED, rejection.detail());
-        }
-        // The whole swept rotation is inside its own bounding box, which also contains the target box.
-        var blocked = occupancy(world, actor, pathEnvelope);
-        if (blocked.isPresent()) {
-            CardinalReorientation.Rejected rejection = blocked.orElseThrow();
-            return rejection.reason() == Reason.WORLD_UNAVAILABLE
-                    ? rejection : new Rejected(Reason.PATH_BLOCKED, rejection.detail());
+            // Target occupancy first: a more specific diagnosis than a blocked path.
+            var occupied = occupancy(world, actor, targetBounds);
+            if (occupied.isPresent()) {
+                CardinalReorientation.Rejected rejection = occupied.orElseThrow();
+                return rejection.reason() == Reason.WORLD_UNAVAILABLE
+                        ? rejection : new Rejected(Reason.TARGET_OCCUPIED, rejection.detail());
+            }
+            if (!ownerCurrent.getAsBoolean() || !matchesPlacement(actor, world, accepted.placement()))
+                return new Rejected(Reason.ACTOR_CHANGED, "physical owner or accepted geometry changed during target query");
+            // The whole swept rotation is inside its own bounding box, which also contains the target box.
+            var blocked = occupancy(world, actor, pathEnvelope);
+            if (blocked.isPresent()) {
+                CardinalReorientation.Rejected rejection = blocked.orElseThrow();
+                return rejection.reason() == Reason.WORLD_UNAVAILABLE
+                        ? rejection : new Rejected(Reason.PATH_BLOCKED, rejection.detail());
+            }
+            if (!ownerCurrent.getAsBoolean() || !matchesPlacement(actor, world, accepted.placement()))
+                return new Rejected(Reason.ACTOR_CHANGED, "physical owner or accepted geometry changed during path query");
+
+        } else {
+            if (!transaction.matchesCardinalOwner(actor, accepted, budget))
+                return new Rejected(Reason.ACTOR_CHANGED, "foreign Cardinal clearance owner transaction or budget");
+            var clearance = CardinalClearancePrepared.prepare(transaction, target);
+            if (clearance instanceof CardinalClearancePrepared.Prepared prepared)
+                return CardinalClearanceFinalizer.install(prepared, budgetTick, nativeRestore);
+            if (clearance instanceof CardinalClearancePrepared.Unavailable failure) return failure.rejection();
+            var rejection = validateOwnedArc(transaction, actor, accepted, target, targetBounds, budget);
+            if (rejection != null) return rejection;
         }
 
         Geometry saved = Geometry.of(actor);
@@ -125,15 +192,24 @@ public final class CardinalReorientation {
             return new Rejected(Reason.INSTALL_REJECTED, "native collider refused the proposed cardinal bounds");
         var installed = PlayerBodyPlacement.fromCardinalBounds(
                 toChb(actor.getEntityBoundingBox()), position(actor), target.attitude(), targetShape);
+        if (!ownerCurrent.getAsBoolean() || !matchesPlacement(actor, world, installed))
+            return new Rejected(Reason.ACTOR_CHANGED, "physical owner changed during collider installation");
         var installedSnapshot = new PlayerPhysicalSnapshot(accepted.scope(),
                 Math.incrementExact(accepted.revision()), installed, accepted.worldVelocity(), accepted.contacts());
-        Optional<Boolean> support = probeSupport(world, actor, installedSnapshot, target);
-        if (support.isEmpty()) {
-            // Fail closed on the ground fact: restore the exact previous geometry, never a half frame.
-            saved.restore(actor);
-            return new Rejected(Reason.WORLD_UNAVAILABLE, "reorientation support could not be re-derived");
+        SupportObservation support = observeSupport(world, actor, installedSnapshot, target, nativeRestore);
+        if (!ownerCurrent.getAsBoolean() || !matchesPlacement(actor, world, installed))
+            return new Rejected(Reason.ACTOR_CHANGED, "physical owner or installed geometry changed during support query");
+        if (support.grounded().isEmpty()) {
+            try { saved.restore(actor); }
+            catch (RuntimeException restoreFailure) {
+                if (support.cause().isEmpty()) throw restoreFailure;
+                RuntimeException primary = support.cause().orElseThrow();
+                if (primary != restoreFailure) primary.addSuppressed(restoreFailure);
+                throw primary;
+            }
+            return new Rejected(Reason.WORLD_UNAVAILABLE, "reorientation support could not be re-derived", support.cause());
         }
-        boolean onGround = support.orElseThrow();
+        boolean onGround = support.grounded().orElseThrow();
         var contacts = accepted.contacts();
         // This tick performed no movement: keep the previous collision/fall facts and only re-derive support.
         var snapshot = new PlayerPhysicalSnapshot(accepted.scope(), Math.incrementExact(accepted.revision()),
@@ -144,8 +220,77 @@ public final class CardinalReorientation {
                 contacts.map(PlayerPhysicalSnapshot.Contacts::nearFootLocomotion).orElse(false))));
         // Anchor rebase, not displacement: the centre did not move, so no credit may be minted or consumed.
         Vec3d transport = installed.transport();
+        if (!ownerCurrent.getAsBoolean() || !matchesPlacement(actor, world, installed))
+            return new Rejected(Reason.ACTOR_CHANGED, "physical owner changed before budget rebase");
         budget.rebase(new Vec3(transport.x(), transport.y(), transport.z()), budgetTick);
         return new Installed(snapshot, target, onGround);
+    }
+
+    private static Rejected validateOwnedArc(FreeOwnerTransaction transaction, EntityPlayerMP actor,
+            PlayerPhysicalSnapshot accepted, CardinalFrame target, Aabb fullTarget, BoostMovementBudget budget) {
+        if (!transaction.matchesCardinalOwner(actor, accepted, budget))
+            return new Rejected(Reason.ACTOR_CHANGED, "foreign Cardinal owner transaction or movement budget");
+        try {
+            transaction.requireCurrent();
+            var live = transaction.cardinalLiveDimensions();
+            transaction.requireCurrent();
+            var contained = CardinalContainedCapsuleSource.prepare(accepted, live, transaction.numeric());
+            if (contained instanceof CardinalContainedCapsuleSource.Unavailable failure)
+                return new Rejected(Reason.WORLD_UNAVAILABLE, "Cardinal source " + failure.reason() + ": "
+                        + failure.diagnostics(), failure.cause().map(cause -> (RuntimeException) cause));
+            var candidate = CardinalRealizedArcRecipe.prepare(
+                    ((CardinalContainedCapsuleSource.Prepared) contained).containment(), target, transaction.numeric());
+            if (candidate instanceof CardinalRealizedArcRecipe.Unavailable failure)
+                return new Rejected(Reason.WORLD_UNAVAILABLE, "Cardinal arc recipe " + failure.reason() + ": "
+                        + failure.detail(), failure.cause());
+            var prepared = (CardinalRealizedArcRecipe.Prepared) candidate;
+            var recipe = prepared.recipe();
+            var whole = prepared.path().enclose(0, 1, transaction.numeric());
+            Aabb window = union(union(accepted.placement().bounds(), fullTarget), whole.bounds());
+            transaction.requireCurrent();
+            var captured = WorldCollisionCandidates.capture(transaction, window,
+                    CollisionQueryFootprint.QueryPolicy.CAPSULE_CONTACT, SCAN);
+            if (captured instanceof WorldCollisionCandidates.Unavailable failure)
+                return new Rejected(Reason.WORLD_UNAVAILABLE, "Cardinal arc capture " + failure.reason()
+                        + ": " + failure.detail(), failure.cause());
+            var capture = (WorldCollisionCandidates.Snapshot) captured;
+            transaction.requireCurrent();
+            for (Aabb box : capture.boxes()) {
+                transaction.numeric().charge(6);
+                if (box.min().x() < fullTarget.max().x() && fullTarget.min().x() < box.max().x()
+                        && box.min().y() < fullTarget.max().y() && fullTarget.min().y() < box.max().y()
+                        && box.min().z() < fullTarget.max().z() && fullTarget.min().z() < box.max().z())
+                    return new Rejected(Reason.TARGET_OCCUPIED, "world geometry intersects the full Cardinal target");
+            }
+            var source = CapsulePathSource.containedCardinal(recipe.sourceContainment(), recipe.start(),
+                    capture, window, FreeOwnerTransaction.ACCURACY, transaction.queries(), transaction.numeric());
+            var arc = CapsuleArcValidator.validateCardinal(source, prepared);
+            if (arc instanceof CapsuleArcValidator.Failed failure)
+                return new Rejected(Reason.PATH_BLOCKED, "Cardinal arc " + failure.failure(),
+                        failure.budgetCause() == null ? Optional.empty() : Optional.of(
+                                failure.budgetCause() instanceof RuntimeException runtime ? runtime
+                                        : new IllegalStateException("Cardinal arc failed", failure.budgetCause())));
+            transaction.requireCurrent();
+            if (!((CapsuleArcValidator.VerifiedArc) arc).matchesBound(source))
+                return new Rejected(Reason.ACTOR_CHANGED, "Cardinal arc proof lost its exact source/capture context");
+            return null;
+        } catch (NumericWorkExhaustedException exhausted) {
+            return new Rejected(Reason.WORLD_UNAVAILABLE, "Cardinal arc numeric budget exhausted", Optional.of(exhausted));
+        }
+    }
+
+    private static Aabb union(Aabb a, Aabb b) {
+        return new Aabb(new Vec3d(Math.min(a.min().x(), b.min().x()), Math.min(a.min().y(), b.min().y()),
+                Math.min(a.min().z(), b.min().z())), new Vec3d(Math.max(a.max().x(), b.max().x()),
+                Math.max(a.max().y(), b.max().y()), Math.max(a.max().z(), b.max().z())));
+    }
+
+    private static boolean matchesPlacement(EntityPlayerMP actor, WorldServer world, PlayerBodyPlacement placement) {
+        return actor.world == world && !actor.isDead
+                && actor.width == placement.shape().dimensions().width()
+                && actor.height == placement.shape().dimensions().height()
+                && toChb(actor.getEntityBoundingBox()).equals(placement.bounds())
+                && position(actor).equals(placement.transport());
     }
 
     /**
@@ -264,7 +409,7 @@ public final class CardinalReorientation {
                 CollisionQueryFootprint.QueryPolicy.NATIVE_STRICT, SCAN);
         if (captured instanceof WorldCollisionCandidates.Unavailable failure)
             return Optional.of(new Rejected(Reason.WORLD_UNAVAILABLE,
-                    failure.reason() + ": " + failure.detail()));
+                    failure.reason() + ": " + failure.detail(), failure.cause()));
         if (!((WorldCollisionCandidates.Snapshot) captured).boxes().isEmpty())
             return Optional.of(new Rejected(Reason.TARGET_OCCUPIED, "world geometry intersects the requested space"));
         return Optional.empty();
@@ -275,14 +420,25 @@ public final class CardinalReorientation {
      * query and the same rule as the movement tail: a nonzero gap is not support.
      */
     static Optional<Boolean> probeSupport(WorldServer world, EntityPlayerMP actor,
-                                                  PlayerPhysicalSnapshot installed, CardinalFrame frame) {
+                                                   PlayerPhysicalSnapshot installed, CardinalFrame frame) {
+        return observeSupport(world, actor, installed, frame, false).grounded();
+    }
+
+    record SupportObservation(Optional<Boolean> grounded, Optional<RuntimeException> cause) { }
+    static SupportObservation observeSupport(WorldServer world, EntityPlayerMP actor,
+                                                   PlayerPhysicalSnapshot installed, CardinalFrame frame,
+                                                   boolean nativeRestore) {
         var request = new CardinalMovementResolver.Request(frame, actor.getEntityBoundingBox(),
                 frame.toWorld(new Vec3d(0, SUPPORT_PROBE_LOCAL_DELTA, 0)), MoverType.PLAYER, false, false, 0);
-        var support = WorldCollisionCandidates.resolveCardinal(world, actor, installed, request, SCAN, MOVE);
-        if (support.worldFailure().isPresent()) return Optional.empty();
+        var support = nativeRestore
+                ? WorldCollisionCandidates.resolveCardinalForNativeRestore(world, actor, installed, request, SCAN, MOVE)
+                : WorldCollisionCandidates.resolveCardinal(world, actor, installed, request, SCAN, MOVE);
+        if (support.worldFailure().isPresent())
+            return new SupportObservation(Optional.empty(), support.worldFailure().orElseThrow().cause());
         if (!(support.calculation().orElse(null) instanceof CardinalMovementResolver.Resolved contact))
-            return Optional.empty();
-        return Optional.of(contact.flags().onGround() && contact.nativeResolvedLocalDelta().y() == 0);
+            return new SupportObservation(Optional.empty(), Optional.empty());
+        return new SupportObservation(Optional.of(contact.flags().onGround() && contact.nativeResolvedLocalDelta().y() == 0),
+                Optional.empty());
     }
 
     private static boolean install(EntityPlayerMP actor, Aabb bounds) {

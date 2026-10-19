@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "defaultFloorProfile": "standard",
+  "defaultBootTier": "standard",
+  "profiles": {
+    "low": { "strength": 16.0, "plateau": 4.0, "range": 8.0 },
+    "standard": { "strength": 32.0, "plateau": 8.0, "range": 16.0 },
+    "high": { "strength": 64.0, "plateau": 16.0, "range": 32.0 }
+  },
+  "floorBindings": [
+    { "block": "unigrav:gravity_floor", "metadata": 1, "state": { "facing": "up" }, "profile": "low" },
+    { "block": "unigrav:gravity_floor", "metadata": 2, "state": { "facing": "north" }, "profile": "high" }
+  ],
+  "bootTiers": {
+    "low": { "floorProfile": "low", "captureReachMetres": 1.0, "jumpProtectionTicks": 6 },
+    "standard": { "floorProfile": "standard", "captureReachMetres": 1.5, "jumpProtectionTicks": 6 },
+    "high": { "floorProfile": "high", "captureReachMetres": 2.5, "jumpProtectionTicks": 6 }
+  },
+  "activeBoots": [
+    { "slot": "feet", "item": "minecraft:leather_boots", "tier": "low" },
+    { "slot": "feet", "item": "minecraft:iron_boots", "metadata": 0, "nbtSnbt": "{display:{Name:\"Magnetic Low\"}}", "tier": "low" },
+    { "slot": "feet", "item": "minecraft:iron_boots", "tier": "standard" },
+    { "slot": "feet", "item": "minecraft:diamond_boots", "tier": "high" }
+  ],
+  "activeMaterials": [
+    { "id": "iron_block", "block": "minecraft:iron_block", "state": {} },
+    { "id": "lit_furnace_core", "block": "minecraft:furnace", "state": { "facing": "north" }, "nbtSnbt": "{BurnTime:0}", "tier": "high" },
+    { "id": "unigrav_magnetic_floor", "block": "unigrav:magnetic_floor", "state": {} }
+  ],
+  "passive": {
+    "droppedItems": [
+      { "item": "minecraft:iron_ingot", "response": 1.0 },
+      { "item": "minecraft:iron_nugget", "response": 1.0 },
+      { "item": "minecraft:iron_block", "response": 1.0 }
+    ],
+    "playerBoots": [
+      { "item": "minecraft:iron_boots", "response": 1.0 },
+      { "item": "minecraft:diamond_boots", "response": 1.0 }
+    ]
+  },
+  "limits": {
+    "capture": { "maxProducerCells": 1024, "maxDependencyCells": 8192, "maxChunkColumns": 16, "maxCandidateBoxes": 2048 },
+    "compiler": { "maxPrimitives": 1024, "maxRawFaces": 6144, "maxCutsPerAxis": 128, "maxTiles": 131072, "maxCoverageChecks": 4000000, "maxFragments": 4096 },
+    "query": { "maxFragments": 4096, "maxVisibilityBoxTests": 1048576 }
+  }
+}

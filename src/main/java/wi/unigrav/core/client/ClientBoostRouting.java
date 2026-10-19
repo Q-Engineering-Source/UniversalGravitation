@@ -3,6 +3,7 @@ package wi.unigrav.core.client;
 import net.minecraft.client.entity.EntityPlayerSP;
 import java.util.Objects;
 import java.util.function.Function;
+import java.util.function.BiFunction;
 import wi.unigrav.core.player.PlayerPhysicsProtocol;
 
 import wi.unigrav.api.math.Vec3;
@@ -12,6 +13,7 @@ public final class ClientBoostRouting {
 
     private static Provider provider;
     private static Function<EntityPlayerSP, PlayerPhysicsProtocol.Controls> physicalProvider;
+    private static BiFunction<EntityPlayerSP, TangentViewSample, PlayerPhysicsProtocol.Controls> sampledPhysicalProvider;
     private static Function<EntityPlayerSP, PlayerPhysicsClientPresentation.ViewBasis> viewBasisProvider;
 
     private ClientBoostRouting() {
@@ -57,6 +59,18 @@ public final class ClientBoostRouting {
 
     public static synchronized PlayerPhysicsProtocol.Controls queryPhysical(EntityPlayerSP player) {
         return physicalProvider == null ? null : physicalProvider.apply(player);
+    }
+
+    public static synchronized Registration registerSampledPhysical(
+            BiFunction<EntityPlayerSP, TangentViewSample, PlayerPhysicsProtocol.Controls> next) {
+        sampledPhysicalProvider = Objects.requireNonNull(next, "sampled physical input provider");
+        return () -> { synchronized (ClientBoostRouting.class) {
+            if (sampledPhysicalProvider == next) sampledPhysicalProvider = null;
+        } };
+    }
+
+    public static synchronized PlayerPhysicsProtocol.Controls queryPhysical(EntityPlayerSP player, TangentViewSample view) {
+        return sampledPhysicalProvider == null ? queryPhysical(player) : sampledPhysicalProvider.apply(player, view);
     }
 
     public static synchronized Registration registerViewBasis(

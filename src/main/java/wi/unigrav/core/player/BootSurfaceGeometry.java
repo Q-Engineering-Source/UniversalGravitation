@@ -3,6 +3,8 @@ package wi.unigrav.core.player;
 import java.math.BigDecimal;
 import java.math.MathContext;
 import java.util.Objects;
+import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.world.WorldServer;
 
 import dev.crlhitbox.api.geometry.Aabb;
 import dev.crlhitbox.api.geometry.Vec3d;
@@ -53,12 +55,24 @@ public final class BootSurfaceGeometry {
         private final SourceKind kind;
         private final Aabb anchorBounds;
         private final double radius;
+        private final BootQueryArithmetic arithmetic;
+        private final CertifiedReferenceEndpoint endpoint;
 
         private Source(PlayerPhysicalSnapshot physical, SourceKind kind, Aabb anchorBounds, double radius) {
+            this(physical, kind, anchorBounds, radius, null);
+        }
+        private Source(PlayerPhysicalSnapshot physical, SourceKind kind, Aabb anchorBounds, double radius,
+                       BootQueryArithmetic arithmetic) {
+            this(physical, kind, anchorBounds, radius, arithmetic, null);
+        }
+        private Source(PlayerPhysicalSnapshot physical, SourceKind kind, Aabb anchorBounds, double radius,
+                       BootQueryArithmetic arithmetic, CertifiedReferenceEndpoint endpoint) {
+            this.arithmetic = arithmetic;
             this.physical = physical;
             this.kind = kind;
             this.anchorBounds = anchorBounds;
             this.radius = radius;
+            this.endpoint = endpoint;
         }
 
         public PlayerPhysicalSnapshot physical() { return physical; }
@@ -67,9 +81,18 @@ public final class BootSurfaceGeometry {
         /** Full foot rectangle, or the lower ball's centre as a point AABB; not the whole body proxy. */
         public Aabb anchorBounds() { return anchorBounds; }
         public double radius() { return radius; }
+        public boolean hasArithmetic() { return arithmetic != null; }
+        public boolean usesArithmetic(BootQueryArithmetic expected) { return arithmetic != null && arithmetic == expected; }
+        public boolean isAcceptedSensor() { return endpoint == null; }
+        public boolean queryCurrent() { return endpoint == null || endpoint.current(); }
+        /** Endpoint sensor permission does not replace the physical owner's live placement. */
+        public boolean endpointCurrentFor(PlayerPhysicalSnapshot exactOwner) {
+            return endpoint != null && physical == exactOwner && endpoint.owner() == exactOwner && endpoint.current();
+        }
 
         /** Outward-rounded bounds of this sensor expanded by reach; does not load a world. */
         public Aabb queryBounds(double reachMetres) {
+            if (arithmetic != null) return queryBounds(reachMetres, arithmetic);
             requireReach(reachMetres);
             BigDecimal expansion = exact(radius).add(exact(reachMetres));
             double[] low = new double[3];
@@ -80,6 +103,54 @@ public final class BootSurfaceGeometry {
             }
             return new Aabb(vector(low), vector(high));
         }
+
+        /** Only a source explicitly bound before footprint planning can use this receipt. */
+        public Aabb queryBounds(double reachMetres, BootQueryArithmetic sameArithmetic) {
+            requireArithmetic(this, sameArithmetic);
+            requireReach(reachMetres);
+            var expansion = sameArithmetic.add(sameArithmetic.exact(radius), sameArithmetic.exact(reachMetres));
+            double[] low = new double[3], high = new double[3];
+            for (int axis = 0; axis < 3; axis++) {
+                low[axis] = sameArithmetic.roundDown(sameArithmetic.subtract(
+                        sameArithmetic.exact(component(anchorBounds.min(), axis)), expansion));
+                high[axis] = sameArithmetic.roundUp(sameArithmetic.add(
+                        sameArithmetic.exact(component(anchorBounds.max(), axis)), expansion));
+            }
+            return new Aabb(vector(low), vector(high));
+        }
+    }
+
+    /** Rechecks a retained query's producer dependencies after this exact transaction installed.
+     * The original sensor remains query geometry only; this lease supplies no installation authority. */
+    public static final class InstalledObservationLease {
+        private final FreeOwnerTransaction transaction;
+        private final Source source;
+        private final PlayerPhysicalSnapshot journal;
+        private final PlayerBodyPlacement placement;
+        private InstalledObservationLease(FreeOwnerTransaction transaction, Source source) {
+            this.transaction = transaction; this.source = source;
+            transaction.requireCurrent();
+            journal = transaction.installedJournal().orElseThrow();
+            placement = transaction.installedPlacement().orElseThrow();
+            if (transaction.installationStage() != FreeOwnerTransaction.InstallationStage.INSTALLED
+                    || source.physical() != transaction.accepted() || journal.placement() != placement)
+                throw new IllegalStateException("post-install boot observation has no exact installed owner");
+            requireCurrent(transaction.world(), transaction.actor(), source);
+        }
+        public void requireCurrent(WorldServer world, EntityPlayer actor, Source exactSource) {
+            if (world != transaction.world() || actor != transaction.actor() || exactSource != source)
+                throw new IllegalStateException("foreign post-install boot observation context");
+            transaction.requireCurrent();
+            if (transaction.installationStage() != FreeOwnerTransaction.InstallationStage.INSTALLED
+                    || transaction.installedJournal().orElse(null) != journal
+                    || transaction.installedPlacement().orElse(null) != placement || journal.placement() != placement)
+                throw new IllegalStateException("post-install boot observation owner changed");
+            transaction.requireCurrent();
+        }
+    }
+
+    static InstalledObservationLease installedObservation(FreeOwnerTransaction transaction, Source source) {
+        return new InstalledObservationLease(transaction, source);
     }
 
     /** Inclusive enclosing interval; an interval touching zero does not assert exact physical contact. */
@@ -140,14 +211,91 @@ public final class BootSurfaceGeometry {
         }
         var dimensions = placement.shape().dimensions();
         // CHB canonicalizes endpoint order. Body up, not Segment3d.start(), defines the lower endpoint.
-        Vec3d lower = placement.center().subtract(placement.bodyUp().multiply(dimensions.centerlineHalfLength()));
-        return new Source(physical, SourceKind.FREE_LOWER_BALL, new Aabb(lower, lower), dimensions.radius());
+        Vec3d lower = placement.storedCapsuleGeometry().negativeEndpoint();
+        return new Source(physical, SourceKind.FREE_LOWER_BALL, new Aabb(lower, lower), placement.capsule().radius());
     }
 
+    /** Binds sensor calculations, not historical construction work or live owner authority. */
+    public static Source fromAccepted(PlayerPhysicalSnapshot physical, BootQueryArithmetic sameArithmetic) {
+        Objects.requireNonNull(physical); Objects.requireNonNull(sameArithmetic);
+        var placement = physical.placement();
+        if (!(placement.shape() instanceof PlayerBodyShape.FreeCapsule))
+            throw new IllegalArgumentException("shared boot source requires actual FreeCapsule");
+        Vec3d negative = placement.storedCapsuleGeometry().negativeEndpoint();
+        return new Source(physical, SourceKind.FREE_LOWER_BALL, new Aabb(negative, negative),
+                placement.capsule().radius(), sameArithmetic);
+    }
+
+    static Source fromEndpoint(CertifiedReferenceEndpoint endpoint, BootQueryArithmetic sameArithmetic) {
+        Objects.requireNonNull(endpoint).requireCurrent();
+        Objects.requireNonNull(sameArithmetic);
+        if (sameArithmetic != endpoint.transaction().resources().environmentObservationWork().arithmetic())
+            throw new IllegalArgumentException("endpoint sensor requires its owner observation arithmetic");
+        var placement = endpoint.pose().placement();
+        if (!(placement.shape() instanceof PlayerBodyShape.FreeCapsule))
+            throw new IllegalArgumentException("endpoint boot source requires certified Free capsule");
+        Vec3d negative = placement.storedCapsuleGeometry().negativeEndpoint();
+        return new Source(endpoint.owner(), SourceKind.FREE_LOWER_BALL, new Aabb(negative, negative),
+                placement.capsule().radius(), sameArithmetic, endpoint);
+    }
+    private static void requireArithmetic(Source source, BootQueryArithmetic arithmetic) {
+        Objects.requireNonNull(arithmetic);
+        if (!source.usesArithmetic(arithmetic)) throw new IllegalArgumentException("boot source arithmetic differs");
+    }
+
+    /** Shared physical range, gap and pull direction. Resource/profile failures propagate unchanged. */
+    public static Result measure(Source source, FaceRectangle face, double reachMetres,
+                                 BootQueryArithmetic arithmetic) {
+        Objects.requireNonNull(source); Objects.requireNonNull(face);
+        requireArithmetic(source, arithmetic); requireReach(reachMetres);
+        double[] from = new double[3], to = new double[3];
+        BootQueryArithmetic.Number[] delta = new BootQueryArithmetic.Number[3];
+        var square = arithmetic.exact(0);
+        for (int axis = 0; axis < 3; axis++) {
+            double sourceLow = component(source.anchorBounds.min(), axis), sourceHigh = component(source.anchorBounds.max(), axis);
+            double faceLow = component(face.bounds().min(), axis), faceHigh = component(face.bounds().max(), axis);
+            if (arithmetic.compare(arithmetic.exact(sourceHigh), arithmetic.exact(faceLow)) < 0) {
+                from[axis] = sourceHigh; to[axis] = faceLow;
+            } else if (arithmetic.compare(arithmetic.exact(faceHigh), arithmetic.exact(sourceLow)) < 0) {
+                from[axis] = sourceLow; to[axis] = faceHigh;
+            } else {
+                from[axis] = arithmetic.compare(arithmetic.exact(sourceLow), arithmetic.exact(faceLow)) >= 0 ? sourceLow : faceLow;
+                to[axis] = from[axis];
+            }
+            delta[axis] = arithmetic.subtract(arithmetic.exact(to[axis]), arithmetic.exact(from[axis]));
+            square = arithmetic.add(square, arithmetic.multiply(delta[axis], delta[axis]));
+        }
+        var radius = arithmetic.exact(source.radius);
+        var reachRadius = arithmetic.add(radius, arithmetic.exact(reachMetres));
+        Range range = arithmetic.compare(square, arithmetic.multiply(reachRadius, reachRadius)) <= 0 ? Range.IN_RANGE : Range.OUT_OF_RANGE;
+        Gap gap; Vec3d direction;
+        if (arithmetic.compare(square, arithmetic.multiply(radius, radius)) <= 0) {
+            gap = new Gap(0, 0);
+            arithmetic.chargeOppositeFaceDirection();
+            direction = face.outward().up().multiply(-1);
+        } else {
+            var distance = arithmetic.sqrt(square);
+            var low = arithmetic.subtract(arithmetic.exact(distance.lower()), radius);
+            var high = arithmetic.subtract(arithmetic.exact(distance.upper()), radius);
+            gap = new Gap(arithmetic.sign(low) < 0 ? 0 : arithmetic.roundDown(low),
+                    arithmetic.sign(high) < 0 ? 0 : arithmetic.roundUp(high));
+            var normalized = arithmetic.normalize(delta[0], delta[1], delta[2]);
+            direction = new Vec3d(normalized.x(), normalized.y(), normalized.z());
+        }
+        int axis = normalAxis(face.outward());
+        boolean positive = component(face.outward().up(), axis) > 0;
+        var point = arithmetic.exact(component(positive ? source.anchorBounds.min() : source.anchorBounds.max(), axis));
+        var plane = arithmetic.exact(component(face.bounds().min(), axis));
+        int side = arithmetic.sign(arithmetic.subtract(positive ? arithmetic.subtract(point, plane)
+                : arithmetic.subtract(plane, point), radius));
+        return new Proximity(source, face, gap, range, side > 0 ? MinimumSide.FRONT : side < 0 ? MinimumSide.BEHIND_PLANE : MinimumSide.ON_PLANE,
+                vector(from), vector(to), direction);
+    }
     /** Finite set distance only. Face exposure, visibility, eligibility and accepted fit remain separate. */
     public static Result measure(Source source, FaceRectangle face, double reachMetres) {
         Objects.requireNonNull(source, "source");
         Objects.requireNonNull(face, "face");
+        if (source.arithmetic != null) return measure(source, face, reachMetres, source.arithmetic);
         requireReach(reachMetres);
         try {
             double[] from = new double[3];

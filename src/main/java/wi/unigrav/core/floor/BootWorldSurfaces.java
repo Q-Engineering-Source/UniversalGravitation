@@ -1,5 +1,7 @@
 package wi.unigrav.core.floor;
 
+import wi.unigrav.core.player.EnvironmentObservationWork;
+
 import java.util.AbstractList;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -177,13 +179,43 @@ public final class BootWorldSurfaces {
     /** Same native observation as {@link #capture}, retaining only explicit rule-selection decisions. */
     public static QualifiedCapture captureQualified(WorldServer world, EntityPlayer actor, BootQueryFootprint footprint,
                                                     MagneticBlockReader.RuleSet ruleSet) {
+        return captureQualifiedInternal(world, actor, footprint, ruleSet, null);
+    }
+
+    public static QualifiedCapture captureQualified(WorldServer world, EntityPlayer actor, BootQueryFootprint footprint,
+            MagneticBlockReader.RuleSet ruleSet, EnvironmentObservationWork work) {
+        Objects.requireNonNull(work).requireCurrent(world);
+        return captureQualifiedInternal(world, actor, footprint, ruleSet, work);
+    }
+
+    /** Same retained query footprint, under a private-minted exact installed-owner lease. */
+    public static QualifiedCapture recaptureQualifiedAfterInstall(WorldServer world, EntityPlayer actor,
+            QualifiedSnapshot previous, MagneticBlockReader.RuleSet ruleSet, EnvironmentObservationWork work,
+            BootSurfaceGeometry.InstalledObservationLease lease) {
+        Objects.requireNonNull(previous); Objects.requireNonNull(lease);
+        Objects.requireNonNull(work).requireCurrent(world);
+        lease.requireCurrent(world, actor, previous.snapshot().footprint().source());
+        var result = captureQualifiedInternal(world, actor, previous.snapshot().footprint(), ruleSet, work, lease);
+        lease.requireCurrent(world, actor, previous.snapshot().footprint().source());
+        return result;
+    }
+
+    private static QualifiedCapture captureQualifiedInternal(WorldServer world, EntityPlayer actor, BootQueryFootprint footprint,
+            MagneticBlockReader.RuleSet ruleSet, EnvironmentObservationWork work) {
+        return captureQualifiedInternal(world, actor, footprint, ruleSet, work, null);
+    }
+
+    private static QualifiedCapture captureQualifiedInternal(WorldServer world, EntityPlayer actor, BootQueryFootprint footprint,
+            MagneticBlockReader.RuleSet ruleSet, EnvironmentObservationWork work,
+            BootSurfaceGeometry.InstalledObservationLease installedLease) {
         Objects.requireNonNull(ruleSet, "ruleSet");
         InternalCapture captured = captureInternal(world, actor, footprint, cell -> {
-            MagneticBlockReader.QualifiedResult result = MagneticBlockReader.readQualified(world, cell, ruleSet);
+            MagneticBlockReader.QualifiedResult result = work == null ? MagneticBlockReader.readQualified(world, cell, ruleSet)
+                    : MagneticBlockReader.readQualified(world, cell, ruleSet, work);
             if (result instanceof MagneticBlockReader.Unavailable unavailable) throw new MaterialUnavailable(cell, unavailable);
             MagneticBlockReader.QualifiedObservation observation = (MagneticBlockReader.QualifiedObservation) result;
             return new CellMaterial(observation.observation(), observation.materialMatch());
-        });
+        }, work, installedLease);
         if (captured instanceof Unavailable unavailable) return unavailable;
         Captured success = (Captured) captured;
         return new QualifiedSnapshot(success.snapshot(), success.materialMatches(), ruleSet.revision());
@@ -191,6 +223,16 @@ public final class BootWorldSurfaces {
 
     private static InternalCapture captureInternal(WorldServer world, EntityPlayer actor, BootQueryFootprint footprint,
                                                    CellReader reader) {
+        return captureInternal(world, actor, footprint, reader, null);
+    }
+
+    private static InternalCapture captureInternal(WorldServer world, EntityPlayer actor, BootQueryFootprint footprint,
+            CellReader reader, EnvironmentObservationWork work) {
+        return captureInternal(world, actor, footprint, reader, work, null);
+    }
+
+    private static InternalCapture captureInternal(WorldServer world, EntityPlayer actor, BootQueryFootprint footprint,
+            CellReader reader, EnvironmentObservationWork work, BootSurfaceGeometry.InstalledObservationLease installedLease) {
         Objects.requireNonNull(world, "world");
         Objects.requireNonNull(actor, "actor");
         Objects.requireNonNull(footprint, "footprint");
@@ -198,17 +240,18 @@ public final class BootWorldSurfaces {
         if (!world.isCallingFromMinecraftThread()) {
             throw new IllegalStateException("boot surface capture requires the authoritative server thread");
         }
-        Optional<Unavailable> actorFailure = actorFailure(world, actor, footprint.source());
+        Optional<Unavailable> actorFailure = observationActorFailure(world, actor, footprint.source(), installedLease);
         if (actorFailure.isPresent()) return actorFailure.orElseThrow();
         if (deferred(world)) return unavailable(Reason.DEFERRED_WORLD, null, "block snapshot capture/restore is active", null);
 
         try {
             long tick = world.getTotalWorldTime();
-            List<Chunk> before = preflight(world, footprint);
-            Dependencies dependencies = observeDependencies(world, footprint);
+            List<Chunk> before = preflight(world, footprint, work);
+            Dependencies dependencies = observeDependencies(world, footprint, work);
             List<Primitive> primitives = new ArrayList<>();
             Map<Primitive, MagneticBlockReader.MaterialMatch> materialMatches = new HashMap<>();
             for (BlockPos planned : footprint.producers()) {
+                charge(work, EnvironmentObservationWork.Unit.CLASSIFICATION);
                 BlockPos cell = planned.toImmutable();
                 CellMaterial material = reader.read(cell);
                 MagneticBlockReader.Observation observation = material.observation();
@@ -218,7 +261,7 @@ public final class BootWorldSurfaces {
                 }
                 try {
                     List<Primitive> produced = collectNativeCell(world, actor, observation, footprint.nativeBounds(),
-                            remaining(footprint, primitives));
+                            remaining(footprint, primitives), work);
                     primitives.addAll(produced);
                     material.materialMatch().ifPresent(match -> produced.forEach(primitive -> materialMatches.put(primitive, match)));
                 } catch (UnsupportedCallbackFailure unsupported) {
@@ -231,10 +274,10 @@ public final class BootWorldSurfaces {
                     return unavailable(Reason.CALLBACK_FAILED, cell, "native block collision callback failed", callbackFailure);
                 }
             }
-            List<Chunk> after = preflight(world, footprint);
-            if (world.getTotalWorldTime() != tick || !sameChunks(before, after) || !dependencies.sameStoredIdentities(world)
+            List<Chunk> after = preflight(world, footprint, work);
+            if (world.getTotalWorldTime() != tick || !sameChunks(before, after, work) || !dependencies.sameStoredIdentities(world, work)
                     || deferred(world)
-                    || actorFailure(world, actor, footprint.source()).isPresent()) {
+                    || observationActorFailure(world, actor, footprint.source(), installedLease).isPresent()) {
                 return unavailable(Reason.CONTEXT_CHANGED, null,
                         "actor, world tick, loaded columns, or snapshot-capture context changed during observation", null);
             }
@@ -279,8 +322,14 @@ public final class BootWorldSurfaces {
      * tile-entity stability, or arbitrary callback purity.
      */
     private static Dependencies observeDependencies(WorldServer world, BootQueryFootprint footprint) {
+        return observeDependencies(world, footprint, null);
+    }
+
+    private static Dependencies observeDependencies(WorldServer world, BootQueryFootprint footprint,
+            EnvironmentObservationWork work) {
         Map<BlockPos, IBlockState> states = new HashMap<>(footprint.dependencies().size());
         for (BlockPos planned : footprint.dependencies()) {
+            charge(work, EnvironmentObservationWork.Unit.CLASSIFICATION);
             BlockPos cell = planned.toImmutable();
             Chunk chunk = world.getChunkProvider().getLoadedChunk(cell.getX() >> 4, cell.getZ() >> 4);
             if (chunk == null || !chunk.isLoaded() || chunk.getWorld() != world) {
@@ -290,7 +339,9 @@ public final class BootWorldSurfaces {
             IBlockState stored = Objects.requireNonNull(chunk.getBlockState(cell), "stored dependency state");
             if (profile(stored) == CallbackProfile.UNSUPPORTED) {
                 throw new ObservationFailure(Reason.UNSUPPORTED_CALLBACK, cell,
-                        "dependency callback domain is outside the known boot collector profile", null);
+                        "dependency callback domain is outside the known boot collector profile: block="
+                                + stored.getBlock().getRegistryName() + " state=" + stored
+                                + " profile=" + profile(stored), null);
             }
             states.put(cell, stored);
         }
@@ -313,20 +364,28 @@ public final class BootWorldSurfaces {
      */
     static List<Primitive> collectNativeCell(World world, Entity actor, MagneticBlockReader.Observation observation,
                                              Aabb nativeBounds, int remainingBoxes) {
+        return collectNativeCell(world, actor, observation, nativeBounds, remainingBoxes, null);
+    }
+
+    static List<Primitive> collectNativeCell(World world, Entity actor, MagneticBlockReader.Observation observation,
+            Aabb nativeBounds, int remainingBoxes, EnvironmentObservationWork work) {
         Objects.requireNonNull(world, "world");
         Objects.requireNonNull(observation, "observation");
         Objects.requireNonNull(nativeBounds, "nativeBounds");
         if (remainingBoxes < 0) {
             throw new IllegalArgumentException("remainingBoxes must be nonnegative");
         }
+        charge(work, EnvironmentObservationWork.Unit.CLASSIFICATION);
         if (profile(observation.storedState()) == CallbackProfile.UNSUPPORTED) {
             throw new UnsupportedCallbackFailure("block callback domain is outside the known boot collector profile");
         }
         BoundedNativeBoxes nativeBoxes = new BoundedNativeBoxes(remainingBoxes);
+        charge(work, EnvironmentObservationWork.Unit.DISPATCH);
         observation.storedState().addCollisionBoxToList(world, observation.position(), nativeBox(nativeBounds),
                 nativeBoxes, actor, false);
         List<Primitive> primitives = new ArrayList<>(nativeBoxes.size());
         for (int ordinal = 0; ordinal < nativeBoxes.size(); ordinal++) {
+            charge(work, EnvironmentObservationWork.Unit.CLASSIFICATION);
             Aabb rawBounds;
             try {
                 rawBounds = copyRaw(nativeBoxes.get(ordinal));
@@ -344,13 +403,16 @@ public final class BootWorldSurfaces {
         if (block == Blocks.AIR || block == Blocks.WATER || block == Blocks.FLOWING_WATER
                 || block == Blocks.LAVA || block == Blocks.FLOWING_LAVA) return CallbackProfile.EMPTY_OR_LOCAL;
         if (block == FloorBlocks.GRAVITY_FLOOR || block == FloorBlocks.MAGNETIC_FLOOR
+                || block == FloorBlocks.DOUBLE_SIDED_GRAVITY_FLOOR
                 || block == Blocks.STONE_SLAB || block == Blocks.WOODEN_SLAB) return CallbackProfile.EMPTY_OR_LOCAL;
-        if (block == Blocks.OAK_STAIRS || block == Blocks.OAK_FENCE || block == Blocks.COBBLESTONE_WALL) {
+        if (block == Blocks.OAK_STAIRS || block == Blocks.STONE_STAIRS || block == Blocks.OAK_FENCE || block == Blocks.COBBLESTONE_WALL) {
             return CallbackProfile.NEIGHBOR_HALO;
         }
         if (block == Blocks.STONE || block == Blocks.COBBLESTONE || block == Blocks.DIRT || block == Blocks.GRASS
                 || block == Blocks.SAND || block == Blocks.GRAVEL || block == Blocks.IRON_BLOCK || block == Blocks.GOLD_BLOCK
-                || block == Blocks.DIAMOND_BLOCK || block == Blocks.EMERALD_BLOCK) return CallbackProfile.EMPTY_OR_LOCAL;
+                || block == Blocks.DIAMOND_BLOCK || block == Blocks.EMERALD_BLOCK
+                // Patched BlockGlowstone inherits Block's local collision callbacks unchanged.
+                || block == Blocks.GLOWSTONE || block == Blocks.BEDROCK) return CallbackProfile.EMPTY_OR_LOCAL;
         return CallbackProfile.UNSUPPORTED;
     }
 
@@ -360,9 +422,16 @@ public final class BootWorldSurfaces {
         UNSUPPORTED
     }
 
+    private static Optional<Unavailable> observationActorFailure(WorldServer world, EntityPlayer actor,
+            BootSurfaceGeometry.Source source, BootSurfaceGeometry.InstalledObservationLease installedLease) {
+        if (installedLease == null) return actorFailure(world, actor, source);
+        installedLease.requireCurrent(world, actor, source);
+        return Optional.empty();
+    }
+
     private static Optional<Unavailable> actorFailure(WorldServer world, EntityPlayer actor, BootSurfaceGeometry.Source source) {
         PlayerPhysicalSnapshot physical = source.physical();
-        if (actor.world != world || actor.isDead || !physical.scope().playerId().equals(actor.getUniqueID())
+        if (!source.queryCurrent() || actor.world != world || actor.isDead || !physical.scope().playerId().equals(actor.getUniqueID())
                 || physical.scope().dimension() != actor.dimension) {
             return Optional.of(unavailable(Reason.ACTOR_SCOPE, null,
                     "actor does not match the source snapshot player/world scope", null));
@@ -374,12 +443,20 @@ public final class BootWorldSurfaces {
             return Optional.of(unavailable(Reason.ACTOR_SCOPE, null,
                     "actor placement does not match the source snapshot placement", null));
         }
+        if (!source.queryCurrent()) return Optional.of(unavailable(Reason.ACTOR_SCOPE, null,
+                "certified endpoint source changed during actor observation", null));
         return Optional.empty();
     }
 
     private static List<Chunk> preflight(WorldServer world, BootQueryFootprint footprint) {
+        return preflight(world, footprint, null);
+    }
+
+    private static List<Chunk> preflight(WorldServer world, BootQueryFootprint footprint,
+            EnvironmentObservationWork work) {
         List<Chunk> chunks = new ArrayList<>(footprint.columns().size());
         for (BootQueryFootprint.Column column : footprint.columns()) {
+            charge(work, EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
             BlockPos probe = new BlockPos(column.x() * 16, 64, column.z() * 16);
             if (!world.isBlockLoaded(probe, true)) {
                 throw new ObservationFailure(Reason.MISSING_DEPENDENCY, null, "a planned dependency column is not loaded", null);
@@ -397,8 +474,14 @@ public final class BootWorldSurfaces {
     }
 
     private static boolean sameChunks(List<Chunk> before, List<Chunk> after) {
+        return sameChunks(before, after, null);
+    }
+
+    private static boolean sameChunks(List<Chunk> before, List<Chunk> after,
+            EnvironmentObservationWork work) {
         if (before.size() != after.size()) return false;
         for (int index = 0; index < before.size(); index++) {
+            charge(work, EnvironmentObservationWork.Unit.COMPARISON);
             if (before.get(index) != after.get(index)) return false;
         }
         return true;
@@ -416,7 +499,12 @@ public final class BootWorldSurfaces {
         }
 
         private boolean sameStoredIdentities(WorldServer world) {
+            return sameStoredIdentities(world, null);
+        }
+
+        private boolean sameStoredIdentities(WorldServer world, EnvironmentObservationWork work) {
             for (Map.Entry<BlockPos, IBlockState> entry : states.entrySet()) {
+                charge(work, EnvironmentObservationWork.Unit.COMPARISON);
                 BlockPos cell = entry.getKey();
                 Chunk chunk = world.getChunkProvider().getLoadedChunk(cell.getX() >> 4, cell.getZ() >> 4);
                 if (chunk == null || !chunk.isLoaded() || chunk.getWorld() != world
@@ -424,6 +512,11 @@ public final class BootWorldSurfaces {
             }
             return true;
         }
+    }
+
+    private static void charge(EnvironmentObservationWork work,
+            EnvironmentObservationWork.Unit unit) {
+        if (work != null) work.charge(unit);
     }
 
     private static int remaining(BootQueryFootprint footprint, List<Primitive> primitives) {

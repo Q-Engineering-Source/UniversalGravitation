@@ -1,6 +1,7 @@
 package wi.unigrav.core.floor;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -15,6 +16,7 @@ import java.util.UUID;
 
 import com.mojang.authlib.GameProfile;
 import dev.crlhitbox.api.geometry.Vec3d;
+import net.minecraft.block.BlockStairs;
 import net.minecraft.block.state.IBlockState;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.init.Blocks;
@@ -64,6 +66,135 @@ class BootCaptureIntegrationTest {
     @BeforeAll
     static void bootstrap() {
         Bootstrap.register();
+    }
+
+    @Test
+    void glowstoneProducerAndDependencyHaloUseActualNativeLocalCollision(@TempDir Path directory) {
+        try (Fixture fixture = fixture(directory, Blocks.GLOWSTONE.getDefaultState())) {
+            var capture = assertInstanceOf(BootWorldSurfaces.QualifiedSnapshot.class,
+                    BootWorldSurfaces.captureQualified(fixture.world(), fixture.actor(), fixture.footprint(), rules(49)));
+            assertEquals(1, capture.snapshot().primitives().size());
+            var box = capture.snapshot().primitives().getFirst().rawBounds();
+            assertEquals(new Vec3d(8, 64, 8), box.min());
+            assertEquals(new Vec3d(9, 65, 9), box.max());
+            var haloOnly = fixture.footprint().dependencies().stream()
+                    .filter(cell -> !fixture.footprint().producers().contains(cell)).findFirst().orElseThrow();
+            fixture.worldFixture().put(haloOnly, Blocks.GLOWSTONE.getDefaultState());
+            assertInstanceOf(BootWorldSurfaces.QualifiedSnapshot.class,
+                    BootWorldSurfaces.captureQualified(fixture.world(), fixture.actor(), fixture.footprint(), rules(49)));
+            fixture.worldFixture().put(haloOnly, Blocks.GLASS.getDefaultState());
+            var unsupported = assertInstanceOf(BootWorldSurfaces.Unavailable.class,
+                    BootWorldSurfaces.captureQualified(fixture.world(), fixture.actor(), fixture.footprint(), rules(49)));
+            assertEquals(BootWorldSurfaces.Reason.UNSUPPORTED_CALLBACK, unsupported.reason());
+            assertEquals(haloOnly, unsupported.cell().orElseThrow());
+            assertTrue(unsupported.detail().contains("minecraft:glass"));
+            assertTrue(unsupported.detail().contains("UNSUPPORTED"));
+        }
+    }
+
+    @Test
+    void bedrockProducerUsesActualNativeLocalCollisionWithoutMagneticQualification(@TempDir Path directory) {
+        try (Fixture fixture = fixture(directory, Blocks.BEDROCK.getDefaultState())) {
+            var capture = assertInstanceOf(BootWorldSurfaces.QualifiedSnapshot.class,
+                    BootWorldSurfaces.captureQualified(fixture.world(), fixture.actor(), fixture.footprint(), rules(50)));
+            assertEquals(1, capture.snapshot().primitives().size());
+            var primitive = capture.snapshot().primitives().getFirst();
+            assertEquals(FLOOR, primitive.cell());
+            assertSame(Blocks.BEDROCK.getDefaultState(), primitive.storedState());
+            assertEquals(new Vec3d(8, 64, 8), primitive.rawBounds().min());
+            assertEquals(new Vec3d(9, 65, 9), primitive.rawBounds().max());
+            assertFalse(primitive.magnetic());
+            assertTrue(capture.materialMatches().isEmpty());
+        }
+    }
+
+    @Test
+    void bedrockDependencyHaloPreservesProducerAndStillRejectsUnknownCallback(@TempDir Path directory) {
+        try (Fixture fixture = fixture(directory, Blocks.IRON_BLOCK.getDefaultState())) {
+            var haloOnly = fixture.footprint().dependencies().stream()
+                    .filter(cell -> !fixture.footprint().producers().contains(cell)).findFirst().orElseThrow();
+            fixture.worldFixture().put(haloOnly, Blocks.BEDROCK.getDefaultState());
+            var capture = assertInstanceOf(BootWorldSurfaces.QualifiedSnapshot.class,
+                    BootWorldSurfaces.captureQualified(fixture.world(), fixture.actor(), fixture.footprint(), rules(51)));
+            assertEquals(1, capture.snapshot().primitives().size());
+            var primitive = capture.snapshot().primitives().getFirst();
+            assertEquals(FLOOR, primitive.cell());
+            assertSame(Blocks.IRON_BLOCK.getDefaultState(), primitive.storedState());
+            assertTrue(primitive.magnetic());
+            fixture.worldFixture().put(haloOnly, Blocks.GLASS.getDefaultState());
+            var unsupported = assertInstanceOf(BootWorldSurfaces.Unavailable.class,
+                    BootWorldSurfaces.captureQualified(fixture.world(), fixture.actor(), fixture.footprint(), rules(51)));
+            assertEquals(BootWorldSurfaces.Reason.UNSUPPORTED_CALLBACK, unsupported.reason());
+            assertEquals(haloOnly, unsupported.cell().orElseThrow());
+            assertTrue(unsupported.detail().contains("minecraft:glass"));
+            assertTrue(unsupported.detail().contains("UNSUPPORTED"));
+        }
+    }
+
+    @Test
+    void stoneStairsBottomProducerMatchesActualOakCollision(@TempDir Path directory) {
+        assertStoneStairsMatchOak(directory, 0, false);
+    }
+
+    @Test
+    void stoneStairsTopProducerMatchesActualOakCollision(@TempDir Path directory) {
+        assertStoneStairsMatchOak(directory, 4, false);
+    }
+
+    @Test
+    void stoneStairsOuterCornerProducerMatchesActualOakCollision(@TempDir Path directory) {
+        assertStoneStairsMatchOak(directory, 0, true);
+    }
+
+    private static void assertStoneStairsMatchOak(Path directory, int metadata, boolean outerCorner) {
+        IBlockState oak = Blocks.OAK_STAIRS.getStateFromMeta(metadata);
+        IBlockState stone = Blocks.STONE_STAIRS.getStateFromMeta(metadata);
+        try (Fixture fixture = fixture(directory, oak)) {
+            if (outerCorner) fixture.worldFixture().put(FLOOR.east(), Blocks.OAK_STAIRS.getStateFromMeta(3));
+            assertEquals(outerCorner ? BlockStairs.EnumShape.OUTER_LEFT : BlockStairs.EnumShape.STRAIGHT,
+                    oak.getActualState(fixture.world(), FLOOR).getValue(BlockStairs.SHAPE));
+            var oakCapture = assertInstanceOf(BootWorldSurfaces.QualifiedSnapshot.class,
+                    BootWorldSurfaces.captureQualified(fixture.world(), fixture.actor(), fixture.footprint(), rules(52)));
+            var oakBoxes = oakCapture.snapshot().primitives().stream()
+                    .filter(primitive -> primitive.cell().equals(FLOOR))
+                    .map(BootWorldSurfaces.Primitive::rawBounds).toList();
+            assertEquals(2, oakBoxes.size(), "the actual stair callback must emit slab plus quarter/eighth");
+            fixture.worldFixture().put(FLOOR, stone);
+            if (outerCorner) fixture.worldFixture().put(FLOOR.east(), Blocks.STONE_STAIRS.getStateFromMeta(3));
+            assertEquals(outerCorner ? BlockStairs.EnumShape.OUTER_LEFT : BlockStairs.EnumShape.STRAIGHT,
+                    stone.getActualState(fixture.world(), FLOOR).getValue(BlockStairs.SHAPE));
+            var stoneCapture = assertInstanceOf(BootWorldSurfaces.QualifiedSnapshot.class,
+                    BootWorldSurfaces.captureQualified(fixture.world(), fixture.actor(), fixture.footprint(), rules(52)));
+            var stonePrimitives = stoneCapture.snapshot().primitives().stream()
+                    .filter(primitive -> primitive.cell().equals(FLOOR)).toList();
+            assertEquals(oakBoxes, stonePrimitives.stream().map(BootWorldSurfaces.Primitive::rawBounds).toList());
+            for (var primitive : stonePrimitives) {
+                assertSame(stone, primitive.storedState());
+                assertFalse(primitive.magnetic());
+            }
+            assertTrue(stoneCapture.materialMatches().isEmpty());
+        }
+    }
+
+    @Test
+    void stoneStairsDependencyHaloPreservesProducerAndRejectsUnknownCallback(@TempDir Path directory) {
+        try (Fixture fixture = fixture(directory, Blocks.IRON_BLOCK.getDefaultState())) {
+            var haloOnly = fixture.footprint().dependencies().stream()
+                    .filter(cell -> !fixture.footprint().producers().contains(cell)).findFirst().orElseThrow();
+            fixture.worldFixture().put(haloOnly, Blocks.STONE_STAIRS.getStateFromMeta(0));
+            var capture = assertInstanceOf(BootWorldSurfaces.QualifiedSnapshot.class,
+                    BootWorldSurfaces.captureQualified(fixture.world(), fixture.actor(), fixture.footprint(), rules(53)));
+            assertEquals(1, capture.snapshot().primitives().size());
+            assertSame(Blocks.IRON_BLOCK.getDefaultState(), capture.snapshot().primitives().getFirst().storedState());
+            assertTrue(capture.snapshot().primitives().getFirst().magnetic());
+            fixture.worldFixture().put(haloOnly, Blocks.GLASS.getDefaultState());
+            var unsupported = assertInstanceOf(BootWorldSurfaces.Unavailable.class,
+                    BootWorldSurfaces.captureQualified(fixture.world(), fixture.actor(), fixture.footprint(), rules(53)));
+            assertEquals(BootWorldSurfaces.Reason.UNSUPPORTED_CALLBACK, unsupported.reason());
+            assertEquals(haloOnly, unsupported.cell().orElseThrow());
+            assertTrue(unsupported.detail().contains("minecraft:glass"));
+            assertTrue(unsupported.detail().contains("UNSUPPORTED"));
+        }
     }
 
     @Test

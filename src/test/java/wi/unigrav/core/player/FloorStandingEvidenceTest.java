@@ -41,9 +41,37 @@ class FloorStandingEvidenceTest {
         assertEquals(ConstraintPresence.PRESENT, result.presence());
         assertEquals(Optional.of(CardinalFrame.Y_POS), result.targetReference());
         assertEquals(Vec3.ZERO, result.authoritativeForce().orElseThrow().combinedAcceleration());
+        assertEquals(8.0, merged.floorGravityStrengths().strength(CardinalFrame.Y_POS));
+        assertEquals(8.0, merged.floorGravityStrengths().strength(CardinalFrame.Y_NEG));
+        assertEquals(0.0, merged.floorMagneticStrengths().strength(CardinalFrame.Y_POS));
         assertEquals(Set.of(CardinalFrame.Y_POS, CardinalFrame.Y_NEG), merged.faceEvidence().keySet());
         assertTrue(result.actualSupport().isEmpty());
         assertTrue(result.nextState().acceptedReference().isEmpty());
+    }
+
+    @Test
+    void oneDoubleSidedFloorSuppliesTheCorrectStandingReferenceFromEitherSide() {
+        FloorFieldProfile profile = new FloorFieldProfile(32.0, 8.0, 16.0);
+        FloorFieldIndex index = new FloorFieldIndex();
+        index.replaceChunk(new ChunkKey(0, 0), new Object(), List.of(
+                new Source(0, 0, 0, Face.UP, Kind.GRAVITY, profile),
+                new Source(0, 0, 0, Face.DOWN, Kind.GRAVITY, profile)));
+
+        var upperSample = index.sampleForStanding(new Vec3(0.5, 1.0, 0.5), 0.0);
+        var upper = StandingConstraints.resolve(State.initial(), new Request(1, false,
+                baseline().withFloorSample(Optional.of(upperSample), true)));
+        assertEquals(Optional.of(CardinalFrame.Y_POS), upper.targetReference());
+        assertEquals(new Vec3(0.0, -32.0, 0.0),
+                upper.authoritativeForce().orElseThrow().gravityAcceleration());
+        assertEquals(Map.of(Face.UP, 32.0), upperSample.gravityStrengths());
+
+        var lowerSample = index.sampleForStanding(new Vec3(0.5, 0.0, 0.5), 0.0);
+        var lower = StandingConstraints.resolve(State.initial(), new Request(1, false,
+                baseline().withFloorSample(Optional.of(lowerSample), true)));
+        assertEquals(Optional.of(CardinalFrame.Y_NEG), lower.targetReference());
+        assertEquals(new Vec3(0.0, 32.0, 0.0),
+                lower.authoritativeForce().orElseThrow().gravityAcceleration());
+        assertEquals(Map.of(Face.DOWN, 32.0), lowerSample.gravityStrengths());
     }
 
     @Test
@@ -64,6 +92,35 @@ class FloorStandingEvidenceTest {
                 baseline().withFloorSample(Optional.of(ignored), false)));
         assertEquals(ConstraintPresence.ABSENT, absent.presence());
         assertEquals(Vec3.ZERO, absent.authoritativeForce().orElseThrow().combinedAcceleration());
+    }
+
+    @Test
+    void strongerEligibleMagnetismCanOutscoreAnOrdinaryGravityFloor() {
+        var floor = sample(1.0, source(0, 0, 0, Face.UP, Kind.GRAVITY, 4.0),
+                source(1, 1, 0, Face.WEST, Kind.MAGNETIC, 8.0));
+        var evidence = baseline().withFloorSample(Optional.of(floor), true);
+
+        assertEquals(4.0, evidence.floorGravityStrengths().strength(CardinalFrame.Y_POS));
+        assertEquals(8.0, evidence.floorMagneticStrengths().strength(CardinalFrame.X_NEG));
+        var result = StandingConstraints.resolve(State.initial(), new Request(1, false, evidence));
+
+        assertEquals(Optional.of(CardinalFrame.X_NEG), result.targetReference(),
+                "ordinary floor gravity does not receive an unconfigured priority over eligible magnetism");
+        assertEquals(floor.forces().gravityAccel(), result.authoritativeForce().orElseThrow().gravityAcceleration());
+        assertEquals(floor.forces().magneticAccel(), result.authoritativeForce().orElseThrow().magneticAcceleration());
+    }
+
+    @Test
+    void currentFloorClassContinuityPrecedesStrongerFloorScore() {
+        var floor = sample(1.0, source(0, 0, 0, Face.UP, Kind.GRAVITY, 4.0),
+                source(1, 1, 0, Face.WEST, Kind.GRAVITY, 20.0));
+        var previous = new State(StandingConstraints.BootPhase.NONE, Optional.empty(),
+                Optional.of(CardinalFrame.Y_POS), Optional.empty(), -1);
+        var result = StandingConstraints.resolve(previous,
+                new Request(1, false, baseline().withFloorSample(Optional.of(floor), true)));
+
+        assertEquals(Optional.of(CardinalFrame.Y_POS), result.targetReference(),
+                "only a still-effective reference from the environmental class retains continuity");
     }
 
     @Test
@@ -211,7 +268,7 @@ class FloorStandingEvidenceTest {
                 Optional.of(CardinalFrame.Y_POS), Optional.empty(), -1);
         var result = StandingConstraints.resolve(previous, new Request(1, false,
                 background.withFloorSample(Optional.of(floor), true)));
-        assertEquals(Optional.of(CardinalFrame.Y_POS), result.targetReference());
+        assertEquals(Optional.of(CardinalFrame.Z_POS), result.targetReference());
         assertEquals(new Vec3(7, -8, -12), result.authoritativeForce().orElseThrow().combinedAcceleration());
     }
 
@@ -247,7 +304,7 @@ class FloorStandingEvidenceTest {
         var evidence = background.withFloorSample(Optional.of(floor), true);
         var preferred = StandingConstraints.resolve(State.initial(), new Request(1, false, evidence));
         var force = preferred.authoritativeForce().orElseThrow();
-        assertEquals(Optional.of(CardinalFrame.Y_POS), preferred.targetReference());
+        assertEquals(Optional.of(CardinalFrame.Z_POS), preferred.targetReference());
         assertEquals(0.0, force.bootAcceleration().x(), 0.0);
         assertEquals(0.0, force.bootAcceleration().y(), 0.0);
         assertEquals(-12.0, force.bootAcceleration().z(), 0.0);
@@ -258,7 +315,7 @@ class FloorStandingEvidenceTest {
                 Optional.of(CardinalFrame.Y_POS), Optional.empty(), -1);
         var result = StandingConstraints.resolve(retained, new Request(2, false, evidence));
         var retainedForce = result.authoritativeForce().orElseThrow();
-        assertEquals(Optional.of(CardinalFrame.X_POS), result.targetReference());
+        assertEquals(Optional.of(CardinalFrame.Y_POS), result.targetReference());
         assertEquals(-5.0, retainedForce.bootAcceleration().x(), 0.0);
         assertEquals(0.0, retainedForce.bootAcceleration().y(), 0.0);
         assertEquals(0.0, retainedForce.bootAcceleration().z(), 0.0);

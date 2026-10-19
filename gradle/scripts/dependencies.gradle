@@ -34,7 +34,7 @@ dependencies {
     // Revo UI (NeoFontRender UI Enhancements) 6-DOF flight API, optional at runtime.
     // The integration is directly linked at compile time, so its local classes
     // are a required build prerequisite even though they are never bundled.
-    def uieDir = file("${rootProject.projectDir}/${uie_classes_dir}")
+    def uieDir = file(uie_classes_dir)
     if (uieDir.isDirectory()) {
         modCompileOnly files(uieDir)
         // Recording-canvas tests execute the production HUD renderer against the
@@ -44,6 +44,56 @@ dependencies {
         throw new GradleException("UIE classes dir not found: ${uieDir}; "
                 + "provide exact UIE Flight API classes from a local build or "
                 + "a digest-verified official CI artifact extraction")
+    }
+
+    // Optional runtime UI libraries used by the Creative pose-backpack screen.
+    // These exact jars are compile-only and are never bundled.
+    def nfrGuiJar = providers.gradleProperty('neofontrender_gui_jar')
+    def modularUiGuiJar = providers.gradleProperty('modularui_gui_jar')
+    if (!nfrGuiJar.isPresent() || !modularUiGuiJar.isPresent()) {
+        throw new GradleException('Pose backpack GUI requires exact NFR and ModularUI compile-only jars')
+    }
+    File nfrGuiFile = file(nfrGuiJar.get())
+    File modularUiGuiFile = file(modularUiGuiJar.get())
+    if (!nfrGuiFile.isFile() || !modularUiGuiFile.isFile()) {
+        throw new GradleException("Pose backpack GUI compile-only jar missing: NFR=${nfrGuiFile}, ModularUI=${modularUiGuiFile}")
+    }
+    modCompileOnly files(nfrGuiFile, modularUiGuiFile)
+    tasks.named('compileJava').configure {
+        doFirst {
+            def sha256 = { File input -> java.security.MessageDigest.getInstance('SHA-256')
+                    .digest(input.bytes).encodeHex().toString().toUpperCase(java.util.Locale.ROOT) }
+            if (sha256(nfrGuiFile) != '9D47EC44E180498548FCFB77D1B0CBF750624CE8AD9F6E16B7CB7D0A29932060')
+                throw new GradleException('Unexpected NFR GUI compile-only artifact')
+            if (sha256(modularUiGuiFile) != 'E0ED1BD56ACF88E1E1F4EDEEAFE8BBA5049959D3864458586C27DA7BD0C78BDC')
+                throw new GradleException('Unexpected ModularUI GUI compile-only artifact')
+        }
+    }
+
+    // Optional runtime adapter, directly linked against the actual public Aqua ABI only at compile time.
+    def bodyAquaAbi = providers.gradleProperty('aquaIntegrationAquaJar')
+    compileOnly files(bodyAquaAbi.getOrElse('MISSING-aquaIntegrationAquaJar'))
+    tasks.named('compileJava').configure {
+        doFirst {
+            if (!bodyAquaAbi.isPresent()) throw new GradleException('Native standing-body ABI requires -PaquaIntegrationAquaJar=<exact jar>')
+            File actual = file(bodyAquaAbi.get())
+            if (!actual.isFile() || java.security.MessageDigest.getInstance('SHA-256').digest(actual.bytes).encodeHex().toString().toUpperCase(java.util.Locale.ROOT)
+                    != '506EE8E264C347FAD33302183B8F4DADDB05D5E5F75C0B6D833266C886E127CE')
+                throw new GradleException('Unexpected actual Aqua standing-body compile ABI')
+        }
+    }
+
+    // The installed DE public ABI is compile-only; DA inherits this family and needs no dependency.
+    def draconicAbi = providers.gradleProperty('draconicFlightAbiJar')
+    compileOnly files(draconicAbi.getOrElse('MISSING-draconicFlightAbiJar'))
+    tasks.named('compileJava').configure {
+        doFirst {
+            if (!draconicAbi.isPresent()) throw new GradleException('DE flight adapter requires -PdraconicFlightAbiJar=<exact jar>')
+            File actual = file(draconicAbi.get())
+            if (!actual.isFile() || java.security.MessageDigest.getInstance('SHA-256').digest(actual.bytes).encodeHex().toString().toUpperCase(java.util.Locale.ROOT)
+                    != '1EECDEFA00056EFAC98FF56E25F7ED840B70E2D809C628E38C9C5B5518FF14FF')
+                throw new GradleException('Unexpected DE flight compile ABI')
+        }
     }
 
     // Example - Dependency descriptor:

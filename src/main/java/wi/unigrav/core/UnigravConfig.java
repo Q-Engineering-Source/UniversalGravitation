@@ -14,6 +14,27 @@ import wi.unigrav.Reference;
  */
 @Config(modid = Reference.MOD_ID, name = Reference.MOD_ID)
 public final class UnigravConfig {
+    public enum NativeBodyProfileEnvironment { UNKNOWN, VANILLA_UNSCALED }
+
+    @Config.Comment({"Explicitly verified native body-size compatibility environment; UNKNOWN never infers unscaled body length.",
+            "VANILLA_UNSCALED is for a verified vanilla-size environment without an external size provider; Aqua uses its own producer."})
+    @Config.Name("native_body_profile_environment")
+    public static NativeBodyProfileEnvironment nativeBodyProfileEnvironment = NativeBodyProfileEnvironment.UNKNOWN;
+
+    @Config.Comment("Fresh owner simulation ticks in one Space press before detach; nominally 1 s at 20 TPS, independent of jump cooldown.")
+    @Config.Name("long_space_detach_ticks")
+    @Config.RangeInt(min = 1)
+    public static int longSpaceDetachTicks = 20;
+
+    @Config.Comment("Client-side continuous G hold in milliseconds before opening the pose backpack debug GUI.")
+    @Config.Name("pose_backpack_gui_hold_millis")
+    @Config.RangeInt(min = 1)
+    public static int poseBackpackGuiHoldMillis = 3000;
+
+    @Config.Comment("Bounded hover braking in blocks/tick^2; 0.08 equals 32 m/s^2 at 20 ticks/s.")
+    @Config.Name("hover_braking_blocks_per_tick_squared")
+    @Config.RangeDouble(min = 0)
+    public static double hoverBrakingBlocksPerTickSquared = .08;
 
     @Config.Comment({
             "Default downward strength of the world gravity field, in m/s^2,",
@@ -44,6 +65,14 @@ public final class UnigravConfig {
     })
     @Config.Name("global_takeover")
     public static boolean globalTakeover = true;
+
+    @Config.Comment("When personal G is active, suppress force from ordinary gravity floors.")
+    @Config.Name("personal_g_suppresses_floor_gravity")
+    public static boolean personalGSuppressesFloorGravity = false;
+
+    @Config.Comment("When personal G is active, suppress standing references from ordinary gravity floors.")
+    @Config.Name("personal_g_suppresses_floor_reference")
+    public static boolean personalGSuppressesFloorReference = false;
 
     @Config.Comment({
             "Entity registry names (e.g. \"minecraft:boat\") excluded from the",

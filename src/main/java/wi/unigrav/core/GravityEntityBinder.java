@@ -1,5 +1,7 @@
 package wi.unigrav.core;
 
+import wi.unigrav.core.player.EnvironmentObservationWork;
+
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
@@ -30,9 +32,9 @@ import net.minecraftforge.fml.common.gameevent.PlayerEvent;
 
 import wi.unigrav.api.math.Vec3;
 import wi.unigrav.core.boost.RemoteBoostServer;
+import wi.unigrav.core.floor.FloorDecision;
 import wi.unigrav.core.floor.FloorFieldIndex;
 import wi.unigrav.core.floor.FloorWorldFields;
-import wi.unigrav.core.floor.MagneticResponseRules;
 import wi.unigrav.core.player.NativePlayerMovement;
 import wi.unigrav.core.player.PlayerPhysicsServer;
 
@@ -298,6 +300,17 @@ public final class GravityEntityBinder {
      * must check {@link FieldBindingSample#isCurrent()} and their actor context.
      */
     public FieldBindingSample sampleFieldBinding(Entity entity) {
+        return sampleFieldBindingInternal(entity, null);
+    }
+
+    public FieldBindingSample sampleFieldBinding(Entity entity,
+            EnvironmentObservationWork work) {
+        Objects.requireNonNull(work).requireCurrent(entity);
+        return sampleFieldBindingInternal(entity, work);
+    }
+
+    private FieldBindingSample sampleFieldBindingInternal(Entity entity,
+            EnvironmentObservationWork work) {
         Objects.requireNonNull(entity, "entity");
         Binding binding;
         Vec3 appliedForce;
@@ -307,8 +320,11 @@ public final class GravityEntityBinder {
             appliedForce = appliedForces.get(entity);
             forceRevision = binding == null ? 0 : binding.forceRevision;
         }
-        boolean active = binding != null && !entity.isDead
-                && (binding.tickFilter == null || binding.tickFilter.test(entity));
+        boolean active = binding != null && !entity.isDead;
+        if (active && binding.tickFilter != null) {
+            if (work != null) work.charge(EnvironmentObservationWork.Unit.DISPATCH);
+            active = binding.tickFilter.test(entity);
+        }
         return new FieldBindingSample(entity, binding, appliedForce, forceRevision, active);
     }
 
@@ -635,17 +651,20 @@ public final class GravityEntityBinder {
 
     private Optional<Vec3> applyDeltaV(Entity entity, Binding binding) {
         double time = entity.world.getTotalWorldTime() * TICK_SECONDS;
-        Vec3 fieldAccel = EntityGravitySources.fieldAcceleration(entity,
+        Vec3 ambientFieldAccel = EntityGravitySources.fieldAcceleration(entity,
                 new Vec3(entity.posX, entity.posY, entity.posZ), time);
+        Vec3 fieldAccel = ambientFieldAccel;
         Vec3 magneticAccel = Vec3.ZERO;
         boolean environmentReady = true;
+        FloorInfluence floorInfluence = null;
         if (!entity.world.isRemote && !(entity instanceof EntityPlayer)) {
-            Optional<FloorFieldIndex.Sample> floor = sampleFloors(entity,
-                    MagneticResponseRules.builtIn().response(entity, false));
-            environmentReady = floor.isPresent();
-            if (floor.isPresent()) {
-                fieldAccel = fieldAccel.add(floor.get().gravityAccel());
-                magneticAccel = floor.get().magneticAccel();
+            environmentReady = false;
+            floorInfluence = captureFloorInfluence((WorldServer) entity.world, entity, true).orElse(null);
+            if (floorInfluence != null) {
+                environmentReady = true;
+                FloorFieldIndex.Sample sample = floorInfluence.sample().orElseThrow();
+                fieldAccel = fieldAccel.add(sample.gravityAccel());
+                magneticAccel = sample.magneticAccel();
             }
         }
         Vec3 force;
@@ -654,29 +673,76 @@ public final class GravityEntityBinder {
         }
         Vec3 accel = BodyAccelerationStep.acceleration(fieldAccel, magneticAccel, force,
                 binding.physics, entity.isInWater(), BodyPhysics.swims(entity), UnigravConfig.waterSinkBias);
-        applyAcceleration(entity, accel);
+        if (!applyAcceleration(entity, accel, floorInfluence)) {
+            // A root can retire while acceleration is prepared (for example from a world callback
+            // used to compute grounded friction). Keep independent ambient/force inputs, but do not
+            // commit a floor contribution from the now-stale generation.
+            fieldAccel = ambientFieldAccel;
+            magneticAccel = Vec3.ZERO;
+            environmentReady = false;
+            accel = BodyAccelerationStep.acceleration(fieldAccel, magneticAccel, force,
+                    binding.physics, entity.isInWater(), BodyPhysics.swims(entity), UnigravConfig.waterSinkBias);
+            applyAcceleration(entity, accel);
+        }
         // Deferred discovery is not zero gravity. Preserve the previous AI/environment
         // decision while retaining the existing background/external-force integration.
         return environmentReady ? Optional.of(fieldAccel.add(magneticAccel)) : Optional.empty();
     }
 
-    private static Optional<FloorFieldIndex.Sample> sampleFloors(Entity entity, double response) {
+    private record FloorInfluence(WorldServer world, FloorDecision decision, double response,
+                                  Optional<FloorFieldIndex.Sample> sample) {
+        private FloorInfluence {
+            Objects.requireNonNull(world, "world");
+            Objects.requireNonNull(decision, "decision");
+            Objects.requireNonNull(sample, "sample");
+        }
+    }
+
+    /** Captures material response and field sample from one root, then rejects stale observations. */
+    private static Optional<FloorInfluence> captureFloorInfluence(WorldServer world, Entity entity,
+                                                                   boolean includeGravityWithoutMagnetism) {
+        FloorDecision decision = FloorWorldFields.captureDecision(world).orElse(null);
+        if (decision == null) return Optional.empty();
+        double response = decision.passiveResponses().response(entity, false);
+        if (response == 0.0 && !includeGravityWithoutMagnetism) {
+            return decision.isCurrent()
+                    ? Optional.of(new FloorInfluence(world, decision, response, Optional.empty())) : Optional.empty();
+        }
+        Optional<FloorFieldIndex.Sample> sample = sampleFloors(decision, entity, response);
+        if (sample.isEmpty() || !decision.isCurrent()) return Optional.empty();
+        return Optional.of(new FloorInfluence(world, decision, response, sample));
+    }
+
+    private static Optional<FloorFieldIndex.Sample> sampleFloors(FloorDecision decision, Entity entity,
+                                                                  double response) {
         var box = entity.getEntityBoundingBox();
         Vec3 center = new Vec3(box.minX + (box.maxX - box.minX) * 0.5,
                 box.minY + (box.maxY - box.minY) * 0.5, box.minZ + (box.maxZ - box.minZ) * 0.5);
-        return FloorWorldFields.sample(entity.world, center, response);
+        return decision.sample(center, response);
     }
 
     private static void applyAcceleration(Entity entity, Vec3 acceleration) {
+        applyAcceleration(entity, acceleration, null);
+    }
+
+    /** Returns false without writing motion if the floor root retired before the commit point. */
+    private static boolean applyAcceleration(Entity entity, Vec3 acceleration, FloorInfluence floorFence) {
         boolean grounded = UnigravConfig.groundFriction && entity.onGround;
         double friction = grounded ? entity.world.getBlockState(new BlockPos(entity).down())
                 .getBlock().slipperiness * 0.9100000262260437 : 1.0;
         Vec3 motion = BodyAccelerationStep.motion(new Vec3(entity.motionX, entity.motionY, entity.motionZ),
                 acceleration, UnigravConfig.maxEntitySpeed, grounded, friction);
+        if (floorFence != null) {
+            boolean current = floorFence.decision().isCurrent();
+            // isCurrent observes virtual world ownership and may reenter; entity ownership must
+            // therefore be the final pure fence immediately before the motion-field writes.
+            if (!current || entity.world != floorFence.world() || entity.isDead || !entity.addedToChunk) return false;
+        }
         entity.motionX = motion.x();
         entity.motionY = motion.y();
         entity.motionZ = motion.z();
         entity.velocityChanged = true;
+        return true;
     }
 
     /**
@@ -863,12 +929,11 @@ public final class GravityEntityBinder {
             for (Entity entity : new ArrayList<>(world.loadedEntityList)) {
                 if (alreadyHandled.contains(entity) || entity.isDead || !entity.addedToChunk
                         || entity.world != world || entity instanceof EntityPlayer) continue;
-                double response = MagneticResponseRules.builtIn().response(entity, false);
-                if (response == 0.0) continue;
-                sampleFloors(entity, response).ifPresent(sample -> {
-                    // This path does not take over gravity, noGravity, bindings or AI.
-                    if (!sample.magneticAccel().equals(Vec3.ZERO)) applyAcceleration(entity, sample.magneticAccel());
-                });
+                FloorInfluence influence = captureFloorInfluence(world, entity, false).orElse(null);
+                if (influence == null || influence.response() == 0.0 || influence.sample().isEmpty()
+                        || influence.sample().orElseThrow().magneticAccel().equals(Vec3.ZERO)) continue;
+                // This path does not take over gravity, noGravity, bindings or AI.
+                applyAcceleration(entity, influence.sample().orElseThrow().magneticAccel(), influence);
             }
         }
     }

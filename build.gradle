@@ -128,6 +128,7 @@ dependencies {
 
 apply from: 'gradle/scripts/dependencies.gradle'
 apply from: 'gradle/scripts/chb.gradle'
+apply from: 'gradle/scripts/floor-aggregation-perf.gradle'
 
 // The Mixin AP emits a development-MCP refmap. The remapJar configuration above
 // rewrites that resource for production SRG, while development runs deliberately
@@ -310,10 +311,74 @@ tasks.register('verifyRemoteBoostPackaging') {
                 if (!(mixin in ['wi/unigrav/mixin/EntityPlayerPoseMixin',
                                 'wi/unigrav/mixin/EntityPlayerEyeMixin',
                                 'wi/unigrav/mixin/AquaPlayerGeometryMixin',
-                                'wi/unigrav/mixin/ArtemisPlayerGeometryMixin']) && !refmap.mappings[mixin]) {
+                                'wi/unigrav/mixin/ArtemisPlayerGeometryMixin',
+                                'wi/unigrav/mixin/InstalledFreeFallMixin']) && !refmap.mappings[mixin]) {
                     throw new GradleException("Release refmap has no mappings for ${mixin}")
                 }
             }
+            // This bridge has no string selector for the annotation processor to map.
+            // Verify the actual remapped inherited call instead of requiring a fictitious refmap row.
+            def fallBridgeEntry = archive.getEntry('wi/unigrav/mixin/InstalledFreeFallMixin.class')
+            if (fallBridgeEntry == null) throw new GradleException('Installed fall bridge is missing')
+            def fallBridge = new ClassNode()
+            archive.getInputStream(fallBridgeEntry).withCloseable {
+                new ClassReader(it).accept(fallBridge, 0)
+            }
+            def fallAnnotations = (fallBridge.visibleAnnotations ?: []) + (fallBridge.invisibleAnnotations ?: [])
+            def fallMixin = fallAnnotations.find { it.desc == 'Lorg/spongepowered/asm/mixin/Mixin;' }
+            def fallTargetIndex = fallMixin?.values?.indexOf('value')
+            def fallTargets = fallTargetIndex != null && fallTargetIndex >= 0
+                    ? fallMixin.values[fallTargetIndex + 1] : []
+            def fallBridgeMethod = fallBridge.methods.find {
+                it.name == 'unigrav$installedFall'
+                        && it.desc == '(Lwi/unigrav/core/player/InstalledFreeFall$Request;)V'
+                        && (it.access & 0x11) == 0x11
+            }
+            def inheritedFallCalls = fallBridge.methods.collectMany {
+                it.instructions.toArray().findAll { instruction ->
+                    instruction instanceof MethodInsnNode && instruction.opcode == 183
+                            && instruction.owner == 'net/minecraft/entity/player/EntityPlayer'
+                            && instruction.name == 'func_184231_a'
+                            && instruction.desc == '(DZLnet/minecraft/block/state/IBlockState;Lnet/minecraft/util/math/BlockPos;)V'
+                }.toList()
+            }
+            if (!requiredMixins.contains('wi/unigrav/mixin/InstalledFreeFallMixin')
+                    || fallBridge.superName != 'net/minecraft/entity/player/EntityPlayer'
+                    || !fallBridge.interfaces.contains('wi/unigrav/core/player/InstalledFreeFallBridge')
+                    || fallTargets*.internalName != ['net/minecraft/entity/player/EntityPlayerMP']
+                    || fallBridgeMethod == null || inheritedFallCalls.size() != 1)
+                throw new GradleException('Installed fall bridge target/interface/method/remapped super call is invalid')
+            def provenanceEntry = archive.getEntry('wi/unigrav/mixin/WorldCollisionProvenanceMixin.class')
+            if (provenanceEntry == null) throw new GradleException('Native provenance Mixin is missing')
+            def provenanceNode = new ClassNode()
+            archive.getInputStream(provenanceEntry).withCloseable { new ClassReader(it).accept(provenanceNode, 0) }
+            def provenanceSelectors = [
+                'getCollisionBoxes(Lnet/minecraft/entity/Entity;Lnet/minecraft/util/math/AxisAlignedBB;)Ljava/util/List;',
+                'getCollisionBoxes(Lnet/minecraft/entity/Entity;Lnet/minecraft/util/math/AxisAlignedBB;ZLjava/util/List;)Z'
+            ] as Set
+            def provenanceWraps = provenanceNode.methods.collectMany { method ->
+                ((method.visibleAnnotations ?: []) + (method.invisibleAnnotations ?: [])).findAll {
+                    it.desc in ['Lcom/llamalad7/mixinextras/injector/wrapmethod/WrapMethod;',
+                                'Lcom/llamalad7/mixinextras/injector/wrapoperation/WrapOperation;']
+                }.collect { annotation ->
+                    def values = annotation.values.collate(2).collectEntries { [(it[0]): it[1]] }
+                    if (values.require != 1 || values.allow != 1 || !values.method.every { it in provenanceSelectors })
+                        throw new GradleException('Native provenance injection selector/count changed')
+                    [type: annotation.desc, values: values]
+                }
+            }
+            if (provenanceWraps.count { it.type.endsWith('/WrapMethod;') } != 2
+                    || provenanceWraps.count { it.type.endsWith('/WrapOperation;') } != 2)
+                throw new GradleException('Native provenance requires two method and two operation wrappers')
+            def provenanceTargets = provenanceWraps.findAll { it.type.endsWith('/WrapOperation;') }.collectMany { wrapper ->
+                def ats = wrapper.values.at instanceof List ? wrapper.values.at : [wrapper.values.at]
+                ats.collect { at -> at.values.collate(2).collectEntries { [(it[0]): it[1]] }.target }
+            } as Set
+            def expectedProvenanceTargets = [
+                    'Lnet/minecraft/world/World;getBlockState(Lnet/minecraft/util/math/BlockPos;)Lnet/minecraft/block/state/IBlockState;',
+                    'Lnet/minecraft/block/state/IBlockState;addCollisionBoxToList(Lnet/minecraft/world/World;Lnet/minecraft/util/math/BlockPos;Lnet/minecraft/util/math/AxisAlignedBB;Ljava/util/List;Lnet/minecraft/entity/Entity;Z)V'
+                ] as Set
+            if (provenanceTargets != expectedProvenanceTargets) throw new GradleException('Native provenance operation targets changed')
             def poseEntry = archive.getEntry('wi/unigrav/mixin/EntityPlayerPoseMixin.class')
             if (poseEntry == null) throw new GradleException('Native pose Mixin class missing')
             def poseNode = new ClassNode()
@@ -412,12 +477,17 @@ tasks.register('verifyRemoteBoostPackaging') {
                     def mixinValues = mixinAnnotation.values.collate(2).collectEntries { [(it[0]): it[1]] }
                     if (mixinValues.priority != 1001)
                         throw new GradleException('Aqua growth injection must outrank its verified priority1000 merged method')
-                    def growthHooks = geometryNode.methods.collectMany { method ->
+                    def aquaCallHooks = geometryNode.methods.collectMany { method ->
                         ((method.visibleAnnotations ?: []) + (method.invisibleAnnotations ?: []))
                                 .findAll { it.desc == 'Lcom/llamalad7/mixinextras/injector/wrapoperation/WrapOperation;' }
                                 .collect { annotation -> [method: method, values: annotation.values.collate(2).collectEntries { [(it[0]): it[1]] }] }
                     }
                     def growthSelector = 'recalculateSize(Lcom/fuzs/aquaacrobatics/entity/EntitySize;Lcom/fuzs/aquaacrobatics/entity/EntitySize;)V'
+                    def clearanceSelector = 'isPoseClear(Lcom/fuzs/aquaacrobatics/entity/Pose;)Z'
+                    def growthHooks = aquaCallHooks.findAll { it.values.method == [growthSelector] }
+                    def clearanceHooks = aquaCallHooks.findAll { it.values.method == [clearanceSelector] }
+                    if (aquaCallHooks.size() != 2 || clearanceHooks.size() != 1)
+                        throw new GradleException('Aqua growth and Cardinal clearance must each have one exact call-site wrapper')
                     if (growthHooks.size() != 1 || growthHooks[0].values.method != [growthSelector]
                             || growthHooks[0].values.remap != false || growthHooks[0].values.require != 1 || growthHooks[0].values.allow != 1)
                         throw new GradleException('Aqua growth call-site selector/guards differ')
@@ -434,6 +504,21 @@ tasks.register('verifyRemoteBoostPackaging') {
                                 && it.desc == '(Lnet/minecraft/entity/EntityLivingBase;Lnet/minecraft/entity/MoverType;Ldev/crlhitbox/api/geometry/Vec3d;Ljava/util/function/Consumer;)V'
                     }
                     if (calls.size() != 1) throw new GradleException('Aqua growth wrapper must use one tested movement boundary')
+                    def clearance = clearanceHooks[0]
+                    if (clearance.values.remap != false || clearance.values.require != 1 || clearance.values.allow != 1)
+                        throw new GradleException('Aqua Cardinal clearance selector/guards differ')
+                    def clearanceAt = clearance.values.at
+                    if (clearanceAt instanceof List) clearanceAt = clearanceAt[0]
+                    def clearanceAtValues = clearanceAt.values.collate(2).collectEntries { [(it[0]): it[1]] }
+                    if (clearanceAtValues.value != 'INVOKE' || clearanceAtValues.remap != false
+                            || clearanceAtValues.target != 'Lnet/minecraft/entity/player/EntityPlayer;getBoundingBox(Lcom/fuzs/aquaacrobatics/entity/Pose;)Lnet/minecraft/util/math/AxisAlignedBB;')
+                        throw new GradleException('Aqua Cardinal clearance must wrap its exact candidate-box call site')
+                    def clearanceCalls = clearance.method.instructions.toArray().findAll {
+                        it instanceof MethodInsnNode && it.owner == 'wi/unigrav/proxy/IProxy' && it.name == 'aquaPoseClearanceBox'
+                                && it.desc == '(Lnet/minecraft/entity/player/EntityPlayer;Lnet/minecraft/util/math/AxisAlignedBB;)Lnet/minecraft/util/math/AxisAlignedBB;'
+                    }
+                    if (clearanceCalls.size() != 1)
+                        throw new GradleException('Aqua Cardinal clearance must use its candidate-box boundary once')
                 }
             }
             // Structural release linkage, not proof that FML applied the Mixin at runtime.
@@ -486,7 +571,11 @@ tasks.register('verifyCardinalFinalizerPackaging') {
                 'func_70041_e_()Z', 'func_180429_a(Lnet/minecraft/util/math/BlockPos;Lnet/minecraft/block/Block;)V',
                 'func_145775_I()V', 'func_70081_e(I)V', 'func_190531_bD()I',
                 'func_184184_Z()Lnet/minecraft/util/SoundEvent;', 'func_191957_ae()Z', 'func_191954_d(F)F',
-                'func_70101_b(FF)V'
+                'func_70101_b(FF)V',
+                'field_70171_ac',
+                'field_70148_d',
+                'func_191955_a(Lnet/minecraft/block/state/IBlockState;)V',
+                'func_71061_d_()V'
         ].collect { 'public net.minecraft.entity.Entity ' + it }.toSet()
         expectedMembers.addAll([
                 'public net.minecraft.entity.EntityLivingBase func_70629_bd()V',
@@ -542,3 +631,19 @@ tasks.withType(JavaCompile).configureEach {
 apply from: 'gradle/scripts/publishing.gradle'
 apply from: 'gradle/scripts/extra.gradle'
 apply from: 'gradle/scripts/cardinal-test-bridge.gradle'
+apply from: 'gradle/scripts/native-provenance-test-bridge.gradle'
+apply from: 'gradle/scripts/client-integration-test.gradle'
+
+apply from: 'gradle/scripts/cardinal-native-integration-test.gradle'
+
+apply from: 'gradle/scripts/installed-free-fall-test-bridge.gradle'
+
+apply from: 'gradle/scripts/collision-event-test-bridge.gradle'
+
+apply from: 'gradle/scripts/movement-stat-test-bridge.gradle'
+
+// Headless test-only native teleport pending-state observation; never used by runClient.
+apply from: 'gradle/scripts/native-teleport-test-bridge.gradle'
+
+// Full builds require the same-candidate real sleep/wake host receipt.
+apply from: 'gradle/scripts/sleep-native-evidence.gradle'

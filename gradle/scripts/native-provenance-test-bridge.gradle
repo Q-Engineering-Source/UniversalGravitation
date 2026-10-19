@@ -1,0 +1,139 @@
+import java.util.zip.ZipFile
+import org.objectweb.asm.ClassReader
+import org.objectweb.asm.ClassWriter
+import org.objectweb.asm.Handle
+import org.objectweb.asm.Opcodes
+import org.objectweb.asm.Type
+import org.objectweb.asm.tree.*
+
+buildscript {
+    dependencies { classpath files(rootProject.buildscript.configurations.classpath) }
+}
+
+// TEST ONLY. Retains mapped World's original scan/event bodies. This is not a Mixin/refmap gate.
+def bridgeOutput = layout.buildDirectory.dir('test-native-provenance-bridge')
+def bridge = tasks.register('prepareNativeProvenanceTestBridge') {
+    dependsOn tasks.named('compileTestJava')
+    inputs.files(sourceSets.main.compileClasspath)
+    inputs.file(file('gradle/scripts/native-provenance-test-bridge.gradle'))
+    inputs.file(file('src/test/java/wi/unigrav/core/player/NativeCollisionProvenanceTestHooks.java'))
+    outputs.dir(bridgeOutput)
+    doLast {
+        def w = 'net/minecraft/world/World'
+        def e = 'net/minecraft/entity/Entity'
+        def a = 'net/minecraft/util/math/AxisAlignedBB'
+        def pos = 'net/minecraft/util/math/BlockPos'
+        def state = 'net/minecraft/block/state/IBlockState'
+        def provenance = 'wi/unigrav/core/player/NativeCollisionProvenance'
+        def hooks = 'wi/unigrav/core/player/NativeCollisionProvenanceTestHooks'
+        def wd = 'L' + w + ';', ed = 'L' + e + ';', ad = 'L' + a + ';'
+        def pd = 'L' + pos + ';', sd = 'L' + state + ';', ld = 'Ljava/util/List;'
+        def supplier = 'Ljava/util/function/Supplier;', consumer = 'Ljava/util/function/Consumer;'
+        def publicDesc = '(' + ed + ad + ')' + ld
+        def collectorDesc = '(' + ed + ad + 'Z' + ld + ')Z'
+        def readDesc = '(' + pd + ')' + sd
+        def produceDesc = '(' + wd + pd + ad + ld + ed + 'Z)V'
+        def matches = []
+        sourceSets.main.compileClasspath.files.findAll { it.isFile() && it.name.endsWith('.jar') }.each { jar ->
+            new ZipFile(jar).withCloseable { zip ->
+                def entry = zip.getEntry(w + '.class')
+                if (entry != null) matches.add([jar: jar, bytes: zip.getInputStream(entry).bytes])
+            }
+        }
+        if (matches.size() != 1) throw new GradleException('World bridge requires exactly one mapped World.class; found ' + matches.size())
+        def node = new ClassNode()
+        new ClassReader(matches[0].bytes as byte[]).accept(node, 0)
+        def method = { String name, String desc ->
+            def found = node.methods.findAll { it.name == name && it.desc == desc }
+            if (found.size() != 1) throw new GradleException('World bridge selector drift: ' + name + desc + ' count=' + found.size())
+            found[0]
+        }
+        def outer = method('getCollisionBoxes', publicDesc)
+        def collector = method('getCollisionBoxes', collectorDesc)
+        if ((outer.access & Opcodes.ACC_PUBLIC) == 0 || (collector.access & Opcodes.ACC_PRIVATE) == 0)
+            throw new GradleException('World bridge method visibility drift')
+        if (node.methods.any { it.name.startsWith('unigrav$test$') }) throw new GradleException('World bridge input already transformed')
+        int reads = 0, produces = 0
+        collector.instructions.toArray().each { insn ->
+            if (insn instanceof MethodInsnNode && insn.owner == w && insn.name == 'getBlockState' && insn.desc == readDesc) {
+                if (insn.opcode != Opcodes.INVOKEVIRTUAL) throw new GradleException('World read opcode drift')
+                reads++
+                collector.instructions.set(insn, new MethodInsnNode(Opcodes.INVOKESTATIC, w, 'unigrav$test$read', '(' + wd + pd + ')' + sd, false))
+            } else if (insn instanceof MethodInsnNode && insn.owner == state && insn.name == 'addCollisionBoxToList' && insn.desc == produceDesc) {
+                if (insn.opcode != Opcodes.INVOKEINTERFACE) throw new GradleException('World producer opcode drift')
+                produces++
+                collector.instructions.set(insn, new MethodInsnNode(Opcodes.INVOKESTATIC, w, 'unigrav$test$produce', '(' + sd + wd + pd + ad + ld + ed + 'Z)V', false))
+            }
+        }
+        if (reads != 1 || produces != 1) throw new GradleException('World bridge invoke drift: reads=' + reads + ', producers=' + produces)
+        def bootstrap = new Handle(Opcodes.H_INVOKESTATIC, 'java/lang/invoke/LambdaMetafactory', 'metafactory',
+                '(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;', false)
+        def create = { int access, String name, String desc ->
+            def m = new MethodNode(access, name, desc, null, null)
+            node.methods.add(m)
+            m
+        }
+        def load = { MethodNode m, int opcode, int index -> m.instructions.add(new VarInsnNode(opcode, index)) }
+        def call = { MethodNode m, int opcode, String owner, String name, String desc, boolean itf ->
+            m.instructions.add(new MethodInsnNode(opcode, owner, name, desc, itf))
+        }
+        def end = { MethodNode m, int opcode -> m.instructions.add(new InsnNode(opcode)) }
+        def lambda = { MethodNode m, String name, String capture, String erased, Handle impl, String instantiated ->
+            m.instructions.add(new InvokeDynamicInsnNode(name, capture, bootstrap, Type.getMethodType(erased), impl, Type.getMethodType(instantiated)))
+        }
+        int helperAccess = Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC
+        int outerAccess = outer.access, collectorAccess = collector.access
+        outer.name = 'unigrav$test$nativeBody'
+        collector.name = 'unigrav$test$collectorBody'
+        // Keep the original method bodies and stack-map frames. Wrappers/helpers are straight-line.
+        def m = create(outerAccess, 'getCollisionBoxes', publicDesc)
+        [0, 1, 2, 0, 1, 2].each { load(m, Opcodes.ALOAD, it) }
+        lambda(m, 'get', '(' + wd + ed + ad + ')' + supplier, '()Ljava/lang/Object;',
+                new Handle(Opcodes.H_INVOKEVIRTUAL, w, outer.name, publicDesc, false), '()' + ld)
+        call(m, Opcodes.INVOKESTATIC, hooks, 'nativeCall', '(' + wd + ed + ad + supplier + ')' + ld, false)
+        end(m, Opcodes.ARETURN)
+        // Explicit boxing helper avoids relying on primitive-to-Supplier metafactory adaptation.
+        def boxedDesc = '(' + wd + ed + ad + 'Z' + ld + ')Ljava/lang/Boolean;'
+        m = create(helperAccess, 'unigrav$test$collectorBoxed', boxedDesc)
+        [0, 1, 2].each { load(m, Opcodes.ALOAD, it) }; load(m, Opcodes.ILOAD, 3); load(m, Opcodes.ALOAD, 4)
+        call(m, Opcodes.INVOKESPECIAL, w, collector.name, collectorDesc, false)
+        call(m, Opcodes.INVOKESTATIC, 'java/lang/Boolean', 'valueOf', '(Z)Ljava/lang/Boolean;', false)
+        end(m, Opcodes.ARETURN)
+        m = create(collectorAccess, 'getCollisionBoxes', collectorDesc)
+        [0, 1, 2, 4, 0, 1, 2].each { load(m, Opcodes.ALOAD, it) }; load(m, Opcodes.ILOAD, 3); load(m, Opcodes.ALOAD, 4)
+        lambda(m, 'get', '(' + wd + ed + ad + 'Z' + ld + ')' + supplier, '()Ljava/lang/Object;',
+                new Handle(Opcodes.H_INVOKESTATIC, w, 'unigrav$test$collectorBoxed', boxedDesc, false), '()Ljava/lang/Boolean;')
+        call(m, Opcodes.INVOKESTATIC, hooks, 'collectorCall', '(' + wd + ed + ad + ld + supplier + ')Z', false)
+        end(m, Opcodes.IRETURN)
+        def actualReadDesc = '(' + wd + pd + ')' + sd
+        m = create(helperAccess, 'unigrav$test$actualRead', actualReadDesc)
+        [0, 1].each { load(m, Opcodes.ALOAD, it) }
+        call(m, Opcodes.INVOKEVIRTUAL, w, 'getBlockState', readDesc, false); end(m, Opcodes.ARETURN)
+        m = create(helperAccess, 'unigrav$test$read', actualReadDesc)
+        [0, 1, 0, 1].each { load(m, Opcodes.ALOAD, it) }
+        lambda(m, 'get', '(' + wd + pd + ')' + supplier, '()Ljava/lang/Object;',
+                new Handle(Opcodes.H_INVOKESTATIC, w, 'unigrav$test$actualRead', actualReadDesc, false), '()' + sd)
+        call(m, Opcodes.INVOKESTATIC, provenance, 'read', '(' + wd + pd + supplier + ')' + sd, false); end(m, Opcodes.ARETURN)
+        def actualProducerDesc = '(' + sd + wd + pd + ad + ed + 'Z' + ld + ')V'
+        m = create(helperAccess, 'unigrav$test$actualProducer', actualProducerDesc)
+        [0, 1, 2, 3, 6, 4].each { load(m, Opcodes.ALOAD, it) }; load(m, Opcodes.ILOAD, 5)
+        call(m, Opcodes.INVOKEINTERFACE, state, 'addCollisionBoxToList', produceDesc, true); end(m, Opcodes.RETURN)
+        m = create(helperAccess, 'unigrav$test$produce', '(' + sd + wd + pd + ad + ld + ed + 'Z)V')
+        [0, 1, 2, 3, 4, 5].each { load(m, Opcodes.ALOAD, it) }; load(m, Opcodes.ILOAD, 6)
+        [0, 1, 2, 3, 5].each { load(m, Opcodes.ALOAD, it) }; load(m, Opcodes.ILOAD, 6)
+        lambda(m, 'accept', '(' + sd + wd + pd + ad + ed + 'Z)' + consumer, '(Ljava/lang/Object;)V',
+                new Handle(Opcodes.H_INVOKESTATIC, w, 'unigrav$test$actualProducer', actualProducerDesc, false), '(' + ld + ')V')
+        call(m, Opcodes.INVOKESTATIC, provenance, 'produce', '(' + sd + wd + pd + ad + ld + ed + 'Z' + consumer + ')V', false); end(m, Opcodes.RETURN)
+        def writer = new ClassWriter(ClassWriter.COMPUTE_MAXS)
+        node.accept(writer)
+        def target = bridgeOutput.get().file(w + '.class').asFile
+        target.parentFile.mkdirs()
+        target.bytes = writer.toByteArray()
+        def digest = java.security.MessageDigest.getInstance('SHA-256').digest(matches[0].bytes as byte[]).encodeHex().toString()
+        bridgeOutput.get().file('world-bridge-input.txt').asFile.text = 'TEST_ONLY; NOT_PRODUCTION_MIXIN\ninput=' + matches[0].jar + '\nsha256=' + digest + '\npublic=1\ncollector=1\nread=1\nproducer=1\n'
+    }
+}
+tasks.named('test', Test).configure {
+    dependsOn bridge
+    classpath = files(bridgeOutput) + classpath
+}

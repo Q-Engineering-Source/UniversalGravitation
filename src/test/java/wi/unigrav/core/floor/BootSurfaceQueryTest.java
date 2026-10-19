@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -19,6 +20,7 @@ import net.minecraft.init.Bootstrap;
 import net.minecraft.util.math.BlockPos;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import wi.unigrav.core.floor.BootSurfaceCompiler.Qualification;
@@ -79,10 +81,158 @@ class BootSurfaceQueryTest {
     void blockedNearestPathCannotPretendThatTheWholeFragmentIsAbsent() {
         var floor = primitive(0, box(-2, -2, -2, 2, -1, 2), true);
         var blocker = primitive(1, box(-0.3, -0.8, -0.3, -0.2, -0.2, -0.2), false);
+        var source = cardinal(CardinalFrame.Y_POS);
         // A ray at x=.25 would be clear, but the chosen closest anchor is x=-.25.
-        var failure = failure(cardinal(CardinalFrame.Y_POS), compile(1.5, floor, blocker), QUERY);
+        var failure = failure(source, compile(1.5, floor, blocker), QUERY);
         assertEquals(Reason.VISIBILITY_UNRESOLVED, failure.reason());
         assertEquals(CardinalFrame.Y_POS, failure.fragment().orElseThrow().geometry().outward());
+
+        var diagnostic = failure.visibilityDiagnostic().orElseThrow();
+        assertEquals(BootSurfaceGeometry.SourceKind.CARDINAL_FOOT_RECTANGLE, diagnostic.sourceKind());
+        assertEquals(source.physical().scope(), diagnostic.sourceScope());
+        assertEquals(source.physical().revision(), diagnostic.sourceRevision());
+        assertEquals(source.anchorBounds(), diagnostic.sourceAnchorBounds());
+        assertEquals(source.radius(), diagnostic.sourceRadius());
+        assertEquals(new Vec3d(-0.25, 0, -0.25), diagnostic.sourceAnchor());
+        assertEquals(new Vec3d(-0.25, -1, -0.25), diagnostic.surfaceAnchor());
+        assertEquals(failure.fragment().orElseThrow().geometry(), diagnostic.fragmentGeometry());
+        assertEquals(blocker.rawBounds(), diagnostic.offendingRawBounds());
+        assertEquals(blocker.cell(), diagnostic.offendingCell());
+        assertSame(blocker.storedState(), diagnostic.offendingState());
+        assertEquals(1, diagnostic.observationOrdinal());
+        assertEquals(2, diagnostic.observationCount());
+        assertEquals(blocker.ordinal(), diagnostic.primitiveOrdinal());
+        assertEquals(2, diagnostic.boxesTested());
+        assertEquals(QUERY.maxVisibilityBoxTests(), diagnostic.visibilityBoxTestLimit());
+        assertTrue(diagnostic.captureTick().isEmpty());
+        assertTrue(diagnostic.rulesRevision().isEmpty());
+        assertTrue(diagnostic.summary().length() < 2048, "diagnostic remains a fixed-size witness, not contributor data");
+
+        var propagated = PlayerBootObservation.queryUnavailable(failure);
+        assertEquals(PlayerBootObservation.Reason.QUERY_UNAVAILABLE, propagated.reason());
+        assertEquals(java.util.Optional.of(diagnostic), propagated.visibilityDiagnostic());
+        assertTrue(propagated.detail().contains(diagnostic.summary()),
+                "the existing owner failure message must carry the same bounded visibility witness");
+        assertTrue(propagated.cause().isEmpty());
+    }
+
+    @ParameterizedTest
+    @EnumSource(CardinalFrame.class)
+    void oneCapturedBoxCanProveWholeCardinalFaceOcclusionAcrossTranslatedAxisFrames(CardinalFrame frame) {
+        var offset = new Vec3d(37.25, -19.5, 8.125);
+        var source = cardinalAt(frame, offset, BODY);
+        var target = primitive(0, framedAt(frame, box(-1, -2, -1, 1, -1, 1), offset), true);
+        var blocker = primitive(1, framedAt(frame, box(-1, -0.8, -1, 1, -0.2, 1), offset), false);
+        var surfaces = compile(1.5, target, blocker);
+
+        var complete = assertInstanceOf(Measurements.class,
+                BootSurfaceQuery.evaluateGeometry(source, surfaces, new BootSurfaceQuery.Limits(16, 2)),
+                "the same raw blocker spans the full source/fragment hull in " + frame);
+        assertTrue(complete.candidates().isEmpty(), "the only magnetic face is wholly hidden in " + frame);
+
+        var budget = assertInstanceOf(BootSurfaceQuery.Unavailable.class,
+                BootSurfaceQuery.evaluateGeometry(source, surfaces, new BootSurfaceQuery.Limits(16, 1)));
+        assertEquals(Reason.VISIBILITY_BUDGET, budget.reason(),
+                "the occlusion proof must use the already-counted blocker test in " + frame);
+        assertTrue(budget.visibilityDiagnostic().isEmpty());
+    }
+
+    @Test
+    void partialCrossSectionOneUlpShortAndSplitBlockersRemainUnresolved() {
+        var standard = cardinal(CardinalFrame.Y_POS);
+
+        // The chosen closest witness is inside the blocker, but the fragment extends farther in Z.
+        var broadTarget = primitive(0, box(-1, -2, -1, 1, -1, 1), true);
+        var shortFragmentBlocker = primitive(1, box(-1, -0.8, -0.75, 1, -0.2, 0.75), false);
+        assertUnresolvedOnYFace(standard, compile(1.5, broadTarget, shortFragmentBlocker), shortFragmentBlocker);
+
+        // The one-ULP uncovered upper Z strip is real: comparisons are exact and use no tolerance.
+        var narrowTarget = primitive(0, box(-0.25, -2, -0.25, 0.25, -1, 0.25), true);
+        var oneUlpShort = primitive(1,
+                box(-0.25, -0.8, -0.25, 0.25, -0.2, Math.nextDown(0.25)), false);
+        assertUnresolvedOnYFace(standard, compile(1.5, narrowTarget, oneUlpShort), oneUlpShort);
+
+        // The source is wider than this fully covered target patch. One selected line is blocked,
+        // but the same solid does not contain the source's transverse hull.
+        var wideSource = cardinalAt(CardinalFrame.Y_POS, ZERO,
+                new PlayerBodyShape.Dimensions(1.2, 2, 1.75));
+        var smallTarget = primitive(0, box(-0.25, -2, -0.25, 0.25, -1, 0.25), true);
+        var narrowBlocker = primitive(1, box(-0.25, -0.8, -0.25, 0.25, -0.2, 0.25), false);
+        assertUnresolvedOnYFace(wideSource, compile(1.5, smallTarget, narrowBlocker), narrowBlocker);
+
+        // Two adjacent half-boxes cover the union hull, but neither blocker alone certifies it.
+        var leftHalf = primitive(1, box(-0.25, -0.8, -0.25, 0.25, -0.2, 0), false);
+        var rightHalf = primitive(2, box(-0.25, -0.8, 0, 0.25, -0.2, 0.25), false);
+        assertUnresolvedOnYFace(standard, compile(1.5, narrowTarget, leftHalf, rightHalf), leftHalf);
+    }
+
+    @Test
+    void lowerBallAndEndpointOnlyContactKeepTheirExistingVisibilitySemantics() {
+        var target = primitive(0, box(-2, -2, -2, 2, -1.75, 2), true);
+        var broadBlocker = primitive(1, box(-2, -1.5, -2, 2, -1, 2), false);
+        var freeResult = failure(sphere(), compile(2, target, broadBlocker), QUERY);
+        assertEquals(Reason.VISIBILITY_UNRESOLVED, freeResult.reason(),
+                "a positive-radius Free lower ball cannot use a point/rectangle occlusion certificate");
+        assertEquals(broadBlocker.rawBounds(), freeResult.visibilityDiagnostic().orElseThrow().offendingRawBounds());
+
+        var cardinal = cardinal(CardinalFrame.Y_POS);
+        var floor = primitive(0, box(-2, -2, -2, 2, -1, 2), true);
+        var endpointOnly = primitive(1, box(-2, 0, -2, 2, 0.5, 2), false);
+        var clear = success(cardinal, compile(1.5, floor, endpointOnly));
+        assertTrue(clear.candidates().stream().anyMatch(candidate ->
+                candidate.fragment().geometry().outward() == CardinalFrame.Y_POS),
+                "a blocker touching only the source endpoint does not occlude the open path");
+    }
+
+    private static void assertUnresolvedOnYFace(BootSurfaceGeometry.Source source, SurfaceSet surfaces,
+                                               Primitive expectedBlocker) {
+        var unavailable = failure(source, surfaces, QUERY);
+        assertEquals(Reason.VISIBILITY_UNRESOLVED, unavailable.reason());
+        assertEquals(CardinalFrame.Y_POS, unavailable.fragment().orElseThrow().geometry().outward());
+        var diagnostic = unavailable.visibilityDiagnostic().orElseThrow();
+        assertEquals(expectedBlocker.rawBounds(), diagnostic.offendingRawBounds());
+    }
+
+    @Test
+    void qualifiedBlockedPathRetainsTheExistingCaptureAndRuleContext(@TempDir Path dataDirectory) {
+        try (BootWorldFixture fixture = BootWorldFixture.open(dataDirectory, new UUID(0, 71))) {
+            var actor = fixture.actor();
+            actor.setPosition(8.5, 66.0, 8.5);
+            var dimensions = new PlayerBodyShape.Dimensions(actor.width, actor.height, actor.getEyeHeight());
+            var placement = new PlayerBodyPlacement(new Vec3d(actor.posX, actor.posY + actor.height / 2.0, actor.posZ),
+                    CardinalFrame.Y_POS.attitude(), new PlayerBodyShape.Cardinal(CardinalFrame.Y_POS, dimensions));
+            var physical = new PlayerPhysicalSnapshot(new PlayerPhysicalSnapshot.Scope(actor.getUniqueID(),
+                    new UUID(0, 72), actor.dimension, 0), 7, placement, ZERO);
+            var source = BootSurfaceGeometry.fromAccepted(physical);
+            var footprint = BootQueryFootprint.plan(source, 2.0,
+                    new BootQueryFootprint.Limits(1024, 4096, 64, 512));
+            fixture.install(footprint);
+            fixture.put(new BlockPos(10, 64, 8), Blocks.IRON_BLOCK.getDefaultState());
+            var blockerCell = new BlockPos(9, 65, 8);
+            fixture.put(blockerCell, Blocks.STONE.getDefaultState());
+
+            var rules = new MagneticBlockReader.RuleSet(49,
+                    List.of(new MagneticBlockReader.RuleBinding("fixture:iron",
+                            new MagneticBlockRule("minecraft:iron_block", Map.of(), null))));
+            var capture = assertInstanceOf(BootWorldSurfaces.QualifiedSnapshot.class,
+                    BootWorldSurfaces.captureQualified(fixture.world(), actor, footprint, rules));
+            var tier = new BootTier(new FloorFieldProfile(32, 0.5, 8), 2.0, 4);
+            var result = assertInstanceOf(BootSurfaceQuery.Unavailable.class,
+                    BootSurfaceQuery.evaluateQualified(capture, Map.of("fixture:iron", tier), COMPILER, QUERY));
+
+            assertEquals(Reason.VISIBILITY_UNRESOLVED, result.reason());
+            var diagnostic = result.visibilityDiagnostic().orElseThrow();
+            assertEquals(source.kind(), diagnostic.sourceKind());
+            assertEquals(source.physical().scope(), diagnostic.sourceScope());
+            assertEquals(source.physical().revision(), diagnostic.sourceRevision());
+            assertEquals(capture.snapshot().captureTick(), diagnostic.captureTick().orElseThrow());
+            assertEquals(capture.rulesRevision(), diagnostic.rulesRevision().orElseThrow());
+            assertEquals(blockerCell, diagnostic.offendingCell());
+            var blocker = capture.snapshot().primitives().stream().filter(primitive -> primitive.cell().equals(blockerCell))
+                    .findFirst().orElseThrow();
+            assertSame(blocker.storedState(), diagnostic.offendingState());
+            assertEquals(capture.snapshot().primitives().indexOf(blocker), diagnostic.observationOrdinal());
+        }
     }
 
     @Test
@@ -147,6 +297,10 @@ class BootSurfaceQueryTest {
         var result = failure(source, compile(Double.MAX_VALUE, target), QUERY);
         assertEquals(Reason.NUMERIC, result.reason());
         assertTrue(result.cause().isPresent());
+        var propagated = PlayerBootObservation.queryUnavailable(result);
+        assertSame(result.cause().orElseThrow(), propagated.cause().orElseThrow(),
+                "query cause identity and its stack must reach the existing owner failure boundary");
+        assertTrue(propagated.visibilityDiagnostic().isEmpty());
     }
 
     @Test
@@ -175,7 +329,10 @@ class BootSurfaceQueryTest {
         assertEquals(1, assertInstanceOf(Measurements.class,
                 BootSurfaceQuery.evaluateGeometry(source, set, new BootSurfaceQuery.Limits(6, 2))).candidates().size());
         assertEquals(Reason.FRAGMENT_LIMIT, failure(source, set, new BootSurfaceQuery.Limits(5, 2)).reason());
-        assertEquals(Reason.VISIBILITY_BUDGET, failure(source, set, new BootSurfaceQuery.Limits(6, 1)).reason());
+        var visibilityBudget = failure(source, set, new BootSurfaceQuery.Limits(6, 1));
+        assertEquals(Reason.VISIBILITY_BUDGET, visibilityBudget.reason());
+        assertTrue(visibilityBudget.visibilityDiagnostic().isEmpty(),
+                "budget exhaustion is not a visibility blocker diagnostic and remains an explicit failure");
         assertThrows(IllegalArgumentException.class, () -> new BootSurfaceQuery.Limits(0, 1));
         assertThrows(IllegalArgumentException.class, () -> new BootSurfaceQuery.Limits(1, 0));
     }
@@ -211,6 +368,17 @@ class BootSurfaceQueryTest {
 
     private static BootSurfaceGeometry.Source cardinal(CardinalFrame frame) {
         return source(new PlayerBodyPlacement(frame.up(), frame.attitude(), new PlayerBodyShape.Cardinal(frame, BODY)));
+    }
+
+    private static BootSurfaceGeometry.Source cardinalAt(CardinalFrame frame, Vec3d foot,
+                                                          PlayerBodyShape.Dimensions dimensions) {
+        return source(new PlayerBodyPlacement(foot.add(frame.up()), frame.attitude(),
+                new PlayerBodyShape.Cardinal(frame, dimensions)));
+    }
+
+    private static Aabb framedAt(CardinalFrame frame, Aabb local, Vec3d offset) {
+        Aabb world = frame.toWorld(local);
+        return new Aabb(world.min().add(offset), world.max().add(offset));
     }
 
     private static BootSurfaceGeometry.Source sphere() {

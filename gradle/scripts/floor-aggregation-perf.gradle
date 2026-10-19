@@ -1,0 +1,1302 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.nio.file.Path
+import java.security.MessageDigest
+import java.util.concurrent.TimeUnit
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+import org.gradle.api.tasks.compile.JavaCompile
+
+/*
+ * F08 performance inputs and class paths are deliberately isolated from the
+ * normal test/runtime class path. This script is applied by the sole build
+ * owner only after the candidate diagnostics integration point is fixed.
+ */
+def acceptedBaselineManifestSha = '879C36117ECDFCDC925A9A8C04069E3EB164D7FF46F210AECD23C61BC81F3A42'
+def acceptedCompiledInventorySha = '5BD522B11B9260232F30B84CA41094A04ED156453B5D6D5704A844A9E3E27118'
+def acceptedApiInventorySha = '79D2E10BB81374F3D8BC364DA8F558AC838CCE3B1EB1479AD749B67AA6D64731'
+def floorPerfProtocol = 'UG_FLOOR_PERF_V1'
+
+def baselineRoot = {
+    def raw = providers.gradleProperty('floorPerfBaselineDir').orNull
+    if (raw == null || raw.isBlank()) {
+        throw new GradleException('Missing -PfloorPerfBaselineDir=<accepted R114 scalar-baseline-r1 path>')
+    }
+    file(raw).canonicalFile
+}
+
+def outputRoot = {
+    def raw = providers.gradleProperty('floorPerfOutput').orNull
+    if (raw == null || raw.isBlank()) {
+        throw new GradleException('Missing -PfloorPerfOutput=<new independent output directory>')
+    }
+    file(raw).canonicalFile
+}
+
+def runOutputRoot = {
+    def raw = providers.gradleProperty('floorPerfRunOutput').orNull
+    if (raw == null || raw.isBlank()) return outputRoot()
+    File runOutput = file(raw).canonicalFile
+    File inputOutput = outputRoot()
+    File baseline = baselineRoot()
+    if (runOutput == inputOutput
+            || runOutput.toPath().startsWith(inputOutput.toPath())
+            || inputOutput.toPath().startsWith(runOutput.toPath())
+            || runOutput.toPath().startsWith(projectDir.canonicalFile.toPath())
+            || runOutput.toPath().startsWith(baseline.toPath())) {
+        throw new GradleException("floorPerfRunOutput must be independent from the worktree, frozen baseline and sealed floorPerfOutput: ${runOutput}")
+    }
+    runOutput
+}
+
+def sha256Bytes = { byte[] bytes ->
+    MessageDigest.getInstance('SHA-256').digest(bytes).collect { String.format('%02X', it & 0xff) }.join()
+}
+
+def sha256File = { File path ->
+    if (!path.isFile()) throw new GradleException("Required input is not a regular file: ${path}")
+    MessageDigest digest = MessageDigest.getInstance('SHA-256')
+    path.withInputStream { input ->
+        byte[] buffer = new byte[1024 * 64]
+        int read
+        while ((read = input.read(buffer)) >= 0) {
+            if (read > 0) digest.update(buffer, 0, read)
+        }
+    }
+    digest.digest().collect { String.format('%02X', it & 0xff) }.join()
+}
+
+def isGeneratedMappingArchive = { File path ->
+    String root = projectDir.canonicalPath.replace('\\', '/')
+    String canonical = path.canonicalPath.replace('\\', '/')
+    canonical.startsWith(root + '/.gradle/unimined/local/mappings/')
+            && canonical.endsWith('/srg2mcp.jar')
+}
+
+// Unimined rewrites this generated ZIP's entry timestamps during project
+// configuration. Bind its mapping payloads, names, and lengths while retaining
+// the original raw archive SHA in the manifest; every other dependency remains
+// byte-for-byte pinned.
+def zipEntryPayloadSha256 = { File archive ->
+    ZipFile zip = null
+    Throwable primary = null
+    try {
+        zip = new ZipFile(archive)
+        List<ZipEntry> entries = []
+        def enumeration = zip.entries()
+        while (enumeration.hasMoreElements()) entries.add(enumeration.nextElement())
+        entries.sort { ZipEntry left, ZipEntry right -> left.name <=> right.name }
+        Set<String> names = new HashSet<>()
+        entries.each { ZipEntry entry ->
+            if (!names.add(entry.name)) throw new GradleException("Duplicate ZIP entry in generated mapping archive ${archive}: ${entry.name}")
+            if (entry.size < 0L) throw new GradleException("Unknown ZIP entry size in generated mapping archive ${archive}: ${entry.name}")
+        }
+        MessageDigest digest = MessageDigest.getInstance('SHA-256')
+        digest.update(ByteBuffer.allocate(4).putInt(entries.size()).array())
+        entries.each { ZipEntry entry ->
+            byte[] name = entry.name.getBytes(StandardCharsets.UTF_8)
+            digest.update(ByteBuffer.allocate(4).putInt(name.length).array())
+            digest.update(name)
+            digest.update((byte) (entry.isDirectory() ? 1 : 0))
+            digest.update(ByteBuffer.allocate(8).putLong(entry.size).array())
+            long observedBytes = 0L
+            if (!entry.isDirectory()) {
+                zip.getInputStream(entry).withCloseable { InputStream input ->
+                    byte[] buffer = new byte[65536]
+                    int read
+                    while ((read = input.read(buffer)) != -1) {
+                        digest.update(buffer, 0, read)
+                        observedBytes += read
+                    }
+                }
+            }
+            if (observedBytes != entry.size) {
+                throw new GradleException("ZIP entry payload length changed in generated mapping archive ${archive}: ${entry.name}")
+            }
+        }
+        return HexFormat.of().formatHex(digest.digest())
+    } catch (Throwable failure) {
+        primary = failure
+        if (failure instanceof GradleException) throw failure
+        throw new GradleException("Could not fingerprint generated mapping archive payloads: ${archive}", failure)
+    } finally {
+        if (zip != null) {
+            try {
+                zip.close()
+            } catch (Throwable closeFailure) {
+                if (primary != null) {
+                    if (closeFailure != primary) primary.addSuppressed(closeFailure)
+                } else {
+                    throw new GradleException("Could not close generated mapping archive: ${archive}", closeFailure)
+                }
+            }
+        }
+    }
+}
+
+def zipEntryPayloadRows = { File archive ->
+    ZipFile zip = null
+    Throwable primary = null
+    try {
+        zip = new ZipFile(archive)
+        List<ZipEntry> entries = []
+        def enumeration = zip.entries()
+        while (enumeration.hasMoreElements()) entries.add(enumeration.nextElement())
+        entries.sort { ZipEntry left, ZipEntry right -> left.name <=> right.name }
+        Set<String> names = new HashSet<>()
+        List<Map> rows = []
+        entries.each { ZipEntry entry ->
+            if (!names.add(entry.name)) throw new GradleException("Duplicate ZIP entry in generated mapping archive ${archive}: ${entry.name}")
+            if (entry.size < 0L) throw new GradleException("Unknown ZIP entry size in generated mapping archive ${archive}: ${entry.name}")
+            MessageDigest digest = MessageDigest.getInstance('SHA-256')
+            long observedBytes = 0L
+            if (!entry.isDirectory()) {
+                zip.getInputStream(entry).withCloseable { InputStream input ->
+                    byte[] buffer = new byte[65536]
+                    int read
+                    while ((read = input.read(buffer)) != -1) {
+                        digest.update(buffer, 0, read)
+                        observedBytes += read
+                    }
+                }
+            }
+            if (observedBytes != entry.size) {
+                throw new GradleException("ZIP entry payload length changed in generated mapping archive ${archive}: ${entry.name}")
+            }
+            rows.add([
+                    name: entry.name,
+                    bytes: entry.size,
+                    directory: entry.isDirectory(),
+                    sha256: digest.digest().collect { String.format('%02X', it & 0xff) }.join()
+            ])
+        }
+        return rows
+    } catch (Throwable failure) {
+        primary = failure
+        if (failure instanceof GradleException) throw failure
+        throw new GradleException("Could not inventory generated mapping archive payloads: ${archive}", failure)
+    } finally {
+        if (zip != null) {
+            try {
+                zip.close()
+            } catch (Throwable closeFailure) {
+                if (primary != null) {
+                    if (closeFailure != primary) primary.addSuppressed(closeFailure)
+                } else {
+                    throw new GradleException("Could not close generated mapping archive: ${archive}", closeFailure)
+                }
+            }
+        }
+    }
+}
+
+def inventoryDirectory = { File root ->
+    if (!root.isDirectory()) throw new GradleException("Pinned inventory directory is missing: ${root}")
+    def entries = []
+    Files.walk(root.toPath()).withCloseable { stream ->
+        stream.filter { Files.isRegularFile(it) }
+                .sorted()
+                .forEach { path ->
+                    File source = path.toFile()
+                    entries.add([
+                            path: root.toPath().relativize(path).toString().replace('\\', '/'),
+                            bytes: source.length(),
+                            sha256: sha256File(source)
+                    ])
+                }
+    }
+    entries
+}
+
+def verifyInventory = { File inventoryFile, File root, String expectedInventorySha, String label ->
+    String observedInventorySha = sha256File(inventoryFile)
+    if (observedInventorySha != expectedInventorySha) {
+        throw new GradleException("${label} inventory file digest mismatch expected=${expectedInventorySha} actual=${observedInventorySha}")
+    }
+    List<String> lines = inventoryFile.readLines('UTF-8')
+    if (lines.isEmpty() || lines.first() != 'path\tbytes\tsha256') {
+        throw new GradleException("${label} inventory header is unsupported: ${inventoryFile}")
+    }
+    Set<String> expectedPaths = new LinkedHashSet<>()
+    long bytesTotal = 0L
+    lines.drop(1).eachWithIndex { String line, int row ->
+        List<String> fields = line.split('\t', -1) as List<String>
+        if (fields.size() != 3) throw new GradleException("${label} malformed inventory row ${row + 2}")
+        String relative = fields[0].replace('\\', '/')
+        if (relative.startsWith('/') || relative.split('/').any { it == '..' }) {
+            throw new GradleException("${label} inventory path escapes its root: ${relative}")
+        }
+        File target = new File(root, relative).canonicalFile
+        if (!target.toPath().startsWith(root.canonicalFile.toPath())) {
+            throw new GradleException("${label} inventory path escapes its root: ${relative}")
+        }
+        if (!target.isFile()) throw new GradleException("${label} pinned file is missing: ${target}")
+        long expectedBytes = Long.parseLong(fields[1])
+        String expectedSha = fields[2].toUpperCase(Locale.ROOT)
+        long actualBytes = target.length()
+        String actualSha = sha256File(target)
+        if (actualBytes != expectedBytes || actualSha != expectedSha) {
+            throw new GradleException("${label} file mismatch ${relative}: expected=${expectedBytes}/${expectedSha} actual=${actualBytes}/${actualSha}")
+        }
+        if (!expectedPaths.add(relative)) throw new GradleException("${label} duplicate inventory path: ${relative}")
+        bytesTotal = Math.addExact(bytesTotal, actualBytes)
+    }
+    Map observedFiles = inventoryDirectory(root).findAll { it.path.endsWith('.class') }
+            .collectEntries { [(it.path): it] }
+    Map expectedFiles = expectedPaths.findAll { it.endsWith('.class') }.collectEntries {
+        [(it): true]
+    }
+    if (observedFiles.keySet() != expectedFiles.keySet()) {
+        Set extra = observedFiles.keySet() - expectedFiles.keySet()
+        Set missing = expectedFiles.keySet() - observedFiles.keySet()
+        throw new GradleException("${label} class inventory coverage mismatch extra=${extra.size()} missing=${missing.size()}")
+    }
+    [files: expectedPaths.size(), bytes: bytesTotal, sha256: observedInventorySha]
+}
+
+def baselinePaths = {
+    File root = baselineRoot()
+    [
+            root: root,
+            manifest: new File(root, 'scalar-baseline.json'),
+            compiledRoot: new File(root, 'compiled-classes'),
+            mainClasses: new File(root, 'compiled-classes/build/classes/java/main'),
+            testClasses: new File(root, 'compiled-classes/build/classes/java/test'),
+            compiledInventory: new File(root, 'compiled-class-inventory.tsv'),
+            apiRoot: new File(root, 'dependencies/uie-api10-compile-baseline'),
+            apiInventory: new File(root, 'api10-dependency-inventory.tsv'),
+            resources: new File(root, 'source-inputs/src/main/resources')
+    ]
+}
+
+def externalClasspathManifest = {
+    new File(outputRoot(), 'external-classpath.txt')
+}
+
+def pinnedExternalFiles = {
+    File path = externalClasspathManifest()
+    if (!path.isFile()) throw new GradleException("Supplemental external classpath has not been pinned: ${path}")
+    List<File> entries = path.readLines('UTF-8').findAll { !it.isBlank() }.collect { new File(it).canonicalFile }
+    if (entries.isEmpty()) throw new GradleException('Supplemental external classpath is empty')
+    entries.each { if (!it.exists()) throw new GradleException("Pinned supplemental classpath entry disappeared: ${it}") }
+    entries
+}
+
+def externalClasspathSnapshot = {
+    Set<String> excluded = new LinkedHashSet<>()
+    (sourceSets.main.output.files + sourceSets.test.output.files).each { File entry ->
+        excluded.add(entry.canonicalFile.path)
+    }
+    File activeUie = file("${rootProject.projectDir}/${uie_classes_dir}").canonicalFile
+    if (activeUie.exists()) excluded.add(activeUie.path)
+
+    List<File> runtimeGraph = sourceSets.test.runtimeClasspath.files.collect { it.canonicalFile }
+    LinkedHashSet<File> externalSources = new LinkedHashSet<>()
+    List<Map> excludedRows = []
+    runtimeGraph.each { File entry ->
+        if (excluded.contains(entry.path)) {
+            excludedRows.add([path: entry.path, reason: entry == activeUie
+                    ? 'active UIE path replaced by the accepted frozen API10 inventory'
+                    : 'current main/test output; excluded to prevent floor-class shadowing'])
+            return
+        }
+        if (!entry.exists()) throw new GradleException("Actual test runtime dependency is missing: ${entry}")
+        externalSources.add(entry)
+    }
+    if (externalSources.isEmpty()) throw new GradleException('Current test runtime graph yielded no supplemental external dependencies')
+    [runtimeGraph: runtimeGraph, excludedRows: excludedRows, externalSources: new ArrayList<>(externalSources)]
+}
+
+def externalClasspathSources = {
+    externalClasspathSnapshot().externalSources
+}
+
+def verifyExternalClasspathSources = {
+    File manifestFile = new File(outputRoot(), 'external-classpath-manifest.json')
+    if (!manifestFile.isFile()) throw new GradleException("Supplemental external classpath has not been pinned: ${manifestFile}")
+    def manifest = new JsonSlurper().parse(manifestFile)
+    List<File> sources = externalClasspathSnapshot().externalSources
+    List<String> actualOrigins = sources.collect { it.canonicalPath }
+    List<String> expectedOrigins = manifest.entries.collect { it.sourceOrigin as String }
+    if (actualOrigins != expectedOrigins) {
+        throw new GradleException("External classpath source order/set changed after pinning expected=${expectedOrigins.size()} actual=${actualOrigins.size()}")
+    }
+    sources.eachWithIndex { File source, int index ->
+        Map entry = manifest.entries[index] as Map
+        if (isGeneratedMappingArchive(source)) {
+            File staged = new File(entry.stagedPath as String).canonicalFile
+            if (!staged.isFile() || sha256File(staged) != (entry.sha256 as String)
+                    || source.length() != (entry.bytes as long) || staged.length() != (entry.bytes as long)) {
+                throw new GradleException("Pinned generated mapping archive bytes changed source=${source} staged=${staged}")
+            }
+            List<Map> sourceRows = zipEntryPayloadRows(source)
+            List<Map> stagedRows = zipEntryPayloadRows(staged)
+            String sourcePayload = zipEntryPayloadSha256(source)
+            String stagedPayload = zipEntryPayloadSha256(staged)
+            if (sourceRows != stagedRows || sourcePayload != stagedPayload
+                    || (entry.contentSha256 != null && sourcePayload != entry.contentSha256)
+                    || (entry.contentEntries != null && stagedRows != entry.contentEntries)) {
+                throw new GradleException("Generated mapping archive entries changed after pinning source=${source} staged=${staged}")
+            }
+            if (entry.identityKind == 'ZIP_ENTRY_PAYLOADS_SHA256'
+                    && (entry.sourceSha256 as String) != (entry.sha256 as String)) {
+                throw new GradleException("Generated mapping archive did not have exact source/staged bytes when pinned: ${source}")
+            }
+            logger.lifecycle("Verified generated mapping archive source=${source} pinnedRawSha=${entry.sha256} currentRawSha=${sha256File(source)} stagedRawSha=${sha256File(staged)} metadataOnly=${sha256File(source) != entry.sha256} payloadEntries=${JsonOutput.toJson(sourceRows)}")
+        } else {
+            String observed = source.isDirectory()
+                    ? sha256Bytes(JsonOutput.toJson(inventoryDirectory(source)).getBytes(StandardCharsets.UTF_8))
+                    : sha256File(source)
+            String expected = entry.sha256 as String
+            if (observed != expected) {
+                throw new GradleException("External classpath source changed after pinning source=${source} expected=${expected} actual=${observed}")
+            }
+        }
+    }
+}
+
+def verifyExistingPreparedOutput = { File output, File baseRoot, Map paths, String identitySha,
+                                    Map compiled, Map api10, Map externalGraph ->
+    File classpathFile = new File(output, 'external-classpath.txt')
+    File externalManifestFile = new File(output, 'external-classpath-manifest.json')
+    File baselineInputFile = new File(output, 'baseline-input-manifest.json')
+    if (![classpathFile, externalManifestFile, baselineInputFile].every { it.isFile() }) {
+        throw new GradleException("Refusing to reuse incomplete floor performance input directory: ${output}")
+    }
+    def externalManifest = new JsonSlurper().parse(externalManifestFile)
+    def baselineInput = new JsonSlurper().parse(baselineInputFile)
+    if (externalManifest.protocol != floorPerfProtocol
+            || externalManifest.status != 'SUPPLEMENTAL_INPUTS_PINNED'
+            || externalManifest.sourceGraphEntryCount != externalGraph.runtimeGraph.size()
+            || externalManifest.excluded != externalGraph.excludedRows
+            || baselineInput.protocol != floorPerfProtocol
+            || baselineInput.status != 'R114_BASELINE_VERIFIED_WITH_SUPPLEMENTAL_EXTERNAL_CP'
+            || baselineInput.frozenBaselinePath != baseRoot.canonicalPath
+            || baselineInput.frozenIdentitySha256 != identitySha
+            || baselineInput.frozenCompiledInventorySha256 != compiled.sha256
+            || baselineInput.frozenCompiledFileCount != compiled.files
+            || baselineInput.frozenCompiledBytes != compiled.bytes
+            || baselineInput.frozenMainClasses != paths.mainClasses.canonicalPath
+            || baselineInput.frozenTestClasses != paths.testClasses.canonicalPath
+            || baselineInput.frozenApi10Root != paths.apiRoot.canonicalPath
+            || baselineInput.frozenApi10InventorySha256 != api10.sha256
+            || baselineInput.frozenApi10FileCount != api10.files
+            || baselineInput.frozenApi10Bytes != api10.bytes
+            || baselineInput.frozenMainResources != paths.resources.canonicalPath
+            || baselineInput.historicExternalClasspath != 'NOT_SAVED_IN_R114; see external-classpath-manifest.json for the separately captured supplemental set'
+            || baselineInput.externalClasspathManifest != externalManifestFile.canonicalPath
+            || baselineInput.externalClasspathManifestSha256 != sha256File(externalManifestFile)) {
+        throw new GradleException("Pinned baseline/external manifests do not match current fixed inputs: ${output}")
+    }
+
+    List<Map> entries = externalManifest.entries as List<Map>
+    List<String> currentOrigins = externalGraph.externalSources.collect { it.canonicalPath }
+    List<String> manifestOrigins = entries.collect { it.sourceOrigin as String }
+    if (currentOrigins != manifestOrigins || entries.size() != externalGraph.externalSources.size()) {
+        throw new GradleException("Pinned external classpath source set/order changed expected=${manifestOrigins.size()} actual=${currentOrigins.size()}")
+    }
+    File stagedRoot = new File(output, 'external-inputs').canonicalFile
+    if (!stagedRoot.isDirectory()) throw new GradleException("Pinned external dependency root is missing: ${stagedRoot}")
+    Set<String> expectedStagedPaths = new LinkedHashSet<>()
+    List<String> expectedClasspath = []
+    entries.eachWithIndex { Map entry, int index ->
+        File source = externalGraph.externalSources[index]
+        String safeName = source.name.replaceAll('[^A-Za-z0-9._-]', '_')
+        File target = new File(stagedRoot, String.format(Locale.ROOT, '%04d-', index) + safeName).canonicalFile
+        if (entry.ordinal != index || entry.sourceOrigin != source.canonicalPath
+                || entry.stagedPath != target.canonicalPath
+                || entry.kind != (source.isDirectory() ? 'directory' : 'file')) {
+            throw new GradleException("Pinned external dependency identity/order mismatch at entry ${index}")
+        }
+        if (!target.toPath().startsWith(stagedRoot.toPath()) || !target.exists()) {
+            throw new GradleException("Pinned external dependency is missing or escapes its root: ${target}")
+        }
+        String sourceHash = source.isDirectory()
+                ? sha256Bytes(JsonOutput.toJson(inventoryDirectory(source)).getBytes(StandardCharsets.UTF_8))
+                : sha256File(source)
+        String stagedHash
+        long stagedBytes
+        long stagedFiles
+        if (target.isDirectory()) {
+            List<Map> inventory = inventoryDirectory(target)
+            stagedHash = sha256Bytes(JsonOutput.toJson(inventory).getBytes(StandardCharsets.UTF_8))
+            stagedBytes = inventory.collect { it.bytes as long }.sum(0L) as long
+            stagedFiles = inventory.size()
+        } else {
+            stagedHash = sha256File(target)
+            stagedBytes = target.length()
+            stagedFiles = 1L
+        }
+        long sourceBytes = source.isDirectory()
+                ? inventoryDirectory(source).collect { it.bytes as long }.sum(0L) as long
+                : source.length()
+        long sourceFiles = source.isDirectory() ? inventoryDirectory(source).size() : 1L
+        boolean sourceMatches = sourceHash == entry.sha256
+        if (isGeneratedMappingArchive(source)) {
+            if (source.isDirectory() || target.isDirectory()) {
+                throw new GradleException("Generated mapping archive identity is assigned to a directory: ${source}")
+            }
+            String sourcePayload = zipEntryPayloadSha256(source)
+            String stagedPayload = zipEntryPayloadSha256(target)
+            List<Map> sourceRows = zipEntryPayloadRows(source)
+            List<Map> stagedRows = zipEntryPayloadRows(target)
+            String expectedPayload = entry.contentSha256 == null ? stagedPayload : entry.contentSha256 as String
+            List<Map> expectedRows = entry.contentEntries == null ? stagedRows : entry.contentEntries as List<Map>
+            sourceMatches = sourcePayload == expectedPayload && stagedPayload == expectedPayload
+                    && sourceRows == expectedRows && stagedRows == expectedRows
+                    && ((entry.identityKind == null) || (entry.identityKind == 'ZIP_ENTRY_PAYLOADS_SHA256'
+                    && (entry.sourceSha256 as String) == (entry.sha256 as String)))
+            logger.lifecycle("Verified staged mapping archive source=${source} pinnedRawSha=${entry.sha256} currentRawSha=${sha256File(source)} stagedRawSha=${stagedHash} metadataOnly=${sha256File(source) != entry.sha256} payloadEntries=${JsonOutput.toJson(sourceRows)}")
+        }
+        if (!sourceMatches || stagedHash != entry.sha256
+                || sourceBytes != (entry.bytes as long) || stagedBytes != (entry.bytes as long)
+                || sourceFiles != (entry.fileCount as long) || stagedFiles != (entry.fileCount as long)) {
+            throw new GradleException("Pinned external dependency bytes/hash changed source=${source} staged=${target}")
+        }
+        expectedStagedPaths.add(target.canonicalPath)
+        expectedClasspath.add(target.canonicalPath)
+    }
+    Set<String> actualStagedPaths = (stagedRoot.listFiles() ?: new File[0]).collect { it.canonicalPath } as Set<String>
+    if (actualStagedPaths != expectedStagedPaths) {
+        throw new GradleException("Pinned external dependency directory has extra or missing entries: ${stagedRoot}")
+    }
+    List<String> observedClasspath = classpathFile.readLines('UTF-8').findAll { !it.isBlank() }
+    if (observedClasspath != expectedClasspath) {
+        throw new GradleException("Pinned external-classpath.txt differs from sealed manifest: ${classpathFile}")
+    }
+
+    externalGraph.externalSources.eachWithIndex { File source, int index ->
+        Map entry = entries[index]
+        if (isGeneratedMappingArchive(source)) {
+            File staged = new File(entry.stagedPath as String).canonicalFile
+            String payload = zipEntryPayloadSha256(source)
+            String stagedPayload = zipEntryPayloadSha256(staged)
+            List<Map> payloadRows = zipEntryPayloadRows(source)
+            List<Map> stagedRows = zipEntryPayloadRows(staged)
+            if (payload != stagedPayload || payloadRows != stagedRows
+                    || (entry.contentSha256 != null && payload != entry.contentSha256)
+                    || (entry.contentEntries != null && stagedRows != entry.contentEntries)) {
+                throw new GradleException("Generated mapping archive payload changed after pinning: ${source}")
+            }
+            if (entry.identityKind == 'ZIP_ENTRY_PAYLOADS_SHA256'
+                    && (entry.sourceSha256 as String) != (entry.sha256 as String)) {
+                throw new GradleException("Generated mapping archive source/staged bytes differed when pinned: ${source}")
+            }
+            logger.lifecycle("Verified generated mapping archive source=${source} pinnedRawSha=${entry.sha256} currentRawSha=${sha256File(source)} stagedRawSha=${sha256File(staged)} metadataOnly=${sha256File(source) != entry.sha256} payloadEntries=${JsonOutput.toJson(payloadRows)}")
+        } else {
+            String observed = source.isDirectory()
+                    ? sha256Bytes(JsonOutput.toJson(inventoryDirectory(source)).getBytes(StandardCharsets.UTF_8))
+                    : sha256File(source)
+            if (observed != entry.sha256) {
+                throw new GradleException("External classpath source changed after pinning: ${source}")
+            }
+        }
+    }
+}
+
+def currentMainClasses = {
+    List<File> roots = sourceSets.main.output.classesDirs.files.collect { it.canonicalFile }
+    File loaded = roots.find { new File(it, 'wi/unigrav/core/floor/FloorFieldIndex.class').isFile() }
+    if (loaded == null) {
+        if (roots.size() == 1) return roots.first()
+        throw new GradleException("Cannot identify the single current main class root from ${roots}")
+    }
+    loaded
+}
+
+def commonClasses = {
+    File root = sourceSets.floorPerfCommon.output.classesDirs.files.collect { it.canonicalFile }
+            .find { it.isDirectory() || it.toPath().toString().contains('floorPerfCommon') }
+    if (root == null) throw new GradleException('Cannot identify floorPerfCommon class output')
+    root
+}
+
+def currentMainOutputFiles = {
+    sourceSets.main.output.files.collect { it.canonicalFile }
+}
+
+def baselineChildClasspath = {
+    def base = baselinePaths()
+    ([commonClasses(), base.mainClasses, base.testClasses, base.resources, base.apiRoot] + pinnedExternalFiles())
+            .collect { it.canonicalFile.path }.join(File.pathSeparator)
+}
+
+def candidateChildClasspath = {
+    ([commonClasses()] + currentMainOutputFiles() + [baselinePaths().apiRoot] + pinnedExternalFiles())
+            .collect { it.canonicalFile.path }.join(File.pathSeparator)
+}
+
+def candidateHelperClasses = {
+    List<File> roots = sourceSets.floorPerfCandidate.output.classesDirs.files.collect { it.canonicalFile }
+    File loaded = roots.find { new File(it, 'wi/unigrav/core/floor/FloorAggregationDiagnosticsRunner.class').isFile() }
+    if (loaded == null) throw new GradleException("Cannot identify floorPerfCandidate class output from ${roots}")
+    loaded
+}
+
+def commonRunnerIdentity = {
+    File classes = new File(commonClasses(), 'wi/unigrav/core/floor')
+    List<File> files = (classes.listFiles() ?: new File[0]).findAll { File entry ->
+        entry.isFile() && (entry.name == 'FloorAggregationPerfRunner.class'
+                || (entry.name.startsWith('FloorAggregationPerfRunner$') && entry.name.endsWith('.class')))
+    }.sort { File left, File right -> left.name <=> right.name }
+    if (files.isEmpty()) throw new GradleException("Compiled common runner class family is missing: ${classes}")
+    List<Map> rows = files.collect { File entry ->
+        [name: entry.name, bytes: entry.length(), sha256: sha256File(entry)]
+    }
+    [rows: rows, sha256: sha256Bytes(JsonOutput.toJson(rows).getBytes(StandardCharsets.UTF_8))]
+}
+
+def java25 = {
+    if (JavaVersion.current().majorVersion != '25') {
+        throw new GradleException("Floor perf requires the project's Java 25 runtime; Gradle currently uses ${System.getProperty('java.version')}")
+    }
+    String suffix = System.getProperty('os.name', '').toLowerCase(Locale.ROOT).contains('win') ? '.exe' : ''
+    File exe = new File(System.getProperty('java.home'), "bin/java${suffix}")
+    if (!exe.isFile()) throw new GradleException("Java 25 executable is missing: ${exe}")
+    exe
+}
+
+def processTreeAlive = { Process process, List<ProcessHandle> descendants ->
+    process.isAlive() || descendants.any { ProcessHandle handle -> handle.isAlive() }
+}
+
+def awaitProcessTreeExit = { Process process, List<ProcessHandle> descendants, Long timeout, TimeUnit unit ->
+    long deadline = System.nanoTime() + unit.toNanos(timeout.longValue())
+    boolean interrupted = false
+    while (processTreeAlive(process, descendants)) {
+        long remaining = deadline - System.nanoTime()
+        if (remaining <= 0L) break
+        try {
+            TimeUnit.NANOSECONDS.sleep(Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(50)))
+        } catch (InterruptedException ignored) {
+            interrupted = true
+            break
+        }
+    }
+    interrupted
+}
+
+def terminateOwnedProcessTree = { Process process, Throwable primary, String operation ->
+    if (!process.isAlive()) return primary
+    Throwable cleanupFailure = null
+    List<ProcessHandle> descendants = []
+    try {
+        descendants = process.toHandle().descendants().toList()
+    } catch (Throwable discoveryFailure) {
+        cleanupFailure = discoveryFailure
+    }
+    descendants.each { ProcessHandle handle ->
+        try {
+            if (handle.isAlive()) handle.destroy()
+        } catch (Throwable destroyFailure) {
+            if (cleanupFailure == null) cleanupFailure = destroyFailure
+            else if (cleanupFailure != destroyFailure) cleanupFailure.addSuppressed(destroyFailure)
+        }
+    }
+    try {
+        process.destroy()
+    } catch (Throwable destroyFailure) {
+        if (cleanupFailure == null) cleanupFailure = destroyFailure
+        else if (cleanupFailure != destroyFailure) cleanupFailure.addSuppressed(destroyFailure)
+    }
+    boolean interrupted = awaitProcessTreeExit(process, descendants, 3, TimeUnit.SECONDS)
+    if (processTreeAlive(process, descendants)) {
+        descendants.each { ProcessHandle handle ->
+            try {
+                if (handle.isAlive()) handle.destroyForcibly()
+            } catch (Throwable forceFailure) {
+                if (cleanupFailure == null) cleanupFailure = forceFailure
+                else if (cleanupFailure != forceFailure) cleanupFailure.addSuppressed(forceFailure)
+            }
+        }
+        try {
+            if (process.isAlive()) process.destroyForcibly()
+        } catch (Throwable forceFailure) {
+            if (cleanupFailure == null) cleanupFailure = forceFailure
+            else if (cleanupFailure != forceFailure) cleanupFailure.addSuppressed(forceFailure)
+        }
+        interrupted |= awaitProcessTreeExit(process, descendants, 5, TimeUnit.SECONDS)
+    }
+    if (processTreeAlive(process, descendants)) {
+        GradleException failure = new GradleException("${operation} could not terminate owned process tree pid=${process.pid()}")
+        if (cleanupFailure == null) cleanupFailure = failure
+        else cleanupFailure.addSuppressed(failure)
+    }
+    if (interrupted) Thread.currentThread().interrupt()
+    if (cleanupFailure != null) {
+        if (primary != null) {
+            if (cleanupFailure != primary) primary.addSuppressed(cleanupFailure)
+            return primary
+        }
+        throw new GradleException("${operation} cleanup failed", cleanupFailure)
+    }
+    primary
+}
+
+def runLogged = { List<String> command, File stdout, File stderr, File workingDirectory, long timeoutMinutes ->
+    stdout.parentFile.mkdirs()
+    stderr.parentFile.mkdirs()
+    if (stdout.exists() || stderr.exists()) {
+        throw new GradleException("Refusing to overwrite child process evidence stdout=${stdout} stderr=${stderr}")
+    }
+    List<String> processCommand = command.collect { Object argument -> String.valueOf(argument) }
+    ProcessBuilder builder = new ProcessBuilder(processCommand)
+            .redirectOutput(stdout)
+            .redirectError(stderr)
+    if (workingDirectory != null) {
+        if (!workingDirectory.isDirectory()) {
+            throw new GradleException("Floor performance child working directory is missing: ${workingDirectory}")
+        }
+        builder.directory(workingDirectory)
+    }
+    Process process = builder.start()
+    try {
+        if (!process.waitFor(timeoutMinutes, TimeUnit.MINUTES)) {
+            GradleException failure = new GradleException("Timed out after ${timeoutMinutes} minutes: ${processCommand.join(' ')}; stdout=${stdout}; stderr=${stderr}")
+            terminateOwnedProcessTree(process, failure, 'floor performance child timeout')
+            throw failure
+        }
+    } catch (InterruptedException interrupted) {
+        terminateOwnedProcessTree(process, interrupted, 'floor performance child interrupted')
+        Thread.currentThread().interrupt()
+        throw new GradleException("Interrupted while waiting for floor performance child: ${command.join(' ')}", interrupted)
+    }
+    int exit = process.exitValue()
+    [exit: exit, stdout: stdout, stderr: stderr, command: processCommand,
+     workingDirectory: workingDirectory == null ? null : workingDirectory.canonicalPath]
+}
+
+def writeJavaArgumentFile = { List<String> command, File argumentFile ->
+    List<String> actualCommand = command.collect { Object argument -> String.valueOf(argument) }
+    if (actualCommand.size() < 2) {
+        throw new GradleException('Java argument-file launch requires the executable and at least one argument')
+    }
+    if (actualCommand.any { it.contains('\n') || it.contains('\r') }) {
+        throw new GradleException('Java argument-file launch arguments cannot contain line breaks')
+    }
+    if (argumentFile.exists()) {
+        throw new GradleException("Refusing to overwrite Java argument-file evidence: ${argumentFile}")
+    }
+    String contents = actualCommand.drop(1).collect { String argument ->
+        '"' + argument.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    }.join(System.lineSeparator()) + System.lineSeparator()
+    Files.writeString(argumentFile.toPath(), contents, StandardCharsets.UTF_8,
+            java.nio.file.StandardOpenOption.CREATE_NEW, java.nio.file.StandardOpenOption.WRITE)
+    [
+            logicalCommand: actualCommand,
+            processCommand: [actualCommand.first(), "@${argumentFile.canonicalPath}"],
+            argumentFile: argumentFile.canonicalPath,
+            argumentFileSha256: sha256File(argumentFile)
+    ]
+}
+
+sourceSets.create('floorPerfCommon') {
+    java.srcDir('src/perf/java')
+    resources.setSrcDirs([])
+    compileClasspath = files({
+        def base = baselinePaths()
+        [base.mainClasses, base.testClasses, base.resources, base.apiRoot] + externalClasspathSources()
+    })
+    runtimeClasspath = output + compileClasspath
+}
+
+sourceSets.create('floorPerfCandidate') {
+    java.srcDir('src/perfCandidate/java')
+    resources.setSrcDirs([])
+    compileClasspath = files({
+        [commonClasses()] + currentMainOutputFiles() + [baselinePaths().apiRoot] + externalClasspathSources()
+    })
+    runtimeClasspath = output + compileClasspath
+}
+
+tasks.named('compileFloorPerfCommonJava', JavaCompile).configure {
+    dependsOn 'prepareFloorPerfInputs'
+    options.encoding = 'UTF-8'
+    classpath = files({
+        def base = baselinePaths()
+        [base.mainClasses, base.testClasses, base.resources, base.apiRoot] + externalClasspathSources()
+    })
+    doFirst { verifyExternalClasspathSources() }
+}
+
+tasks.named('compileFloorPerfCandidateJava', JavaCompile).configure {
+    dependsOn 'prepareFloorPerfInputs'
+    dependsOn tasks.named('compileFloorPerfCommonJava')
+    dependsOn tasks.named('classes')
+    options.encoding = 'UTF-8'
+    classpath = files({
+        [commonClasses()] + currentMainOutputFiles() + [baselinePaths().apiRoot] + externalClasspathSources()
+    })
+    doFirst { verifyExternalClasspathSources() }
+}
+
+tasks.register('prepareFloorPerfInputs') {
+    group = 'verification'
+    description = 'Verify immutable R114 scalar/API10 input, then pin the actual external dependency graph outside the worktree.'
+    // Resolve generated mapped dependencies only after the normal project build
+    // has completed; otherwise an external artifact can change between capture
+    // and common compilation, making a sealed snapshot immediately stale.
+    dependsOn tasks.named('classes')
+    doLast {
+        File baseRoot = baselineRoot()
+        File output = outputRoot()
+        if (!baseRoot.isDirectory()) throw new GradleException("Frozen R114 baseline directory is missing: ${baseRoot}")
+        if (output.toPath().startsWith(projectDir.canonicalFile.toPath())
+                || output.toPath().startsWith(baseRoot.canonicalFile.toPath())) {
+            throw new GradleException("floorPerfOutput must be an independent directory outside the worktree and frozen baseline: ${output}")
+        }
+        File identity = new File(baseRoot, 'scalar-baseline.json')
+        String identitySha = sha256File(identity)
+        if (identitySha != acceptedBaselineManifestSha) {
+            throw new GradleException("R114 scalar baseline identity mismatch expected=${acceptedBaselineManifestSha} actual=${identitySha}")
+        }
+        def parsed = new JsonSlurper().parse(identity)
+        if (parsed.compiledClasses.files != 763 || parsed.api10CompileInput.files != 866) {
+            throw new GradleException("R114 scalar/API10 inventory counts changed: compiled=${parsed.compiledClasses.files}, api10=${parsed.api10CompileInput.files}")
+        }
+        def paths = baselinePaths()
+        if (![paths.mainClasses, paths.testClasses, paths.apiRoot, paths.resources].every { it.exists() }) {
+            throw new GradleException('One or more frozen R114 class/API/resource roots are missing')
+        }
+        def compiled = verifyInventory(paths.compiledInventory, paths.compiledRoot,
+                acceptedCompiledInventorySha, 'R114 compiled classes')
+        def api10 = verifyInventory(paths.apiInventory, paths.apiRoot,
+                acceptedApiInventorySha, 'R114 API10 compile input')
+
+        Map externalGraph = externalClasspathSnapshot()
+        List<File> runtimeGraph = externalGraph.runtimeGraph
+        List<File> externalSources = externalGraph.externalSources
+        List<Map> excludedRows = externalGraph.excludedRows
+
+        if (output.exists() && output.listFiles()?.length > 0) {
+            verifyExistingPreparedOutput(output, baseRoot, paths, identitySha, compiled, api10, externalGraph)
+            logger.lifecycle("Verified and reused sealed floor performance inputs entries=${externalSources.size()} output=${output}")
+            return
+        }
+
+        output.mkdirs()
+        File stagedRoot = new File(output, 'external-inputs')
+        stagedRoot.mkdirs()
+        List<Map> stagedEntries = []
+        List<String> stagedClassPath = []
+        externalSources.eachWithIndex { File source, int index ->
+            String prefix = String.format(Locale.ROOT, '%04d-', index)
+            String safeName = source.name.replaceAll('[^A-Za-z0-9._-]', '_')
+            File target = new File(stagedRoot, prefix + safeName)
+            if (source.isDirectory()) {
+                target.mkdirs()
+                Files.walk(source.toPath()).withCloseable { stream ->
+                    stream.filter { Files.isRegularFile(it) }.forEach { Path input ->
+                        Path relative = source.toPath().relativize(input)
+                        Path destination = target.toPath().resolve(relative)
+                        Files.createDirectories(destination.parent)
+                        Files.copy(input, destination)
+                    }
+                }
+            } else {
+                Files.copy(source.toPath(), target.toPath())
+            }
+            List<Map> sourceInventory = source.isDirectory() ? inventoryDirectory(source) : null
+            List<Map> targetInventory = target.isDirectory() ? inventoryDirectory(target) : null
+            String sourceHash = source.isDirectory()
+                    ? sha256Bytes(JsonOutput.toJson(sourceInventory).getBytes(StandardCharsets.UTF_8))
+                    : sha256File(source)
+            String targetHash = target.isDirectory()
+                    ? sha256Bytes(JsonOutput.toJson(targetInventory).getBytes(StandardCharsets.UTF_8))
+                    : sha256File(target)
+            boolean mappingArchive = !source.isDirectory() && isGeneratedMappingArchive(source)
+            String sourceContentSha = mappingArchive ? zipEntryPayloadSha256(source) : null
+            String targetContentSha = mappingArchive ? zipEntryPayloadSha256(target) : null
+            List<Map> sourceContentEntries = mappingArchive ? zipEntryPayloadRows(source) : null
+            List<Map> targetContentEntries = mappingArchive ? zipEntryPayloadRows(target) : null
+            if (sourceHash != targetHash) {
+                throw new GradleException("Staged external dependency digest mismatch source=${source} target=${target}")
+            }
+            if (mappingArchive && (sourceContentSha != targetContentSha
+                    || sourceContentEntries != targetContentEntries)) {
+                throw new GradleException("Staged generated mapping archive payload mismatch source=${source} target=${target}")
+            }
+            stagedClassPath.add(target.canonicalPath)
+            stagedEntries.add([
+                    ordinal: index,
+                    kind: source.isDirectory() ? 'directory' : 'file',
+                    identityKind: mappingArchive ? 'ZIP_ENTRY_PAYLOADS_SHA256' : 'EXACT_BYTES_SHA256',
+                    sourceOrigin: source.canonicalPath,
+                    stagedPath: target.canonicalPath,
+                    sourceSha256: sourceHash,
+                    sha256: targetHash,
+                    contentSha256: sourceContentSha,
+                    contentEntries: sourceContentEntries,
+                    fileCount: source.isDirectory() ? sourceInventory.size() : 1,
+                    bytes: source.isDirectory()
+                            ? sourceInventory.collect { it.bytes as long }.sum(0L)
+                            : source.length()
+            ])
+        }
+
+        File classpathFile = new File(output, 'external-classpath.txt')
+        classpathFile.setText(stagedClassPath.join(System.lineSeparator()) + System.lineSeparator(), 'UTF-8')
+        File manifest = new File(output, 'external-classpath-manifest.json')
+        manifest.setText(JsonOutput.prettyPrint(JsonOutput.toJson([
+                protocol: floorPerfProtocol,
+                status: 'SUPPLEMENTAL_INPUTS_PINNED',
+                statement: 'This supplemental external classpath was captured from the current test runtime graph. It does not claim those external bytes were present in the historical R114 run.',
+                identityPolicy: 'Exact staged bytes and raw SHA for all entries; only the generated Unimined .gradle/unimined/local/mappings/srg2mcp.jar additionally records exact sorted ZIP entry payload SHA because configuration rewrites ZIP entry timestamps.',
+                sourceGraph: 'sourceSets.test.runtimeClasspath after excluding current main/test outputs and the active UIE directory replaced by the accepted frozen API10 inventory',
+                sourceGraphEntryCount: runtimeGraph.size(),
+                excluded: excludedRows,
+                entries: stagedEntries
+        ])) + System.lineSeparator(), 'UTF-8')
+        File baselineInput = new File(output, 'baseline-input-manifest.json')
+        baselineInput.setText(JsonOutput.prettyPrint(JsonOutput.toJson([
+                protocol: floorPerfProtocol,
+                status: 'R114_BASELINE_VERIFIED_WITH_SUPPLEMENTAL_EXTERNAL_CP',
+                frozenBaselinePath: baseRoot.canonicalPath,
+                frozenIdentitySha256: identitySha,
+                frozenCompiledInventorySha256: compiled.sha256,
+                frozenCompiledFileCount: compiled.files,
+                frozenCompiledBytes: compiled.bytes,
+                frozenMainClasses: paths.mainClasses.canonicalPath,
+                frozenTestClasses: paths.testClasses.canonicalPath,
+                frozenApi10Root: paths.apiRoot.canonicalPath,
+                frozenApi10InventorySha256: api10.sha256,
+                frozenApi10FileCount: api10.files,
+                frozenApi10Bytes: api10.bytes,
+                frozenMainResources: paths.resources.canonicalPath,
+                historicExternalClasspath: 'NOT_SAVED_IN_R114; see external-classpath-manifest.json for the separately captured supplemental set',
+                externalClasspathManifest: manifest.canonicalPath,
+                externalClasspathManifestSha256: sha256File(manifest)
+        ])) + System.lineSeparator(), 'UTF-8')
+        logger.lifecycle("Pinned supplemental external classpath entries=${stagedEntries.size()} manifest=${manifest}")
+    }
+}
+
+def validateCandidateRetainedReport = { File reportFile ->
+    if (!reportFile.isFile()) throw new GradleException("Candidate typed retained-count report is missing: ${reportFile}")
+    Map report = new JsonSlurper().parse(reportFile) as Map
+    List<String> expectedFixtures = [
+            'DENSE', 'QUARTER_HOLES', 'MIXED_SIX_FACE', 'DOUBLE_SIX_FACE',
+            'PUBLIC_MIXED_PROFILES', 'MULTILAYER', 'DENSE_WIDE', 'MULTILAYER_WIDE',
+            'DIRTY_BATCH_CROSS_SECTION'
+    ]
+    if (report.protocol != floorPerfProtocol || report.status != 'PASS'
+            || report.maskPayloadIsTotalHeapEstimate != Boolean.FALSE
+            || report.tangentLookupPayloadIsTotalHeapEstimate != Boolean.FALSE
+            || report.fixtureCount != expectedFixtures.size()
+            || !(report.maskPayloadDefinition as String).contains('identity-distinct live Mask256 primitive long fields')
+            || !(report.tangentLookupPayloadDefinition as String).contains('identity-distinct live 256-entry primitive short arrays')) {
+        throw new GradleException("Candidate typed retained-count report header is invalid: ${reportFile}")
+    }
+
+    File expectedRoot = currentMainClasses().canonicalFile
+    List<String> expectedClasses = [
+            'wi.unigrav.core.floor.FloorFieldIndex',
+            'wi.unigrav.core.floor.FloorChunkSources',
+            'wi.unigrav.core.floor.FloorChunkCoverage',
+            'wi.unigrav.core.floor.FloorWorldFields'
+    ]
+    List<Map> classRows = report.classIdentities as List<Map>
+    if (classRows == null || classRows.size() != expectedClasses.size()
+            || classRows.collect { it.name as String }.toSet() != expectedClasses.toSet()) {
+        throw new GradleException("Candidate typed report does not identify the exact four production floor classes: ${reportFile}")
+    }
+    classRows.each { Map row ->
+        String name = row.name as String
+        File classFile = new File(expectedRoot, name.replace('.', '/') + '.class').canonicalFile
+        if (!classFile.isFile() || row.codeSource != expectedRoot.canonicalPath
+                || (row.bytes as long) != classFile.length()
+                || !((row.sha256 as String).equalsIgnoreCase(sha256File(classFile)))) {
+            throw new GradleException("Candidate typed report class identity mismatch name=${name} path=${classFile}")
+        }
+    }
+
+    List<Map> rows = report.fixtures as List<Map>
+    if (rows == null || rows.size() != expectedFixtures.size()
+            || rows.collect { it.fixture as String }.toSet() != expectedFixtures.toSet()) {
+        throw new GradleException("Candidate typed report fixture inventory is incomplete or duplicated: ${reportFile}")
+    }
+    def nonnegative = { Map values, String key, String fixture ->
+        Object raw = values[key]
+        if (!(raw instanceof Number)) throw new GradleException("Candidate typed count is not numeric fixture=${fixture} field=${key}")
+        long value = ((Number) raw).longValue()
+        if (value < 0L) throw new GradleException("Candidate typed count is negative fixture=${fixture} field=${key} value=${value}")
+        value
+    }
+    def exactCounts = { Map actual, Map<String, Long> expected ->
+        actual != null && actual.size() == expected.size() && expected.every { String key, Long value ->
+            Object observed = actual[key]
+            observed instanceof Number && ((Number) observed).longValue() == value.longValue()
+        }
+    }
+    rows.each { Map row ->
+        String fixture = row.fixture as String
+        int width = (row.width as Number).intValue()
+        boolean wide = fixture.endsWith('_WIDE')
+        int expectedWidth = wide ? 16 : fixture == 'DIRTY_BATCH_CROSS_SECTION' ? 1 : 8
+        if (width != expectedWidth || ((row.seed as Number).longValue() != 0x55474608L)) {
+            throw new GradleException("Candidate typed report fixture parameters changed fixture=${fixture}")
+        }
+        Map counts = row.counts as Map
+        if (counts == null || row.expectedChunks == null) {
+            throw new GradleException("Candidate typed report is missing real chunk/count data fixture=${fixture}")
+        }
+        long expectedChunks = nonnegative(row, 'expectedChunks', fixture)
+        long expectedPhysical = nonnegative(row, 'expectedPhysicalBlocks', fixture)
+        long expectedEmitters = nonnegative(row, 'expectedEmitters', fixture)
+        long expectedSections = nonnegative(row, 'expectedStorageSections', fixture)
+        long publishedChunks = nonnegative(counts, 'publishedChunks', fixture)
+        long coverages = nonnegative(counts, 'coverages', fixture)
+        long sections = nonnegative(counts, 'sections', fixture)
+        long routeBuckets = nonnegative(counts, 'routeBuckets', fixture)
+        long routeShards = nonnegative(counts, 'routeShards', fixture)
+        long coverageBuckets = nonnegative(counts, 'coverageBuckets', fixture)
+        long groups = nonnegative(counts, 'groups', fixture)
+        long physicalBlocks = nonnegative(counts, 'physicalBlocks', fixture)
+        long emitters = nonnegative(counts, 'emitters', fixture)
+        long identityMasks = nonnegative(counts, 'identityDistinctMasks', fixture)
+        long maskPayload = nonnegative(counts, 'maskPayloadBytes', fixture)
+        long tangentLookupFaces = nonnegative(counts, 'tangentNormalLookupFaces', fixture)
+        long tangentLookupPayload = nonnegative(counts, 'tangentNormalLookupPayloadBytes', fixture)
+        if (publishedChunks != expectedChunks || coverages != expectedChunks
+                || physicalBlocks != expectedPhysical || emitters != expectedEmitters || sections != expectedSections
+                || maskPayload != Math.multiplyExact(identityMasks, 32L)
+                || tangentLookupPayload != Math.multiplyExact(tangentLookupFaces, 512L)
+                || identityMasks > groups || coverageBuckets > groups || routeShards < routeBuckets
+                || (expectedEmitters > 0L && groups == 0L)) {
+            throw new GradleException("Candidate typed retained counts violate fixture invariants fixture=${fixture} counts=${counts}")
+        }
+        if (fixture == 'DOUBLE_SIX_FACE' && expectedEmitters != Math.multiplyExact(expectedPhysical, 2L)) {
+            throw new GradleException('Candidate double-sided fixture lost one face per physical floor block')
+        }
+        if (fixture == 'MULTILAYER_WIDE') {
+            Map shape = row.multiLayerWideShape as Map
+            Map yCounts = shape?.layerYCounts as Map
+            Map faceCounts = shape?.layerFaceCounts as Map
+            Map expectedYCounts = ['16': 65536L, '20': 65536L, '24': 65536L, '28': 65536L]
+            Map expectedFaceCounts = ['16|UP': 65536L, '20|DOWN': 65536L,
+                                      '24|UP': 65536L, '28|DOWN': 65536L]
+            if (width != 16 || expectedChunks != 256L || expectedPhysical != 262144L
+                    || expectedEmitters != 262144L || expectedSections != 256L
+                    || shape == null || nonnegative(shape, 'physicalBlocks', fixture) != 262144L
+                    || nonnegative(shape, 'emitters', fixture) != 262144L
+                    || nonnegative(shape, 'retainedStorageSections', fixture) != 256L
+                    || !exactCounts(yCounts, expectedYCounts) || !exactCounts(faceCounts, expectedFaceCounts)
+                    || nonnegative(shape, 'upLocalNormalMask', fixture) != 257L
+                    || nonnegative(shape, 'downLocalNormalMask', fixture) != 4112L) {
+                throw new GradleException("MULTILAYER_WIDE did not pass the actual four-layer storage shape gate: ${row}")
+            }
+        }
+    }
+
+    [
+            protocol: floorPerfProtocol,
+            status: 'PASS',
+            reportPath: reportFile.canonicalPath,
+            reportSha256: sha256File(reportFile),
+            candidateFloorClassRoot: expectedRoot.canonicalPath,
+            candidateFloorClassRows: classRows,
+            helperClassPath: new File(candidateHelperClasses(), 'wi/unigrav/core/floor/FloorAggregationDiagnosticsRunner.class').canonicalPath,
+            helperClassSha256: sha256File(new File(candidateHelperClasses(), 'wi/unigrav/core/floor/FloorAggregationDiagnosticsRunner.class')),
+            commonRunnerClassSha256: sha256File(new File(commonClasses(), 'wi/unigrav/core/floor/FloorAggregationPerfRunner.class')),
+            commonRunnerClassInventorySha256: commonRunnerIdentity().sha256,
+            externalClasspathManifestSha256: sha256File(new File(outputRoot(), 'external-classpath-manifest.json')),
+            preflightReceiptSha256: sha256File(new File(runOutputRoot(), 'linkage/preflight.json')),
+            fixtureIds: expectedFixtures,
+            fixtureCount: rows.size(),
+            maskPayloadDefinition: report.maskPayloadDefinition,
+            maskPayloadIsTotalHeapEstimate: false
+    ]
+}
+
+tasks.register('verifyFloorPerfCommonLinkage') {
+    group = 'verification'
+    description = 'Run the common driver preflight independently against frozen scalar and current candidate class paths.'
+    dependsOn tasks.named('compileFloorPerfCommonJava')
+    dependsOn tasks.named('classes')
+    doLast {
+        File output = runOutputRoot()
+        File commonOutput = commonClasses()
+        File runnerClass = new File(commonOutput, 'wi/unigrav/core/floor/FloorAggregationPerfRunner.class')
+        if (!runnerClass.isFile()) throw new GradleException("Common perf runner class is missing: ${runnerClass}")
+        String runnerClassSha256 = sha256File(runnerClass)
+        Map runnerIdentity = commonRunnerIdentity()
+        File linkageDirectory = new File(output, 'linkage')
+        linkageDirectory.mkdirs()
+        File receipt = new File(linkageDirectory, 'preflight.json')
+        Map inputs = [
+                baseline: [cp: baselineChildClasspath(), root: baselinePaths().mainClasses.canonicalPath],
+                candidate: [cp: candidateChildClasspath(), root: currentMainClasses().canonicalPath]
+        ]
+        if (receipt.isFile()) {
+            Map existing = new JsonSlurper().parse(receipt) as Map
+            if (existing.protocol != floorPerfProtocol || existing.status != 'PASS'
+                    || existing.commonRunnerClassSha256 != runnerClassSha256
+                    || existing.commonRunnerClassInventorySha256 != runnerIdentity.sha256
+                    || existing.commonRunnerClassInventory != runnerIdentity.rows) {
+                throw new GradleException("Existing common-linkage receipt is not a passing ${floorPerfProtocol} receipt: ${receipt}")
+            }
+            inputs.each { String variant, Map input ->
+                Map row = existing[variant] as Map
+                File stdout = new File(linkageDirectory, "${variant}.stdout.log")
+                File stderr = new File(linkageDirectory, "${variant}.stderr.log")
+                List<String> expectedCommand = [
+                        java25().canonicalPath, '-Xms2g', '-Xmx2g', '-Dfile.encoding=UTF-8',
+                        '-cp', input.cp as String,
+                        'wi.unigrav.core.floor.FloorAggregationPerfRunner',
+                        '--mode=preflight', "--variant=${variant}",
+                        "--expected-floor-root=${input.root}"
+                ].collect { Object argument -> String.valueOf(argument) }
+                List<String> recordedCommand = ((row.command ?: []) as List).collect { Object argument -> String.valueOf(argument) }
+                List<String> passLines = stdout.isFile() ? stdout.readLines('UTF-8').findAll {
+                    it.startsWith("PREFLIGHT_PASS protocol=${floorPerfProtocol} variant=${variant.toUpperCase(Locale.ROOT)} ")
+                } : []
+                if (row.status != 'PASS' || recordedCommand != expectedCommand
+                        || row.classpathSha256 != sha256Bytes(input.cp.getBytes(StandardCharsets.UTF_8))
+                        || row.expectedFloorRoot != input.root
+                        || row.commonRunnerClassSha256 != runnerClassSha256
+                        || row.commonRunnerClassInventorySha256 != runnerIdentity.sha256
+                        || row.workingDirectory != new File(linkageDirectory, "${variant}-work").canonicalPath
+                        || !stdout.isFile() || !stderr.isFile()
+                        || row.stdoutSha256 != sha256File(stdout) || row.stderrSha256 != sha256File(stderr)
+                        || passLines.size() != 1) {
+                    throw new GradleException("Existing ${variant} preflight evidence does not match current classes/classpath: ${receipt}")
+                }
+            }
+            logger.lifecycle("Verified and reused sealed baseline/candidate common-linkage preflight=${receipt}")
+            return
+        }
+
+        Map rows = [:]
+        inputs.each { String variant, Map input ->
+            File stdout = new File(linkageDirectory, "${variant}.stdout.log")
+            File stderr = new File(linkageDirectory, "${variant}.stderr.log")
+            List<String> command = [
+                    java25().canonicalPath, '-Xms2g', '-Xmx2g', '-Dfile.encoding=UTF-8',
+                    '-cp', (input.cp as String),
+                    'wi.unigrav.core.floor.FloorAggregationPerfRunner',
+                    '--mode=preflight', "--variant=${variant}",
+                    "--expected-floor-root=${input.root}"
+            ]
+            File workingDirectory = new File(linkageDirectory, "${variant}-work")
+            if (!workingDirectory.mkdirs() && !workingDirectory.isDirectory()) {
+                throw new GradleException("Could not create isolated ${variant} preflight working directory: ${workingDirectory}")
+            }
+            def result = runLogged(command, stdout, stderr, workingDirectory, 20)
+            List<String> lines = stdout.readLines('UTF-8').findAll {
+                it.startsWith("PREFLIGHT_PASS protocol=${floorPerfProtocol} variant=${variant.toUpperCase(Locale.ROOT)} ")
+            }
+            if (result.exit != 0 || lines.size() != 1) {
+                throw new GradleException("Real ${variant} common-linkage preflight failed exit=${result.exit}; stdout=${stdout}; stderr=${stderr}")
+            }
+            rows[variant] = [
+                    status: 'PASS',
+                    commonRunnerClassSha256: runnerClassSha256,
+                    commonRunnerClassInventorySha256: runnerIdentity.sha256,
+                    workingDirectory: result.workingDirectory,
+                    command: command.collect { Object argument -> String.valueOf(argument) },
+                    classpathSha256: sha256Bytes(input.cp.getBytes(StandardCharsets.UTF_8)),
+                    exitCode: result.exit,
+                    passLineCount: lines.size(),
+                    stdoutSha256: sha256File(stdout),
+                    stderrSha256: sha256File(stderr),
+                    expectedFloorRoot: input.root
+            ]
+        }
+        receipt.setText(JsonOutput.prettyPrint(JsonOutput.toJson([
+                protocol: floorPerfProtocol,
+                status: 'PASS',
+                commonRunnerClassSha256: runnerClassSha256,
+                commonRunnerClassInventorySha256: runnerIdentity.sha256,
+                commonRunnerClassInventory: runnerIdentity.rows,
+                baseline: rows.baseline,
+                candidate: rows.candidate
+        ])) + System.lineSeparator(), 'UTF-8')
+        logger.lifecycle("Real baseline/candidate common linkage preflight passed: ${receipt}")
+    }
+}
+
+tasks.register('verifyFloorPerfCandidateDiagnostics') {
+    group = 'verification'
+    description = 'Run and validate typed retained counts from the actual candidate published index/scanner structures.'
+    dependsOn tasks.named('verifyFloorPerfCommonLinkage')
+    dependsOn tasks.named('compileFloorPerfCandidateJava')
+    doLast {
+        File output = runOutputRoot()
+        File report = new File(output, 'candidate-retained-counts.json')
+        File stdout = new File(output, 'candidate-retained-counts.stdout.log')
+        File stderr = new File(output, 'candidate-retained-counts.stderr.log')
+        File receipt = new File(output, 'candidate-retained-counts-validation.json')
+        File helperClass = new File(candidateHelperClasses(), 'wi/unigrav/core/floor/FloorAggregationDiagnosticsRunner.class')
+        if (!helperClass.isFile()) throw new GradleException("Candidate diagnostics class is missing: ${helperClass}")
+        File workingDirectory = new File(output, 'candidate-diagnostics-work')
+        String candidateClasspath = ([commonClasses(), candidateHelperClasses()] + currentMainOutputFiles()
+                + [baselinePaths().apiRoot] + pinnedExternalFiles())
+                .collect { it.canonicalFile.path }.join(File.pathSeparator)
+        List<String> command = [
+                java25().canonicalPath, '-Xms2g', '-Xmx2g', '-Dfile.encoding=UTF-8',
+                '-cp', candidateClasspath,
+                'wi.unigrav.core.floor.FloorAggregationDiagnosticsRunner',
+                '--mode=verify', "--output=${report.canonicalPath}",
+                "--expected-floor-root=${currentMainClasses().canonicalPath}"
+        ]
+        Map reportValidation
+        int exitCode
+        if (receipt.isFile()) {
+            Map existing = new JsonSlurper().parse(receipt) as Map
+            reportValidation = validateCandidateRetainedReport(report)
+            if (existing.protocol != floorPerfProtocol || existing.status != 'PASS'
+                    || existing.reportPath != report.canonicalPath
+                    || existing.reportSha256 != reportValidation.reportSha256
+                    || existing.candidateClasspathSha256 != sha256Bytes(candidateClasspath.getBytes(StandardCharsets.UTF_8))
+                    || existing.commonRunnerClassSha256 != reportValidation.commonRunnerClassSha256
+                    || existing.commonRunnerClassInventorySha256 != reportValidation.commonRunnerClassInventorySha256
+                    || existing.diagnosticsWorkingDirectory != workingDirectory.canonicalPath
+                    || existing.helperClassSha256 != sha256File(helperClass)
+                    || existing.diagnosticsStdoutSha256 != (stdout.isFile() ? sha256File(stdout) : null)
+                    || existing.diagnosticsStderrSha256 != (stderr.isFile() ? sha256File(stderr) : null)
+                    || existing.externalClasspathManifestSha256 != reportValidation.externalClasspathManifestSha256
+                    || existing.preflightReceiptSha256 != reportValidation.preflightReceiptSha256) {
+                throw new GradleException("Existing candidate typed diagnostics receipt does not match the current validated inputs: ${receipt}")
+            }
+            logger.lifecycle("Verified and reused sealed candidate typed retained-count evidence report=${report} receipt=${receipt}")
+            return
+        }
+
+        boolean priorRunEvidence = report.exists() || stdout.exists() || stderr.exists()
+        if (priorRunEvidence) {
+            if (![report, stdout, stderr].every { it.isFile() }) {
+                throw new GradleException("Candidate typed diagnostics has partial prior evidence; refusing to overwrite under ${output}")
+            }
+            reportValidation = validateCandidateRetainedReport(report)
+            exitCode = 0
+            logger.lifecycle("Revalidating prior candidate diagnostics report after wrapper-side contract correction; output and logs remain unchanged")
+        } else {
+            if (!workingDirectory.mkdirs() && !workingDirectory.isDirectory()) {
+                throw new GradleException("Could not create isolated candidate diagnostics working directory: ${workingDirectory}")
+            }
+            def result = runLogged(command, stdout, stderr, workingDirectory, 20)
+            exitCode = result.exit
+            if (exitCode != 0) {
+                throw new GradleException("Candidate typed retained-count process failed exit=${exitCode}; stdout=${stdout}; stderr=${stderr}")
+            }
+            reportValidation = validateCandidateRetainedReport(report)
+        }
+        List<String> passLines = stdout.readLines('UTF-8').findAll {
+            it.startsWith("CANDIDATE_RETAINED_COUNTS_PASS protocol=${floorPerfProtocol} fixtures=9 path=")
+        }
+        if (passLines.size() != 1) {
+            throw new GradleException("Candidate typed retained-count process did not emit exactly one success line: ${stdout}")
+        }
+        String passLine = passLines.first()
+        int shaMarker = passLine.lastIndexOf(' sha256=')
+        if (shaMarker < 0) throw new GradleException("Candidate typed success line has no report digest: ${stdout}")
+        String reportedPath = passLine.substring(passLine.indexOf(' path=') + 6, shaMarker)
+        String reportedSha = passLine.substring(shaMarker + 8)
+        if (reportedPath != report.canonicalPath
+                || !reportedSha.equalsIgnoreCase(reportValidation.reportSha256 as String)) {
+            throw new GradleException("Candidate typed success line does not bind the validated report: ${stdout}")
+        }
+        Map validation = new LinkedHashMap(reportValidation)
+        validation.put('candidateClasspathSha256', sha256Bytes(candidateClasspath.getBytes(StandardCharsets.UTF_8)))
+        validation.put('candidateClasspathEntryCount', candidateClasspath.split(java.util.regex.Pattern.quote(File.pathSeparator)).length)
+        validation.put('diagnosticsCommand', command.collect { Object argument -> String.valueOf(argument) })
+        validation.put('diagnosticsWorkingDirectory', workingDirectory.canonicalPath)
+        validation.put('diagnosticsExitCode', exitCode)
+        validation.put('diagnosticsStdoutSha256', sha256File(stdout))
+        validation.put('diagnosticsStderrSha256', sha256File(stderr))
+        Files.writeString(receipt.toPath(), JsonOutput.prettyPrint(JsonOutput.toJson(validation)) + System.lineSeparator(),
+                StandardCharsets.UTF_8, java.nio.file.StandardOpenOption.CREATE_NEW, java.nio.file.StandardOpenOption.WRITE)
+        logger.lifecycle("Candidate actual typed retained counts validated fixtures=9 report=${report} receipt=${receipt}")
+    }
+}
+
+tasks.register('floorAggregationPerf') {
+    group = 'verification'
+    description = 'Run isolated scalar-versus-candidate correctness traces and CPU measurements; never a player-latency or GPU claim.'
+    dependsOn tasks.named('verifyFloorPerfCommonLinkage')
+    dependsOn tasks.named('compileFloorPerfCandidateJava')
+    dependsOn tasks.named('verifyFloorPerfCandidateDiagnostics')
+    doLast {
+        def mode = providers.gradleProperty('floorPerfMode').orElse('compare').get()
+        if (mode != 'compare') throw new GradleException("Unsupported floorPerfMode=${mode}; only compare is defined")
+        File output = runOutputRoot()
+        File diagnosticsReceipt = new File(output, 'candidate-retained-counts-validation.json')
+        File diagnosticsReport = new File(output, 'candidate-retained-counts.json')
+        if (!diagnosticsReceipt.isFile()) throw new GradleException("Candidate typed retained-count validation receipt is missing: ${diagnosticsReceipt}")
+        Map diagnostics = new JsonSlurper().parse(diagnosticsReceipt) as Map
+        if (diagnostics.protocol != floorPerfProtocol || diagnostics.status != 'PASS'
+                || diagnostics.reportPath != diagnosticsReport.canonicalPath
+                || diagnostics.reportSha256 != sha256File(diagnosticsReport)
+                || diagnostics.externalClasspathManifestSha256 != sha256File(new File(outputRoot(), 'external-classpath-manifest.json'))
+                || diagnostics.preflightReceiptSha256 != sha256File(new File(output, 'linkage/preflight.json'))) {
+            throw new GradleException("Candidate typed retained-count evidence is stale or invalid: ${diagnosticsReceipt}")
+        }
+        validateCandidateRetainedReport(diagnosticsReport)
+        boolean candidateDiagnosticsReady = true
+        List<File> baselineEntries = [commonClasses(), baselinePaths().mainClasses,
+                                      baselinePaths().testClasses, baselinePaths().resources,
+                                      baselinePaths().apiRoot] + pinnedExternalFiles()
+        List<File> candidateEntries = [commonClasses()] + currentMainOutputFiles() +
+                [baselinePaths().apiRoot] + pinnedExternalFiles()
+        String baselineCp = baselineEntries.collect { it.canonicalFile.path }.join(File.pathSeparator)
+        String candidateCp = candidateEntries.collect { it.canonicalFile.path }.join(File.pathSeparator)
+        List<String> command = [
+                java25().canonicalPath, '-Xms2g', '-Xmx2g', '-Dfile.encoding=UTF-8',
+                '-cp', baselineCp,
+                'wi.unigrav.core.floor.FloorAggregationPerfRunner',
+                '--mode=compare',
+                "--baseline-classpath=${baselineCp}",
+                "--candidate-classpath=${candidateCp}",
+                "--output=${output.canonicalPath}",
+                "--baseline-manifest=${new File(outputRoot(), 'baseline-input-manifest.json').canonicalPath}",
+                "--external-manifest=${new File(outputRoot(), 'external-classpath-manifest.json').canonicalPath}",
+                "--preflight-receipt=${new File(output, 'linkage/preflight.json').canonicalPath}",
+                "--expected-baseline-floor-root=${baselinePaths().mainClasses.canonicalPath}",
+                "--expected-candidate-floor-root=${currentMainClasses().canonicalPath}",
+                "--candidate-diagnostics-ready=${candidateDiagnosticsReady}"
+        ]
+        String launchId = Long.toString(System.currentTimeMillis())
+        Map launch = writeJavaArgumentFile(command, new File(output, "compare-launch-${launchId}.args"))
+        File commandReceipt = new File(output, "compare-command-${launchId}.json")
+        Files.writeString(commandReceipt.toPath(), JsonOutput.prettyPrint(JsonOutput.toJson([
+                protocol: floorPerfProtocol,
+                logicalCommand: launch.logicalCommand,
+                processCommand: launch.processCommand,
+                argumentFile: launch.argumentFile,
+                argumentFileSha256: launch.argumentFileSha256,
+                baselineClasspathSha256: sha256Bytes(baselineCp.getBytes(StandardCharsets.UTF_8)),
+                candidateClasspathSha256: sha256Bytes(candidateCp.getBytes(StandardCharsets.UTF_8))
+        ])) + System.lineSeparator(), StandardCharsets.UTF_8,
+                java.nio.file.StandardOpenOption.CREATE_NEW, java.nio.file.StandardOpenOption.WRITE)
+        File compareStdout = new File(output, 'compare-' + launchId + '.stdout.log')
+        File compareStderr = new File(output, 'compare-' + launchId + '.stderr.log')
+        File compareWorkingDirectory = new File(output, 'compare-work')
+        if (!compareWorkingDirectory.mkdirs() && !compareWorkingDirectory.isDirectory()) {
+            throw new GradleException("Could not create isolated compare-parent working directory: ${compareWorkingDirectory}")
+        }
+        def result = runLogged(launch.processCommand as List<String>, compareStdout,
+                compareStderr, compareWorkingDirectory, 360)
+        File executionReceipt = new File(output, "compare-execution-${launchId}.json")
+        Files.writeString(executionReceipt.toPath(), JsonOutput.prettyPrint(JsonOutput.toJson([
+                protocol: floorPerfProtocol,
+                commandReceipt: commandReceipt.canonicalPath,
+                commandReceiptSha256: sha256File(commandReceipt),
+                exitCode: result.exit,
+                stdout: result.stdout.canonicalPath,
+                stdoutSha256: sha256File(result.stdout),
+                stderr: result.stderr.canonicalPath,
+                stderrSha256: sha256File(result.stderr),
+                workingDirectory: result.workingDirectory
+        ])) + System.lineSeparator(), StandardCharsets.UTF_8,
+                java.nio.file.StandardOpenOption.CREATE_NEW, java.nio.file.StandardOpenOption.WRITE)
+        if (result.exit != 0) {
+            throw new GradleException("Floor performance comparison did not pass exit=${result.exit}; stdout=${result.stdout}; stderr=${result.stderr}")
+        }
+        if (!candidateDiagnosticsReady) {
+            throw new GradleException('Common traces/measurements were captured, but the candidate-only retainedCounts helper is not integrated; result is NON_PASS and F08 remains incomplete.')
+        }
+    }
+}

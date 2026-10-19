@@ -390,6 +390,16 @@ public final class PlayerRenderPoseTracker {
                 || player.isPlayerSleeping() || player.isSpectator() || PlayerKinematics.requiresNative(player)) {
             return Optional.empty();
         }
+        AcceptedPresentation acceptedPresentation = acceptedPresentation(connection).orElse(null);
+        if (acceptedPresentation != null) {
+            PlayerPhysicalSnapshot.Scope scope = acceptedPresentation.snapshot().scope();
+            if (!current(connection) || !presentationScopeCurrent(connection, acceptedPresentation.snapshot()))
+                return Optional.empty();
+            return Optional.of(new PermitSignature(player.getUniqueID(), connection.world,
+                    connection.world.provider.getDimension(), epoch(connection.world), false, false, false,
+                    null, null, 0, 0, false, scope.sessionId(), scope.worldEpoch(), acceptedPresentation.kind()));
+        }
+
         Optional<GIntentObservation> observed = intent.observe(player);
         boolean personalZeroG = observed.filter(GIntentObservation::active).isPresent();
         boolean integrated = !player.getServer().isDedicatedServer();
@@ -423,8 +433,36 @@ public final class PlayerRenderPoseTracker {
                 connection.world.provider.getDimension(), epoch(connection.world), integrated, bound, custody,
                 source == null ? null : source.key().sessionId(),
                 source == null ? null : source.source(), source == null ? 0 : source.sourceEpoch(),
-                source == null ? 0 : source.revision(), source != null && source.active(), physicalScope, physicalEpoch);
+                source == null ? 0 : source.revision(), source != null && source.active(), physicalScope, physicalEpoch,
+                PresentationKind.LEGACY);
         return Optional.of(signature);
+    }
+
+    /** Exact render admission from the physics owner; neither accepted() nor G custody alone grants this lease. */
+    private Optional<AcceptedPresentation> acceptedPresentation(Connection connection) {
+        if (!current(connection)) return Optional.empty();
+        PlayerPhysicsServer.PresentationBodyReference cardinal =
+                physics.presentationBodyReference(connection.handler).orElse(null);
+        if (cardinal != null) {
+            PlayerPhysicalSnapshot snapshot = cardinal.snapshot();
+            if (current(connection) && presentationScopeCurrent(connection, snapshot))
+                return Optional.of(new AcceptedPresentation(PresentationKind.CARDINAL_HEAD, snapshot,
+                        cardinal.acceptedLock()));
+        }
+        PlayerPhysicsServer.FreePresentationSnapshot free =
+                physics.presentationFreeSnapshot(connection.handler).orElse(null);
+        if (free != null) {
+            PlayerPhysicalSnapshot snapshot = free.snapshot();
+            if (current(connection) && presentationScopeCurrent(connection, snapshot))
+                return Optional.of(new AcceptedPresentation(PresentationKind.FREE_OWNER, snapshot, null));
+        }
+        return Optional.empty();
+    }
+
+    private static boolean presentationScopeCurrent(Connection connection, PlayerPhysicalSnapshot snapshot) {
+        PlayerPhysicalSnapshot.Scope scope = snapshot.scope();
+        return scope.playerId().equals(connection.player.getUniqueID())
+                && scope.dimension() == connection.world.provider.getDimension();
     }
 
     private PoseState poseState(Connection connection, long tick) {
@@ -433,26 +471,47 @@ public final class PlayerRenderPoseTracker {
 
     private PoseState poseState(Connection connection, EntityPlayerMP subject, long tick) {
         if (connection == null || connection.player != subject || !current(connection)) return null;
-        PlayerPhysicalSnapshot accepted = physics.presentationAccepted(connection.handler).orElse(null);
-        if (connection.lease != null && connection.lease.sample != null
-                && tick - connection.lease.sample.tick <= FREE_REPORT_TTL_TICKS) {
-            PlayerRenderPoseProtocol.Quaternion body = connection.lease.sample.body;
-            PlayerRenderPoseProtocol.Quaternion head = connection.lease.sample.head;
-            UUID physicalScope = accepted == null ? null : accepted.scope().sessionId();
-            long revision = accepted == null ? 0 : accepted.revision();
-            return new PoseState(PlayerRenderPoseProtocol.Mode.FREE, -1, revision, physicalScope,
-                    connection.lease.id, epoch(connection.world), connection.world.provider.getDimension(), body, head);
+        AcceptedPresentation admitted = acceptedPresentation(connection).orElse(null);
+        PlayerRenderPoseProtocol.Quaternion head = currentLeaseHead(connection, tick, admitted);
+        if (admitted != null && admitted.kind() == PresentationKind.CARDINAL_HEAD) {
+            PlayerPhysicsServer.AcceptedBodyReference acceptedLock = admitted.cardinalReference();
+            PlayerPhysicalSnapshot accepted = admitted.snapshot();
+            PlayerBodyShape.Cardinal cardinal = (PlayerBodyShape.Cardinal) accepted.placement().shape();
+            PlayerRenderPoseProtocol.Quaternion body = acceptedBody(subject, acceptedLock);
+            if (head == null) {
+                head = fallbackCardinalHead(subject, cardinal, acceptedLock);
+            }
+            return new PoseState(PlayerRenderPoseProtocol.Mode.CARDINAL, acceptedLock.frame().ordinal(),
+                    accepted.revision(), accepted.scope().sessionId(), 0, epoch(connection.world),
+                    connection.world.provider.getDimension(), body, head,
+                    new PlayerRenderPoseProtocol.CardinalGeometry(accepted.scope().sessionId(),
+                            accepted.scope().worldEpoch(), accepted.placement().transport(), accepted.placement().bounds()));
         }
-        if (accepted == null || !(accepted.placement().shape() instanceof PlayerBodyShape.Cardinal cardinal)) return null;
-        Vec3d up = cardinal.frame().up();
-        float bodyYaw = Float.isFinite(subject.renderYawOffset) ? subject.renderYawOffset : subject.rotationYaw;
-        Vec3d bodyHeading = Float.isFinite(bodyYaw)
-                ? new Vec3d(-Math.sin(Math.toRadians(bodyYaw)), 0, Math.cos(Math.toRadians(bodyYaw)))
-                : accepted.placement().attitude().basisZ();
-        Vec3d fallback = tangent(bodyHeading, up);
-        if (fallback == null) fallback = tangent(accepted.placement().attitude().basisZ(), up);
-        if (fallback == null) fallback = cardinal.frame().attitude().basisZ();
-        PlayerRenderPoseProtocol.Quaternion body = PlayerRenderPoseProtocol.Quaternion.fromUpForward(up, fallback);
+
+        // accepted() is used only to prevent a stale/temporarily inadmissible Cardinal owner from
+        // falling through to the legacy FREE client-body branch. It never grants a report lease.
+        PlayerPhysicalSnapshot accepted = physics.accepted(connection.handler).orElse(null);
+        if (accepted != null && accepted.placement().shape() instanceof PlayerBodyShape.Cardinal) return null;
+        if (connection.lease != null && connection.lease.signature.kind() == PresentationKind.CARDINAL_HEAD) return null;
+        if (connection.lease != null && connection.lease.signature.kind() == PresentationKind.FREE_OWNER
+                && (admitted == null || admitted.kind() != PresentationKind.FREE_OWNER
+                || !samePresentationScope(connection.lease.signature, admitted))) return null;
+
+        FreeSample sample = currentLeaseSample(connection, tick);
+        if (sample == null) return null;
+        // Preserve the existing Free body-report semantics; the owner-qualified lease adds the
+        // full head quaternion but does not replace the established Free body authority.
+        return new PoseState(PlayerRenderPoseProtocol.Mode.FREE, -1, 0, null,
+                connection.lease.id, epoch(connection.world), connection.world.provider.getDimension(),
+                sample.body(), sample.head(), null);
+    }
+
+    private static PlayerRenderPoseProtocol.Quaternion fallbackCardinalHead(EntityPlayerMP subject,
+            PlayerBodyShape.Cardinal cardinal, PlayerPhysicsServer.AcceptedBodyReference acceptedLock) {
+        Vec3d up = acceptedLock.frame().up();
+        Vec3d fallback = usesFrozenHeading(acceptedLock)
+                ? acceptedLock.tangentHeading() : nativeBodyHeading(subject, up);
+        if (fallback == null) fallback = acceptedLock.frame().attitude().basisZ();
         net.minecraft.util.math.Vec3d minecraftLook = subject.getLook(1.0F);
         Vec3d look = new Vec3d(minecraftLook.x, minecraftLook.y, minecraftLook.z);
         Vec3d headForward = normalized(look);
@@ -460,9 +519,60 @@ public final class PlayerRenderPoseTracker {
         Vec3d headUp = tangent(up, headForward);
         if (headUp == null) headUp = tangent(fallback, headForward);
         if (headUp == null) headUp = cardinal.frame().attitude().basisZ();
-        PlayerRenderPoseProtocol.Quaternion head = PlayerRenderPoseProtocol.Quaternion.fromUpForward(headUp, headForward);
-        return new PoseState(PlayerRenderPoseProtocol.Mode.CARDINAL, cardinal.frame().ordinal(), accepted.revision(),
-                accepted.scope().sessionId(), 0, epoch(connection.world), connection.world.provider.getDimension(), body, head);
+        return PlayerRenderPoseProtocol.Quaternion.fromUpForward(headUp, headForward);
+    }
+
+    private FreeSample currentLeaseSample(Connection connection, long tick) {
+        FreeLease lease = connection.lease;
+        if (lease == null || lease.sample == null || lease.id <= 0 || lease.sample.leaseId() != lease.id
+                || lease.worldEpoch != epoch(connection.world)
+                || lease.dimension != connection.world.provider.getDimension()
+                || tick - lease.sample.tick() > FREE_REPORT_TTL_TICKS) return null;
+        return lease.sample;
+    }
+
+    private PlayerRenderPoseProtocol.Quaternion currentLeaseHead(Connection connection, long tick,
+            AcceptedPresentation admitted) {
+        FreeSample sample = currentLeaseSample(connection, tick);
+        if (sample == null) return null;
+        PermitSignature signature = connection.lease.signature;
+        if (signature.kind() == PresentationKind.CARDINAL_HEAD) {
+            return admitted != null && admitted.kind() == PresentationKind.CARDINAL_HEAD
+                    && samePresentationScope(signature, admitted) ? sample.head() : null;
+        }
+        if (signature.kind() == PresentationKind.FREE_OWNER) {
+            return admitted != null && admitted.kind() == PresentationKind.FREE_OWNER
+                    && samePresentationScope(signature, admitted) ? sample.head() : null;
+        }
+        if (admitted != null && !samePresentationScope(signature, admitted)) return null;
+        return sample.head();
+    }
+
+    private static boolean samePresentationScope(PermitSignature signature, AcceptedPresentation admitted) {
+        PlayerPhysicalSnapshot.Scope scope = admitted.snapshot().scope();
+        return (signature.kind() == PresentationKind.LEGACY || signature.kind() == admitted.kind())
+                && Objects.equals(signature.physicsScope(), scope.sessionId())
+                && signature.physicsEpoch() == scope.worldEpoch();
+    }
+
+    private static PlayerRenderPoseProtocol.Quaternion acceptedBody(EntityPlayerMP subject,
+            PlayerPhysicsServer.AcceptedBodyReference acceptedLock) {
+        Vec3d heading = usesFrozenHeading(acceptedLock)
+                ? acceptedLock.tangentHeading() : nativeBodyHeading(subject, acceptedLock.frame().up());
+        if (heading == null) heading = acceptedLock.frame().attitude().basisZ();
+        return PlayerRenderPoseProtocol.Quaternion.fromUpForward(acceptedLock.frame().up(), heading);
+    }
+
+    private static boolean usesFrozenHeading(PlayerPhysicsServer.AcceptedBodyReference reference) {
+        return reference.source() == PlayerBodyReference.Source.MANUAL
+                || reference.source() == PlayerBodyReference.Source.ENVIRONMENT;
+    }
+
+    private static Vec3d nativeBodyHeading(EntityPlayerMP subject, Vec3d up) {
+        float bodyYaw = Float.isFinite(subject.renderYawOffset) ? subject.renderYawOffset : subject.rotationYaw;
+        if (!Float.isFinite(bodyYaw)) return null;
+        return tangent(new Vec3d(-Math.sin(Math.toRadians(bodyYaw)), 0,
+                Math.cos(Math.toRadians(bodyYaw))), up);
     }
 
     private void failSubject(Connection connection, String operation, RuntimeException failure) {
@@ -507,7 +617,7 @@ public final class PlayerRenderPoseTracker {
             if (bySubject == null) continue;
             Pair pair = bySubject.get(subject.getUniqueID());
             if (pair != null && (!actual.contains(pair.viewer.player)
-                    || !isTracking(pair.subject, pair.viewer.player) || state == null))
+                    || !isTracking(pair.subject, pair.viewer.player)))
                 removePair(viewerLink, subject.getUniqueID(), pair.subject, true);
         }
     }
@@ -533,11 +643,31 @@ public final class PlayerRenderPoseTracker {
         Map<UUID, Pair> bySubject = pairs.computeIfAbsent(viewerLink.manager, ignored -> new HashMap<>());
         UUID subjectId = subject.getUniqueID();
         Pair pair = bySubject.get(subjectId);
-        if (state == null) {
-            if (pair != null) removePair(viewerLink, subjectId, subject, true);
+        PlayerPhysicsServer.PresentationRelease release = physics.presentationRelease(subject.connection).orElse(null);
+        if (release != null && pair != null && pair.subject == subject && pair.state != null
+                && pair.state.geometry != null && pair.state.physicsScope.equals(release.scope().sessionId())
+                && pair.state.geometry.physicsWorldEpoch() == release.scope().worldEpoch()
+                && release.revision() >= pair.state.physicalRevision) {
+            if (!pair.released) {
+                pair.sequence = Math.incrementExact(pair.sequence);
+                outbound.accept(viewer.player, PlayerRenderPoseProtocol.Packet.presentationRelease(viewer.clientToken,
+                        viewer.viewerRealm, subjectId, pair.entityId, pair.state.dimension, pair.state.worldEpoch,
+                        pair.lifetime, pair.sequence, release.revision(),
+                        new PlayerRenderPoseProtocol.PresentationRelease(release.scope().sessionId(),
+                                release.scope().worldEpoch(), release.generation())));
+                pair.released = true;
+                pair.suspended = true;
+            }
             return;
         }
-        if (pair != null && !pair.sameContext(subject, state)) {
+        if (state == null) {
+            if (pair != null && !pair.suspended) {
+                sendRemoval(pair);
+                pair.suspended = true;
+            }
+            return;
+        }
+        if (pair != null && (pair.suspended || !pair.sameContext(subject, state))) {
             removePair(viewerLink, subjectId, pair.subject, true);
             pair = null;
             bySubject = pairs.computeIfAbsent(viewerLink.manager, ignored -> new HashMap<>());
@@ -551,9 +681,10 @@ public final class PlayerRenderPoseTracker {
         pair.sequence = Math.incrementExact(pair.sequence);
         pair.state = state;
         pair.lastSentTick = tick;
-        outbound.accept(viewer.player, PlayerRenderPoseProtocol.Packet.pose(viewer.clientToken, viewer.viewerRealm,
+        outbound.accept(viewer.player, new PlayerRenderPoseProtocol.Packet(PlayerRenderPoseProtocol.Kind.POSE,
+                viewer.clientToken, viewer.viewerRealm, 0,
                 subjectId, subject.getEntityId(), state.dimension, state.worldEpoch, pair.lifetime, pair.sequence,
-                state.physicalRevision, state.mode, state.cardinalFrame, state.body, state.head));
+                state.physicalRevision, state.mode, state.cardinalFrame, state.body, state.head, state.geometry));
     }
 
     private void removePair(Link link, UUID subjectId, EntityPlayerMP expected, boolean send) {
@@ -563,7 +694,12 @@ public final class PlayerRenderPoseTracker {
         if (pair == null || expected != null && pair.subject != expected) return;
         bySubject.remove(subjectId);
         if (bySubject.isEmpty()) pairs.remove(link.manager);
-        if (!send || pair.state == null || !pair.viewer.hello || !current(pair.viewer)) return;
+        if (!send || pair.suspended) return;
+        sendRemoval(pair);
+    }
+
+    private void sendRemoval(Pair pair) {
+        if (pair.state == null || !pair.viewer.hello || !current(pair.viewer)) return;
         pair.sequence = Math.incrementExact(pair.sequence);
         PoseState state = pair.state;
         outbound.accept(pair.viewer.player, PlayerRenderPoseProtocol.Packet.remove(pair.viewer.clientToken,
@@ -744,14 +880,20 @@ public final class PlayerRenderPoseTracker {
     private record FreeSample(PlayerRenderPoseProtocol.Quaternion body, PlayerRenderPoseProtocol.Quaternion head,
                               long sequence, long tick, long leaseId) { }
 
+    private enum PresentationKind { LEGACY, CARDINAL_HEAD, FREE_OWNER }
+
+    private record AcceptedPresentation(PresentationKind kind, PlayerPhysicalSnapshot snapshot,
+                                        PlayerPhysicsServer.AcceptedBodyReference cardinalReference) { }
+
     private record PermitSignature(UUID playerId, WorldServer world, int dimension, long worldEpoch,
                                    boolean integrated, boolean bound, boolean custody, UUID gSession,
                                    GIntentObservation.Source gSource, long gSourceEpoch, long gRevision,
-                                   boolean gActive, UUID physicsScope, long physicsEpoch) { }
+                                   boolean gActive, UUID physicsScope, long physicsEpoch, PresentationKind kind) { }
 
     private record PoseState(PlayerRenderPoseProtocol.Mode mode, int cardinalFrame, long physicalRevision,
                              UUID physicsScope, long freeLease, long worldEpoch, int dimension,
-                             PlayerRenderPoseProtocol.Quaternion body, PlayerRenderPoseProtocol.Quaternion head) { }
+                             PlayerRenderPoseProtocol.Quaternion body, PlayerRenderPoseProtocol.Quaternion head,
+                             PlayerRenderPoseProtocol.CardinalGeometry geometry) { }
 
     private static final class Pair {
         private final Connection viewer;
@@ -761,6 +903,8 @@ public final class PlayerRenderPoseTracker {
         private long sequence;
         private long lastSentTick = Long.MIN_VALUE;
         private PoseState state;
+        private boolean suspended;
+        private boolean released;
 
         private Pair(Connection viewer, EntityPlayerMP subject, long lifetime) {
             this.viewer = viewer;
@@ -774,12 +918,16 @@ public final class PlayerRenderPoseTracker {
                     && subject.world == candidate.world && state != null
                     && state.mode == next.mode && state.cardinalFrame == next.cardinalFrame
                     && Objects.equals(state.physicsScope, next.physicsScope) && state.freeLease == next.freeLease
+                    && (state.geometry == null && next.geometry == null
+                    || state.geometry != null && next.geometry != null
+                    && state.geometry.physicsWorldEpoch() == next.geometry.physicsWorldEpoch())
                     && state.dimension == next.dimension && state.worldEpoch == next.worldEpoch;
         }
 
         private boolean changed(PoseState next) {
             if (state == null) return true;
             return state.physicalRevision != next.physicalRevision
+                    || !Objects.equals(state.geometry, next.geometry)
                     || !sameRotation(state.body, next.body) || !sameRotation(state.head, next.head);
         }
 

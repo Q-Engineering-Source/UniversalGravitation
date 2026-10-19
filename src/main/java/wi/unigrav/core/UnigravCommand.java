@@ -1,9 +1,15 @@
 package wi.unigrav.core;
 
+import wi.unigrav.core.player.PlayerMobilityIntent;
+import wi.unigrav.core.player.PlayerPhysicsServer;
+
+import net.minecraft.world.WorldServer;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.nio.file.Path;
+import java.util.Objects;
 
 import net.minecraft.block.state.IBlockState;
 import net.minecraft.command.CommandBase;
@@ -18,8 +24,12 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.RayTraceResult;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.text.TextComponentString;
+import net.minecraftforge.fml.common.Loader;
 
 import wi.unigrav.UnigravMod;
+import wi.unigrav.core.config.FloorConfigException;
+import wi.unigrav.core.floor.FloorRuntime;
+import wi.unigrav.core.floor.FloorWorldFields;
 import wi.unigrav.api.field.GravityField;
 import wi.unigrav.api.field.GravityFields;
 import wi.unigrav.api.field.RegionGravityContribution;
@@ -65,6 +75,16 @@ import wi.unigrav.api.math.Vec3;
  * they persist and fire {@code WorldGravityChangeEvent}.
  */
 public final class UnigravCommand extends CommandBase {
+    private final Path floorConfigFileOverride;
+
+    public UnigravCommand() {
+        this.floorConfigFileOverride = null;
+    }
+
+    /** Package-local command seam for headless behavior tests; production resolves Forge's config directory. */
+    UnigravCommand(Path floorConfigFileOverride) {
+        this.floorConfigFileOverride = Objects.requireNonNull(floorConfigFileOverride, "floorConfigFileOverride");
+    }
 
     @Override
     public String getName() {
@@ -75,7 +95,7 @@ public final class UnigravCommand extends CommandBase {
     public String getUsage(ICommandSender sender) {
         return "/unigrav <sources|accel|mass [self] [kg]|chunk <get|set|clear>"
                 + "|world <get|set|enable|disable|reset>|pos1|pos2"
-                + "|region <add|list|remove|clear>>";
+                + "|region <add|list|remove|clear>|reload floors|mode walk|flight|hover on|off>";
     }
 
     @Override
@@ -90,6 +110,7 @@ public final class UnigravCommand extends CommandBase {
             throw new CommandException(getUsage(sender));
         }
         switch (args[0]) {
+            case "mode", "hover" -> executeMobility(server, sender, args);
             case "sources" -> executeSources(sender);
             case "accel" -> executeAccel(sender);
             case "world" -> executeWorld(sender, args);
@@ -98,7 +119,62 @@ public final class UnigravCommand extends CommandBase {
             case "pos1" -> executePos(sender, args, true);
             case "pos2" -> executePos(sender, args, false);
             case "region" -> executeRegion(sender, args);
+            case "reload" -> executeReload(server, sender, args);
             default -> throw new CommandException(getUsage(sender));
+        }
+    }
+
+    private void executeMobility(MinecraftServer server, ICommandSender sender, String[] args) throws CommandException {
+        if (args.length != 2) throw new CommandException("/unigrav mode walk|flight; /unigrav hover on|off");
+        if (!server.isCallingFromMinecraftThread()) throw new CommandException("Mobility intent requires the server owner thread");
+        EntityPlayerMP actor = getCommandSenderAsPlayer(sender);
+        var physics = PlayerPhysicsServer.INSTANCE;
+        var current = physics.mobilityState(actor).orElseThrow(() -> new CommandException("No current physical owner"));
+        var mode = current.mode(); var hover = current.hover();
+        try {
+            if ("mode".equals(args[0])) mode = PlayerMobilityIntent.Mode.valueOf(args[1].toUpperCase(Locale.ROOT));
+            else hover = PlayerMobilityIntent.Hover.valueOf(args[1].toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException rejected) {
+            throw new CommandException("/unigrav mode walk|flight; /unigrav hover on|off");
+        }
+        if (!physics.requestMobility(actor, mode, hover)) throw new CommandException("Mobility intent rejected: release Space and wait for the current owner");
+        sender.sendMessage(new TextComponentString("Mobility intent accepted: " + mode + ", hover " + hover));
+    }
+
+    private void executeReload(MinecraftServer server, ICommandSender sender, String[] args)
+            throws CommandException {
+        if (args.length != 2 || !"floors".equals(args[1])) {
+            throw new CommandException("/unigrav reload floors");
+        }
+        if (!sender.canUseCommand(2, "unigrav.reload.floors")) {
+            throw new CommandException("commands.generic.permission");
+        }
+        if (!server.isCallingFromMinecraftThread()) {
+            throw new CommandException("Floor reload must run on the authoritative server owner thread.");
+        }
+        Path file = floorConfigFileOverride == null
+                ? Loader.instance().getConfigDir().toPath().resolve("unigrav/floors.json")
+                : floorConfigFileOverride;
+        try {
+            FloorRuntime.ReloadReceipt receipt = FloorWorldFields.reloadFloors(server, file);
+            sender.sendMessage(new TextComponentString(String.format(Locale.ROOT,
+                    "Published floors revision %d across %d loaded world(s) and %d loaded chunk(s).",
+                    receipt.revision(), receipt.worlds(), receipt.loadedChunks())));
+        } catch (FloorConfigException failure) {
+            UnigravMod.LOGGER.error("Floor reload rejected during {} at {} in {}", failure.stage(),
+                    failure.field(), failure.file(), failure);
+            throw new CommandException("Floor reload failed during " + failure.stage() + " at "
+                    + failure.field() + "; the active generation was retained.");
+        } catch (FloorRuntime.PublishedRetirementFailure failure) {
+            UnigravMod.LOGGER.error("Floor revision {} was published but prior-generation retirement failed",
+                    failure.publishedRevision(), failure);
+            throw new CommandException("Floor revision " + failure.publishedRevision()
+                    + " is active, but prior-generation cleanup failed; see server log.");
+        } catch (FloorRuntime.ReloadFailure failure) {
+            UnigravMod.LOGGER.error("Floor reload failed during {}; the previous generation remains active",
+                    failure.stage(), failure);
+            throw new CommandException("Floor reload failed during " + failure.stage()
+                    + "; the active generation was retained.");
         }
     }
 
@@ -135,7 +211,7 @@ public final class UnigravCommand extends CommandBase {
         if (!sender.canUseCommand(2, "unigrav.region")) {
             throw new CommandException("commands.generic.permission");
         }
-        if (!UnigravMod.regionGravity.isLoaded()) {
+        if (!UnigravMod.regionGravity.isLoaded(commandWorld(sender))) {
             throw new CommandException("No world loaded");
         }
         if (args.length < 2) {
@@ -144,7 +220,7 @@ public final class UnigravCommand extends CommandBase {
         switch (args[1]) {
             case "list" -> {
                 Map<String, RegionGravityContribution> regions =
-                        UnigravMod.regionGravity.regions();
+                        UnigravMod.regionGravity.regions(commandWorld(sender));
                 if (regions.isEmpty()) {
                     sender.sendMessage(new TextComponentString("No gravity regions."));
                     return;
@@ -158,7 +234,7 @@ public final class UnigravCommand extends CommandBase {
                 if (args.length < 3) {
                     throw new CommandException("/unigrav region remove <name>");
                 }
-                if (UnigravMod.regionGravity.remove(args[2])) {
+                if (UnigravMod.regionGravity.remove(commandWorld(sender), args[2])) {
                     sender.sendMessage(new TextComponentString(
                             "Removed gravity region " + args[2] + "."));
                 } else {
@@ -166,7 +242,7 @@ public final class UnigravCommand extends CommandBase {
                 }
             }
             case "clear" -> sender.sendMessage(new TextComponentString(String.format(
-                    "Removed %d gravity region(s).", UnigravMod.regionGravity.clear())));
+                    "Removed %d gravity region(s).", UnigravMod.regionGravity.clear(commandWorld(sender)))));
             case "add" -> executeRegionAdd(sender, args);
             default -> throw new CommandException(
                     "/unigrav region <add|list|remove <name>|clear>");
@@ -245,7 +321,7 @@ public final class UnigravCommand extends CommandBase {
             default -> throw new CommandException(
                     "/unigrav region add <box|sphere|cyl> <dir|center> …");
         }
-        String name = UnigravMod.regionGravity.add(
+        String name = UnigravMod.regionGravity.add(commandWorld(sender), 
                 new RegionGravityContribution(shape, mode));
         if (name == null) {
             throw new CommandException("No world loaded");
@@ -310,7 +386,7 @@ public final class UnigravCommand extends CommandBase {
         if (!sender.canUseCommand(2, "unigrav.chunk")) {
             throw new CommandException("commands.generic.permission");
         }
-        if (!UnigravMod.chunkGravity.isLoaded()) {
+        if (!UnigravMod.chunkGravity.isLoaded(commandWorld(sender))) {
             throw new CommandException("No world loaded");
         }
         if (args.length < 2) {
@@ -320,7 +396,7 @@ public final class UnigravCommand extends CommandBase {
         int chunkZ = (int) Math.floor(sender.getPosition().getZ()) >> 4;
         switch (args[1]) {
             case "get" -> {
-                Vec3 acc = UnigravMod.chunkGravity.get(chunkX, chunkZ);
+                Vec3 acc = UnigravMod.chunkGravity.get(commandWorld(sender), chunkX, chunkZ);
                 sender.sendMessage(new TextComponentString(acc == null
                         ? String.format("Chunk (%d, %d): no override.", chunkX, chunkZ)
                         : String.format(Locale.ROOT,
@@ -334,7 +410,7 @@ public final class UnigravCommand extends CommandBase {
                 }
                 Vec3 target = new Vec3(parseAcceleration(args[2]),
                         parseAcceleration(args[3]), parseAcceleration(args[4]));
-                if (UnigravMod.chunkGravity.set(chunkX, chunkZ, target)) {
+                if (UnigravMod.chunkGravity.set(commandWorld(sender), chunkX, chunkZ, target)) {
                     sender.sendMessage(new TextComponentString(String.format(Locale.ROOT,
                             "Chunk (%d, %d) gravity set to (%.4g, %.4g, %.4g) m/s^2 (%.3g G);"
                                     + " adds to world gravity.",
@@ -343,7 +419,7 @@ public final class UnigravCommand extends CommandBase {
                 }
             }
             case "clear" -> {
-                if (UnigravMod.chunkGravity.set(chunkX, chunkZ, null)) {
+                if (UnigravMod.chunkGravity.set(commandWorld(sender), chunkX, chunkZ, null)) {
                     sender.sendMessage(new TextComponentString(
                             String.format("Chunk (%d, %d) gravity override cleared.",
                                     chunkX, chunkZ)));
@@ -532,12 +608,14 @@ public final class UnigravCommand extends CommandBase {
         });
     }
 
-    private void executeAccel(ICommandSender sender) {
+    private void executeAccel(ICommandSender sender) throws CommandException {
         Vec3d pos = sender.getPositionVector();
         double time = sender.getEntityWorld().getTotalWorldTime()
                 * GravityEntityBinder.TICK_SECONDS;
-        Vec3 acc = GravityFields.get().accelerationAt(
-                new Vec3(pos.x, pos.y, pos.z), time);
+        AmbientWorldFields.Decision decision = AmbientWorldFields.capture(commandWorld(sender));
+        if (decision == null) throw new CommandException("Ambient gravity world unavailable");
+        Vec3 acc = decision.accelerationAt(new Vec3(pos.x, pos.y, pos.z), time);
+        if (!decision.isCurrent()) throw new CommandException("Ambient gravity changed during query");
         sender.sendMessage(new TextComponentString(String.format(Locale.ROOT,
                 "Field acceleration at (%.2f, %.2f, %.2f): (%.4g, %.4g, %.4g) m/s^2, |a| = %.4g m/s^2",
                 pos.x, pos.y, pos.z, acc.x(), acc.y(), acc.z(), acc.norm())));
@@ -548,7 +626,7 @@ public final class UnigravCommand extends CommandBase {
             throw new CommandException("commands.generic.permission");
         }
         WorldGravityManager manager = UnigravMod.worldGravity;
-        if (!manager.isLoaded()) {
+        if (!manager.isLoaded(commandWorld(sender))) {
             throw new CommandException("No world loaded");
         }
         if (args.length < 2) {
@@ -556,26 +634,26 @@ public final class UnigravCommand extends CommandBase {
         }
         switch (args[1]) {
             case "get" -> {
-                Vec3 acc = manager.getAcceleration();
+                Vec3 acc = manager.getAcceleration(commandWorld(sender));
                 sender.sendMessage(new TextComponentString(String.format(Locale.ROOT,
                         "World gravity: (%.4g, %.4g, %.4g) m/s^2, |a| = %.4g m/s^2 (%.3g G), %s",
                         acc.x(), acc.y(), acc.z(), acc.norm(),
                         acc.norm() / GravityEntityBinder.VANILLA_PLAYER_GRAVITY,
-                        manager.isEnabled() ? "enabled" : "disabled")));
+                        manager.isEnabled(commandWorld(sender)) ? "enabled" : "disabled")));
             }
             case "set" -> executeWorldSet(sender, manager, args);
             case "enable" -> {
-                if (manager.setWorldGravity(null, Boolean.TRUE)) {
+                if (manager.setWorldGravity(commandWorld(sender), null, Boolean.TRUE)) {
                     sender.sendMessage(new TextComponentString("World gravity enabled."));
                 }
             }
             case "disable" -> {
-                if (manager.setWorldGravity(null, Boolean.FALSE)) {
+                if (manager.setWorldGravity(commandWorld(sender), null, Boolean.FALSE)) {
                     sender.sendMessage(new TextComponentString("World gravity disabled."));
                 }
             }
             case "reset" -> {
-                if (manager.resetToDefault()) {
+                if (manager.resetToDefault(commandWorld(sender))) {
                     sender.sendMessage(new TextComponentString(String.format(Locale.ROOT,
                             "World gravity reset to config default (0, -%.4g, 0) m/s^2.",
                             UnigravConfig.worldGravityStrength)));
@@ -583,6 +661,11 @@ public final class UnigravCommand extends CommandBase {
             }
             default -> throw new CommandException("/unigrav world <get|set|enable|disable|reset>");
         }
+    }
+
+    private static WorldServer commandWorld(ICommandSender sender) throws CommandException {
+        if (sender.getEntityWorld() instanceof WorldServer world) return world;
+        throw new CommandException("No server world for command sender");
     }
 
     private void executeWorldSet(ICommandSender sender, WorldGravityManager manager, String[] args)
@@ -603,7 +686,7 @@ public final class UnigravCommand extends CommandBase {
         } else {
             throw new CommandException("/unigrav world set <ax> <ay> <az> | up|down [strength]");
         }
-        if (manager.setWorldGravity(target, null)) {
+        if (manager.setWorldGravity(commandWorld(sender), target, null)) {
             sender.sendMessage(new TextComponentString(String.format(Locale.ROOT,
                     "World gravity set to (%.4g, %.4g, %.4g) m/s^2 (%.3g G).",
                     target.x(), target.y(), target.z(),

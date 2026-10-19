@@ -1,0 +1,276 @@
+import groovy.json.JsonOutput
+import java.security.MessageDigest
+
+// These native callbacks require the normal Mixin host. The same assertions remain mandatory in check/build.
+sourceSets {
+    nativeIntegration {
+        java.srcDir('src/nativeIntegration/java')
+        compileClasspath += sourceSets.main.output + sourceSets.test.output + sourceSets.main.compileClasspath
+        runtimeClasspath += sourceSets.main.output + sourceSets.main.runtimeClasspath
+    }
+}
+configurations {
+    nativeIntegrationImplementation.extendsFrom(testImplementation)
+    nativeIntegrationRuntimeOnly.extendsFrom(testRuntimeOnly)
+}
+def observerAgent = providers.gradleProperty('nativePoolObserverAgent').map { file(it) }
+def observerBootstrap = providers.gradleProperty('nativePoolObserverBootstrap').map { file(it) }
+def agentHash = 'C96A75FE39FE647AB6A107DD3AD4554140C290B1E21A0BA49C853596DC9F174C'
+def bootstrapHash = 'BD60B90A87149E447B883F7C9834F86FE1D2369CAB43E7E436E4C3FDC55A3C87'
+dependencies {
+    nativeIntegrationImplementation 'org.junit.platform:junit-platform-launcher:6.0.3'
+    nativeIntegrationCompileOnly files(observerBootstrap)
+}
+tasks.named('compileNativeIntegrationJava', JavaCompile).configure {
+    dependsOn tasks.named('testClasses')
+    sourceCompatibility = targetCompatibility = JavaVersion.VERSION_25
+}
+tasks.named('test', Test).configure {
+    useJUnitPlatform { excludeTags 'requires-native-transform' }
+}
+
+def digestBytes = { byte[] value -> HexFormat.of().withUpperCase().formatHex(MessageDigest.getInstance('SHA-256').digest(value)) }
+def digestFile = { File target ->
+    if (!target.isFile()) throw new GradleException("Missing native gate identity input: ${target}")
+    def hash = MessageDigest.getInstance('SHA-256')
+    target.withInputStream { stream ->
+        byte[] buffer = new byte[8192]; int read
+        while ((read = stream.read(buffer)) != -1) hash.update(buffer, 0, read)
+    }
+    HexFormat.of().withUpperCase().formatHex(hash.digest())
+}
+def describeFiles = { Collection<File> files ->
+    // Preserve first-file canonical identity while avoiding Groovy unique's repeated key comparisons.
+    def canonicalFiles = new LinkedHashMap<String, File>()
+    files.findAll { it.isFile() }.each { File input ->
+        String canonical = input.canonicalPath
+        if (!canonicalFiles.containsKey(canonical)) canonicalFiles.put(canonical, input)
+    }
+    def rows = canonicalFiles.values().collect { File input ->
+        [path: project.relativePath(input).replace('\\','/'), bytes: input.length(), sha256: digestFile(input)]
+    }.sort { it.path }
+    [sha256: digestBytes(JsonOutput.toJson(rows).getBytes('UTF-8')), files: rows]
+}
+def describeSource = {
+    describeFiles(fileTree(projectDir) {
+        include 'src/**', 'gradle/**', 'build.gradle', 'settings.gradle', 'gradle.properties', 'gradlew', 'gradlew.bat'
+    }.files)
+}
+def describeMain = {
+    def files = []
+    sourceSets.main.output.files.each { File output ->
+        if (output.isDirectory()) files.addAll(fileTree(output).files)
+        else if (output.isFile()) files.add(output)
+    }
+    describeFiles(files)
+}
+def nativeCaseSetSha256 = 'A878EFC56BCC17EFE80F3A6988856FF420BEA32CE45638833DA15397F29538F8'
+def validateNativeCaseIds = { List<String> ids ->
+    String actual = digestBytes((ids.sort(false).join('\n') + '\n').getBytes('UTF-8'))
+    if (ids.size() != 40 || ids.toSet().size() != 40 || actual != nativeCaseSetSha256)
+        throw new GradleException('Native FML case identities do not match the exact mandatory 40-case set')
+    actual
+}
+def nativeCaseContract = tasks.register('cardinalNativeCaseSetContractTest') {
+    group = 'verification'
+    doLast {
+        // Exact approved JUnit IDs: original 39 plus landing SOURCE03 callback-origin regression.
+        def approved = [
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.floor.CardinalNativeEntryIntegrationTest]/[method:actualNestedSuccessorWaterCompletesBeforeOldActorUnwind()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.floor.CardinalNativeEntryIntegrationTest]/[method:actualPreexhaustedFrameNeverDispatchesNativePreflightOrRetainsPool()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.floor.CardinalNativeEntryIntegrationTest]/[method:nativeOverrideCannotClearLatchByCatchingWaterAbort()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.floor.CardinalNativeEntryIntegrationTest]/[method:noOwnerContextKeepsActualNativeCallbackThrowable()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.floor.CardinalNativeEntryIntegrationTest]/[test-template:actualAreaLoadedPreflightFencesBothNativeReturnBranches(boolean)]/[test-template-invocation:#1]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.floor.CardinalNativeEntryIntegrationTest]/[test-template:actualAreaLoadedPreflightFencesBothNativeReturnBranches(boolean)]/[test-template-invocation:#2]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.floor.CardinalNativeEntryIntegrationTest]/[test-template:actualMpLandingKeepsBothEffectsBranchesAndFallenCallbackOnce(boolean)]/[test-template-invocation:#1]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.floor.CardinalNativeEntryIntegrationTest]/[test-template:actualMpLandingKeepsBothEffectsBranchesAndFallenCallbackOnce(boolean)]/[test-template-invocation:#2]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.floor.CardinalNativeEntryIntegrationTest]/[test-template:actualWorldWaterUnwindReleasesItsActualPoolObjectOnce(java.lang.String)]/[test-template-invocation:#1]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.floor.CardinalNativeEntryIntegrationTest]/[test-template:actualWorldWaterUnwindReleasesItsActualPoolObjectOnce(java.lang.String)]/[test-template-invocation:#2]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.floor.CardinalNativeEntryIntegrationTest]/[test-template:actualWorldWaterUnwindReleasesItsActualPoolObjectOnce(java.lang.String)]/[test-template-invocation:#3]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.floor.PlayerPhysicsServerIntegrationTest]/[test-template:returningCardinalCallbackTeleportCannotWriteSuccessorMotionFallOrTail(java.lang.String, java.nio.file.Path)]/[test-template-invocation:#1]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.floor.PlayerPhysicsServerIntegrationTest]/[test-template:returningCardinalCallbackTeleportCannotWriteSuccessorMotionFallOrTail(java.lang.String, java.nio.file.Path)]/[test-template-invocation:#2]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.floor.PlayerPhysicsServerIntegrationTest]/[test-template:returningCardinalCallbackTeleportCannotWriteSuccessorMotionFallOrTail(java.lang.String, java.nio.file.Path)]/[test-template-invocation:#3]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.CardinalNativeBoundaryTest]/[method:callbackExceptionRemainsPrimaryEvenWhenItRetiresOwner()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.CardinalNativeBoundaryTest]/[method:callbackThrowingTheAuthorityExceptionTypeRemainsAnExecutionFailure()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.CardinalNativeBoundaryTest]/[method:caughtForeignCallbackAbortRemainsPrimaryAndRetiresOnlyOldOperation()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.CardinalNativeBoundaryTest]/[method:caughtInternalOverrideFailureCannotResumeOldNativeTail()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.CardinalNativeBoundaryTest]/[method:externalCallbackSuspendsOnlyOldFrameAndNewOperationCanComplete()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.CardinalNativeBoundaryTest]/[method:foreignAbortFromProofAlsoLatchesAnOwnExecutionFailure()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.CardinalNativeBoundaryTest]/[method:noContextCallsOriginalOnceAndPreservesOriginalThrowable()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.CardinalNativeBoundaryTest]/[method:realSharedBudgetFailureIsLatchedWithExactCauseAndNoCallback()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.CardinalOwnerCallbackBoundaryTest]/[test-template:actualLandingRelocationStopsWalkingAndWorldTailBeforeAnySuccessorWrites(wi.unigrav.core.player.CardinalFrame, boolean)]/[test-template-invocation:#1]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.CardinalOwnerCallbackBoundaryTest]/[test-template:actualLandingRelocationStopsWalkingAndWorldTailBeforeAnySuccessorWrites(wi.unigrav.core.player.CardinalFrame, boolean)]/[test-template-invocation:#2]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.CardinalOwnerCallbackBoundaryTest]/[test-template:actualLandingRelocationStopsWalkingAndWorldTailBeforeAnySuccessorWrites(wi.unigrav.core.player.CardinalFrame, boolean)]/[test-template-invocation:#3]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.CardinalOwnerCallbackBoundaryTest]/[test-template:actualLandingRelocationStopsWalkingAndWorldTailBeforeAnySuccessorWrites(wi.unigrav.core.player.CardinalFrame, boolean)]/[test-template-invocation:#4]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.CardinalOwnerCallbackBoundaryTest]/[test-template:exhaustedOwnerFramePreventsFirstActualTailDispatchWithoutRefund(wi.unigrav.core.player.CardinalFrame)]/[test-template-invocation:#1]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.CardinalOwnerCallbackBoundaryTest]/[test-template:exhaustedOwnerFramePreventsFirstActualTailDispatchWithoutRefund(wi.unigrav.core.player.CardinalFrame)]/[test-template-invocation:#2]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.InstalledMovementStatTest]/[method:caughtPredicateReentryRemainsFailureBeforeAddStat()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.InstalledMovementStatTest]/[method:exhaustedSameFrameBudgetCannotDispatchNativeStatisticsAndDoesNotRefund()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.InstalledMovementStatTest]/[method:missingOwnerScopeCannotMakeAnUnmeteredAttempt()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.InstalledMovementStatTest]/[method:noInstalledRequestNativeAndCardinalScopeEachCallNativeOnlyOnce()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.InstalledMovementStatTest]/[method:oneJournalCannotBeConsumedThroughAnotherEndpointObject()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.InstalledMovementStatTest]/[method:predicateAuthorityLossStopsBeforeFirstStatAndConsumesJournalAttempt()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.InstalledMovementStatTest]/[method:predicateThrowableIsOriginalAndLexicalCleanupAllowsLaterUnownedNativeCall()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.InstalledMovementStatTest]/[method:purePoseTailMakesNoNativeStatisticsCall()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.InstalledMovementStatTest]/[method:realFreeFinalizerAccountsNetTranslationOnceAndCannotReplay()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.InstalledMovementStatTest]/[method:realSlideRoundsOneNetWorldDeltaRatherThanEachSegment()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.InstalledMovementStatTest]/[method:sequentialNativeSuperReentryCannotApplyASecondStat()]",
+            "[engine:junit-jupiter]/[class:wi.unigrav.core.player.InstalledMovementStatTest]/[method:successfulAddStatThenAuthorityLossCannotReachExhaustionOrReplay()]"
+        ]
+        validateNativeCaseIds(approved)
+        def reject = { List<String> candidate ->
+            boolean rejected = false
+            try { validateNativeCaseIds(candidate) } catch (GradleException expected) { rejected = true }
+            if (!rejected) throw new GradleException('Native case-set negative contract unexpectedly passed')
+        }
+        reject(approved.take(39))
+        reject(approved + ['[engine:junit-jupiter]/[class:unexpected]/[method:extra()]'])
+        reject(approved.take(39) + ['[engine:junit-jupiter]/[class:unexpected]/[method:replacement()]'])
+        reject(approved.take(39) + [approved.first()])
+    }
+}
+
+def invocation = java.util.UUID.randomUUID().toString()
+def reportDirectory = layout.buildDirectory.dir("reports/cardinal-native/${invocation}")
+def result = reportDirectory.map { it.file('result.txt') }
+def fixture = tasks.register('cardinalNativeFixtureJar', Jar) {
+    dependsOn tasks.named('nativeIntegrationClasses'), tasks.named('testClasses')
+    archiveFileName = 'ug-cardinal-native-fixture.jar'
+    destinationDirectory = layout.buildDirectory.dir('cardinal-native-fixture')
+    from sourceSets.nativeIntegration.output
+    from sourceSets.test.output
+}
+def releaseJar = tasks.named(enable_shadow.toBoolean() ? 'remapShadowJar' : 'remapJar')
+def identity = null
+def identityHash = null
+def gateVerified = false
+def nativeStateBefore = null
+def observedJunit = null
+def freshStateProof = null
+// This value is only set after this invocation actually verifies all 40 normal-FML cases.
+// Historical cross-script key retained; it now carries only the exact 40-case contract.
+project.ext.ugFreshNative39StateTransition = { -> gateVerified ? freshStateProof : null }
+File observedMods = null
+File observedChb = null
+def jarInputs = { File directory ->
+    if (!directory.isDirectory()) throw new GradleException("Missing native host dependency directory: ${directory}")
+    describeFiles(directory.listFiles().findAll { it.isFile() && it.name.endsWith('.jar') })
+}
+
+def validateCurrentIdentity = {
+    project.ext.ugVerifyHostMappingIdentity.call()
+    if (identity == null || identityHash == null) throw new GradleException('Native FML gate did not create this invocation identity')
+    if (describeSource().sha256 != identity.source.sha256 || describeMain().sha256 != identity.mainOutput.sha256)
+        throw new GradleException('Native gate source or main output changed after host observation')
+    if (digestFile(fixture.get().archiveFile.get().asFile) != identity.fixtureSha256
+            || digestFile(releaseJar.get().archiveFile.get().asFile) != identity.ugArtifactSha256)
+        throw new GradleException('Native gate fixture or UG artifact identity changed')
+    if (digestFile(observerAgent.get()) != identity.observerAgentSha256
+            || digestFile(observerBootstrap.get()) != identity.observerBootstrapSha256
+            || jarInputs(observedMods).sha256 != identity.runtimeMods.sha256
+            || jarInputs(observedChb).sha256 != identity.chbArtifacts.sha256)
+        throw new GradleException('Native gate observer or runtime dependency identity changed')
+}
+def gate = tasks.register('cardinalNativeIntegrationTest') {
+    group = 'verification'
+    description = 'Mandatory real FML native callback acceptance for this source and release artifact.'
+    dependsOn fixture, releaseJar, tasks.named('runClient'), nativeCaseContract
+    doNotTrackState('Requires a fresh normal-client report bound to this invocation and artifact')
+    doLast {
+        if (tasks.named('runClient', JavaExec).get().executionResult.get().exitValue != 0)
+            throw new GradleException('Native FML host did not exit normally with code zero')
+        File report = result.get().asFile
+        String header = "PASS tests=40 started=40 unique=40 succeeded=40 failed=0 aborted=0 skipped=0\nnonce=${invocation}\nidentity=${identityHash}\ncaseSetSha256=${nativeCaseSetSha256}\n"
+        if (!report.isFile() || !report.getText('UTF-8').startsWith(header))
+            throw new GradleException("Native FML acceptance has no fresh matching 40-case report: ${report}")
+        def cases = report.readLines('UTF-8').findAll { it.startsWith('SUCCESSFUL [engine:') }
+        def caseIds = cases.collect { String line ->
+            int end = line.indexOf('] ')
+            if (end < 0) throw new GradleException('Native FML case line has no complete UniqueId delimiter')
+            line.substring('SUCCESSFUL '.length(), end + 1)
+        }
+        validateNativeCaseIds(caseIds)
+        validateCurrentIdentity()
+        def transition = null
+        if (nativeStateBefore != null) {
+            transition = (project.ext.ugSleepNativeState.afterNative.call(nativeStateBefore, reportDirectory.get().asFile, observedJunit)
+                    + [nonce: invocation, tests: 40, started: 40, unique: 40, caseSetSha256: nativeCaseSetSha256, succeeded: 40, failed: 0, aborted: 0, skipped: 0])
+        }
+        def receipt = [status:'PASS', nonce:invocation, identitySha256:identityHash,
+                       reportSha256:digestFile(report), tests:40, started:40, unique:40, caseSetSha256:nativeCaseSetSha256, succeeded:40, failed:0, aborted:0, skipped:0,
+                       identity:identity, stateTransition:transition]
+        File verifiedReceipt = reportDirectory.get().file('verified-receipt.json').asFile
+        java.nio.file.Files.writeString(verifiedReceipt.toPath(), JsonOutput.prettyPrint(JsonOutput.toJson(receipt)),
+                java.nio.charset.StandardCharsets.UTF_8, java.nio.file.StandardOpenOption.CREATE_NEW,
+                java.nio.file.StandardOpenOption.WRITE)
+        if (transition != null) freshStateProof = [nonce: invocation, identityHash: identityHash,
+                receipt: verifiedReceipt.canonicalPath, sha256: digestFile(verifiedReceipt), transition: transition]
+        gateVerified = true
+    }
+}
+tasks.named('check').configure { dependsOn gate }
+tasks.named('build').configure { dependsOn gate }
+['check','build'].each { String taskName ->
+    tasks.named(taskName).configure {
+        doLast {
+            if (!gateVerified) throw new GradleException("${taskName} did not execute its mandatory fresh native FML gate")
+            validateCurrentIdentity()
+        }
+    }
+}
+tasks.named('runClient', JavaExec).configure { JavaExec host ->
+    mustRunAfter fixture, releaseJar, tasks.named('test'), tasks.named('sleepNativeFixtureJar')
+    doFirst {
+        if (gradle.taskGraph.hasTask(gate.get())) {
+            if (gradle.taskGraph.hasTask(tasks.named('clientIntegrationTest').get()))
+                throw new GradleException('Run client-route and native fixture profiles in separate normal FML invocations')
+            if (digestFile(observerAgent.get()) != agentHash || digestFile(observerBootstrap.get()) != bootstrapHash)
+                throw new GradleException('Frozen native pool observer identity mismatch')
+            project.ext.ugPrepareHostMappingIdentity.call(reportDirectory.get().asFile)
+            def before = host.classpath.files.collect { it.absolutePath }.sort()
+            def junit = sourceSets.nativeIntegration.runtimeClasspath.filter { dependency ->
+                ['junit-', 'opentest4j-', 'apiguardian-'].any { dependency.name.startsWith(it) }
+            }
+            host.classpath = host.classpath.plus(junit)
+            File mods = new File(host.workingDir, 'mods'); mods.mkdirs()
+            def modFiles = mods.listFiles().findAll { it.isFile() && it.name.endsWith('.jar') }
+            if (!modFiles.any { it.name.toLowerCase().contains('fugue') }
+                    || !modFiles.any { it.name.toLowerCase().contains('scalar') })
+                throw new GradleException('Normal native FML host requires Fugue and scalar')
+            if (modFiles.any { it.name == 'ug-client-route-integration-fixture.jar' })
+                throw new GradleException('Native host mods directory contains the other fixture profile')
+            java.nio.file.Files.copy(fixture.get().archiveFile.get().asFile.toPath(),
+                    new File(mods, 'ug-cardinal-native-fixture.jar').toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            File directory = reportDirectory.get().asFile; directory.mkdirs()
+            new File(directory, 'host-classpath.txt').setText('NORMAL HOST\n'+before.join('\n')
+                    +'\nWITH JUNIT\n'+host.classpath.files.collect { it.absolutePath }.sort().join('\n')+'\n', 'UTF-8')
+            def chbPin = new Properties()
+            file('gradle/chb-artifact.properties').withInputStream { chbPin.load(it) }
+            observedMods = mods
+            observedChb = file(providers.gradleProperty('chb_artifact_dir').getOrElse(
+                    new File(gradle.gradleUserHomeDir, 'artifacts/UG-CHB-CAPSULE-V1/'+chbPin.getProperty('candidate')).path))
+            identity = [nonce:invocation, source:describeSource(), mainOutput:describeMain(),
+                        fixtureSha256:digestFile(fixture.get().archiveFile.get().asFile),
+                        ugArtifact:releaseJar.get().archiveFile.get().asFile.name,
+                        ugArtifactSha256:digestFile(releaseJar.get().archiveFile.get().asFile),
+                        observerAgentSha256:digestFile(observerAgent.get()), observerBootstrapSha256:digestFile(observerBootstrap.get()),
+                        workingDirectory:host.workingDir.canonicalPath,
+                        runtimeMods:jarInputs(observedMods), chbArtifacts:jarInputs(observedChb)]
+            if (gradle.taskGraph.hasTask(tasks.named('sleepNativeEvidenceGate').get())
+                    || providers.gradleProperty('sleepEvidenceReceipt').isPresent()) {
+                observedJunit = junit.files.toList()
+                nativeStateBefore = project.ext.ugSleepNativeState.beforeNative.call(directory, observedJunit)
+                identity.stateBefore = nativeStateBefore
+            }
+            String encoded = JsonOutput.toJson(identity); identityHash = digestBytes(encoded.getBytes('UTF-8'))
+            new File(directory,'input-identity.json').setText(JsonOutput.prettyPrint(encoded),'UTF-8')
+            host.jvmArgs "-javaagent:${observerAgent.get().absolutePath}=${new File(directory,'pool-agent').absolutePath}"
+            host.systemProperty 'unigrav.nativeIntegration.result', result.get().asFile.absolutePath
+            host.systemProperty 'unigrav.nativeIntegration.nonce', invocation
+            host.systemProperty 'unigrav.nativeIntegration.identity', identityHash
+            host.systemProperty 'mixin.debug.export', 'true'
+            host.systemProperty 'junit.jupiter.execution.parallel.enabled', 'false'
+            project.ext.ugVerifyHostMappingIdentity.call()
+        }
+    }
+}

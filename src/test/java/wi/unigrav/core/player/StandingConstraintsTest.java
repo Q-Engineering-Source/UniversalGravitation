@@ -26,6 +26,30 @@ class StandingConstraintsTest {
     private static final StandingConstraints.Surface EAST_SURFACE = surface(5, 6, 7, Face.EAST);
 
     @Test
+    void endpointQualificationRejectsDepartedOrReplacedBootDespiteSameFloorAndRetainedMemory() {
+        var floor = Map.of(CardinalFrame.Y_POS, new StandingConstraints.FaceEvidence(12,
+                Set.of(StandingConstraints.ConstraintSource.FLOOR)));
+        var original = available(Vec3.ZERO, Vec3.ZERO, floor,
+                List.of(boot(UP_SURFACE, 0.25, TIER)), Optional.empty());
+        var first = resolve(StandingConstraints.State.initial(), 1, false, original);
+        var departed = available(Vec3.ZERO, Vec3.ZERO, floor, List.of(), Optional.empty());
+        var after = resolve(first.nextState(), 2, false, departed);
+        assertEquals(first.targetReference(), after.targetReference());
+        assertEquals(first.bootMemory(), after.bootMemory(), "history alone cannot prove current qualification");
+        assertFalse(PlayerPhysicsStep.FreeStandingQualification.from(original)
+                .equals(PlayerPhysicsStep.FreeStandingQualification.from(departed)));
+        var replacement = available(Vec3.ZERO, Vec3.ZERO, floor,
+                List.of(boot(surface(3, 3, 4, Face.UP), 0.25, TIER)), Optional.empty());
+        assertEquals(first.targetReference(), resolve(first.nextState(), 2, false, replacement).targetReference());
+        assertFalse(PlayerPhysicsStep.FreeStandingQualification.from(original)
+                .equals(PlayerPhysicsStep.FreeStandingQualification.from(replacement)));
+        var nearerSameProducer = available(Vec3.ZERO, Vec3.ZERO, floor,
+                List.of(boot(UP_SURFACE, 0.125, TIER)), Optional.empty());
+        assertEquals(PlayerPhysicsStep.FreeStandingQualification.from(original),
+                PlayerPhysicsStep.FreeStandingQualification.from(nearerSameProducer));
+    }
+
+    @Test
     void defaultReachAndTierFalloffCaptureAcrossGapWithoutClaimingAttachment() {
         var near = boot(UP_SURFACE, 1.5, TIER);
         var outsideReach = boot(UP_SURFACE, 1.5000001, TIER);
@@ -71,26 +95,61 @@ class StandingConstraintsTest {
     }
 
     @Test
-    void currentEligibleReferenceIsStableBeforeActualSupportAndScores() {
+    void legacyMixedReferenceRemainsACompositeFallbackWithoutBecomingPureFloorStrength() {
+        var evidence = new StandingConstraints.Evidence(StandingConstraints.Availability.AVAILABLE,
+                Vec3.ZERO, Vec3.ZERO,
+                Map.of(CardinalFrame.X_POS, new StandingConstraints.FaceEvidence(13.0,
+                        Set.of(StandingConstraints.ConstraintSource.FLOOR,
+                                StandingConstraints.ConstraintSource.NATURAL_BACKGROUND))),
+                List.of(), Optional.empty());
+
+        assertEquals(0.0, evidence.floorGravityStrengths().strength(CardinalFrame.X_POS),
+                "the legacy aggregate has no recoverable floor-only magnitude");
+        var result = resolve(StandingConstraints.State.initial(), 1, false, evidence);
+        assertEquals(Optional.of(CardinalFrame.X_POS), result.targetReference(),
+                "a valid legacy composite still retains its historical generic reference behavior");
+    }
+
+    @Test
+    void actualSupportPrecedesSameClassReferenceContinuityAndScores() {
         var previous = new StandingConstraints.State(StandingConstraints.BootPhase.NONE, Optional.empty(),
                 Optional.of(CardinalFrame.Z_POS), Optional.empty(), -1);
         var result = resolve(previous, 3, false, available(Vec3.ZERO, Vec3.ZERO,
                 scores(CardinalFrame.Z_POS, 1.0, CardinalFrame.X_POS, 99.0), List.of(), Optional.of(EAST_SURFACE)));
-        assertEquals(Optional.of(CardinalFrame.Z_POS), result.targetReference());
+        assertEquals(Optional.of(CardinalFrame.X_POS), result.targetReference());
         assertEquals(Optional.of(EAST_SURFACE), result.actualSupport());
     }
 
     @Test
-    void boundBootWinsAndActualSupportDoesNotBecomeAttachment() {
+    void floorReferenceWinsWithoutFabricatingBootAttachment() {
         var memory = new StandingConstraints.BootMemory(UP_SURFACE, TIER);
         var previous = new StandingConstraints.State(StandingConstraints.BootPhase.IN_RANGE_UNATTACHED, Optional.of(memory),
                 Optional.of(CardinalFrame.X_POS), Optional.empty(), -1);
         var result = resolve(previous, 4, false, available(Vec3.ZERO, Vec3.ZERO,
                 scores(CardinalFrame.X_POS, 100.0),
                 List.of(boot(UP_SURFACE, 1.0, TIER), boot(EAST_SURFACE, 0.0, TIER)), Optional.of(EAST_SURFACE)));
-        assertEquals(Optional.of(CardinalFrame.Y_POS), result.targetReference());
-        assertEquals(StandingConstraints.BootPhase.ACQUIRING, result.nextState().bootPhase());
+        assertEquals(Optional.of(CardinalFrame.X_POS), result.targetReference());
+        assertEquals(StandingConstraints.BootPhase.IN_RANGE_UNATTACHED, result.nextState().bootPhase());
         assertEquals(Optional.of(EAST_SURFACE), result.actualSupport());
+    }
+
+    @Test
+    void confirmedAttachedBootKeepsItsSupportedAxisAgainstAnotherFloorScoreAndOnJump() {
+        var memory = new StandingConstraints.BootMemory(UP_SURFACE, TIER);
+        var attached = StandingConstraints.State.attached(memory, CardinalFrame.Y_POS, UP_SURFACE);
+        var evidence = available(Vec3.ZERO, Vec3.ZERO, scores(CardinalFrame.X_POS, 100.0),
+                List.of(boot(UP_SURFACE, 0.0, TIER)), Optional.of(UP_SURFACE));
+
+        var retained = resolve(attached, 9, false, evidence);
+        assertEquals(Optional.of(CardinalFrame.Y_POS), retained.targetReference());
+        assertEquals(StandingConstraints.BootPhase.ATTACHED, retained.nextState().bootPhase());
+        assertEquals(Optional.of(UP_SURFACE), retained.actualSupport());
+
+        var jumped = resolve(attached, 10, true, evidence);
+        assertEquals(Optional.of(CardinalFrame.Y_POS), jumped.targetReference());
+        assertEquals(StandingConstraints.BootPhase.JUMP_RELEASE_PROTECTED, jumped.nextState().bootPhase());
+        assertEquals(14, jumped.nextState().protectionUntilServerTick());
+        assertEquals(Optional.of(UP_SURFACE), jumped.actualSupport());
     }
 
     @Test
@@ -122,14 +181,16 @@ class StandingConstraintsTest {
     }
 
     @Test
-    void sidewaysBootPullSurvivesStableNaturalReferenceSelection() {
+    void magneticFloorPrecedesNaturalContinuityWithoutChangingFieldOrBootForce() {
         Vec3 naturalGravity = new Vec3(0.0, -9.0, 0.0);
         var previous = new StandingConstraints.State(StandingConstraints.BootPhase.NONE, Optional.empty(),
                 Optional.of(CardinalFrame.Y_POS), Optional.empty(), -1);
         var result = resolve(previous, 7, false, available(naturalGravity, Vec3.ZERO,
-                scores(CardinalFrame.Y_POS, 9.0), List.of(boot(EAST_SURFACE, 0.5, TIER)), Optional.empty()));
+                Map.of(CardinalFrame.Y_POS, new StandingConstraints.FaceEvidence(9.0,
+                        Set.of(StandingConstraints.ConstraintSource.NATURAL_BACKGROUND))),
+                List.of(boot(EAST_SURFACE, 0.5, TIER)), Optional.empty()));
         var force = result.authoritativeForce().orElseThrow();
-        assertEquals(Optional.of(CardinalFrame.Y_POS), result.targetReference());
+        assertEquals(Optional.of(CardinalFrame.X_POS), result.targetReference());
         assertEquals(Optional.of(CardinalFrame.Y_POS), result.nextState().acceptedReference());
         assertEquals(naturalGravity, force.gravityAcceleration());
         assertEquals(Vec3.ZERO, force.magneticAcceleration());
@@ -265,7 +326,7 @@ class StandingConstraintsTest {
     void constantOneGAndWeakerBootTierKeepTheirForceThroughoutJumpProtection(Face face) {
         var selectedSurface = surface(2, 3, 4, face);
         var frame = CardinalFrame.fromFloorFace(face);
-        // UG's native-player 1G is 32 m/s². No background field is added here.
+        // UG's native-player 1G is 32 m/s虏. No background field is added here.
         // This verifies force continuity, not the still-unwired Minecraft jump/travel lifecycle.
         for (double strength : new double[] {32.0, 8.0}) {
             var tier = new StandingConstraints.BootTier(new FloorFieldProfile(strength, 1.5, 2.0), 1.5, 4);

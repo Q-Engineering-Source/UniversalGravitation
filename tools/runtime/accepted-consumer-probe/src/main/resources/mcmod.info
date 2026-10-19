@@ -1,0 +1,16 @@
+[
+  {
+    "modid": "ugacceptedprobe",
+    "name": "UG Accepted Consumer Probe",
+    "description": "Isolated read-only native consumer observations for UniversalGravitation.",
+    "version": "1.0.0-wip",
+    "mcversion": "1.12.2",
+    "url": "",
+    "updateUrl": "",
+    "authorList": ["Codex native probe"],
+    "credits": "",
+    "logoFile": "",
+    "screenshots": [],
+    "dependencies": []
+  }
+]

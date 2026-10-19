@@ -1,0 +1,159 @@
+import java.util.zip.ZipFile
+import org.objectweb.asm.*
+import org.objectweb.asm.tree.*
+
+buildscript { dependencies { classpath files(rootProject.buildscript.configurations.classpath) } }
+
+// TEST ONLY: reproduce the actual FML EventSubscriptionTransformer additions for
+// this event hierarchy. The real EventBus and World's native post body stay intact.
+def output = layout.buildDirectory.dir('test-collision-event-bridge')
+def prepare = tasks.register('prepareCollisionEventTestBridge') {
+    dependsOn tasks.named('compileJava')
+    inputs.files(sourceSets.main.compileClasspath)
+    inputs.file(file('gradle/scripts/collision-event-test-bridge.gradle'))
+    outputs.dir(output)
+    doLast {
+        String event = 'net/minecraftforge/fml/common/eventhandler/Event'
+        String worldEvent = 'net/minecraftforge/event/world/WorldEvent'
+        String boxesEvent = 'net/minecraftforge/event/world/GetCollisionBoxesEvent'
+        String list = 'net/minecraftforge/fml/common/eventhandler/ListenerList'
+        String listType = 'L' + list + ';'
+        def read = { String owner ->
+            def found = []
+            sourceSets.main.compileClasspath.files.findAll { it.isFile() && it.name.endsWith('.jar') }.each { jar ->
+                new ZipFile(jar).withCloseable { zip ->
+                    def entry = zip.getEntry(owner + '.class')
+                    if (entry != null) found.add([jar: jar, bytes: zip.getInputStream(entry).withCloseable { it.bytes }])
+                }
+            }
+            if (found.size() != 1) throw new GradleException('Collision Event bridge requires exactly one ' + owner + '; got ' + found.size())
+            found[0]
+        }
+        def base = new ClassNode(); new ClassReader(read(event).bytes as byte[]).accept(base, 0)
+        [['<init>', '()V', Opcodes.ACC_PUBLIC], ['setup', '()V', Opcodes.ACC_PROTECTED],
+         ['getListenerList', '()' + listType, Opcodes.ACC_PUBLIC]].each { signature ->
+            def matches = base.methods.findAll { it.name == signature[0] && it.desc == signature[1]
+                    && (it.access & signature[2]) != 0 }
+            if (matches.size() != 1) throw new GradleException('Base Event method drift: ' + signature)
+        }
+        def report = ['TEST_ONLY; NOT_FML_TRANSFORM_ACCEPTANCE; native World post/EventBus bodies unchanged']
+        [[worldEvent, event, '(Lnet/minecraft/world/World;)V'],
+         [boxesEvent, worldEvent, '(Lnet/minecraft/world/World;Lnet/minecraft/entity/Entity;Lnet/minecraft/util/math/AxisAlignedBB;Ljava/util/List;)V']].each { signature ->
+            String owner = signature[0], parent = signature[1]
+            def input = read(owner)
+            def node = new ClassNode(); new ClassReader(input.bytes as byte[]).accept(node, 0)
+            if (node.superName != parent) throw new GradleException('Event superclass drift: ' + owner)
+            if (node.methods.count { it.name == '<init>' && it.desc == signature[2] } != 1)
+                throw new GradleException('Original event constructor drift: ' + owner)
+            if (node.fields.any { it.name == 'LISTENER_LIST' } || node.methods.any {
+                    (it.name == '<init>' || it.name == 'setup') && it.desc == '()V'
+                    || it.name == 'getListenerList' && it.desc == '()' + listType })
+                throw new GradleException('Event input is already transformed: ' + owner)
+            if (node.visibleAnnotations?.any { it.desc == 'Lnet/minecraftforge/fml/common/eventhandler/Cancelable;'
+                    || it.desc == 'Lnet/minecraftforge/fml/common/eventhandler/Event$HasResult;' })
+                throw new GradleException('Event annotation contract changed: ' + owner)
+            node.fields.add(new FieldNode(Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC, 'LISTENER_LIST', listType, null, null))
+            // Identical constructor/super and lazy hierarchical ListenerList recipe to FML.
+            def constructor = new MethodNode(Opcodes.ACC_PUBLIC, '<init>', '()V', null, null)
+            constructor.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0))
+            constructor.instructions.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, parent, '<init>', '()V', false))
+            constructor.instructions.add(new InsnNode(Opcodes.RETURN)); node.methods.add(constructor)
+            def setup = new MethodNode(Opcodes.ACC_PROTECTED, 'setup', '()V', null, null)
+            setup.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0))
+            setup.instructions.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, parent, 'setup', '()V', false))
+            setup.instructions.add(new FieldInsnNode(Opcodes.GETSTATIC, owner, 'LISTENER_LIST', listType))
+            def initialize = new LabelNode()
+            setup.instructions.add(new JumpInsnNode(Opcodes.IFNULL, initialize))
+            setup.instructions.add(new InsnNode(Opcodes.RETURN))
+            setup.instructions.add(initialize)
+            setup.instructions.add(new FrameNode(Opcodes.F_SAME, 0, null, 0, null))
+            setup.instructions.add(new TypeInsnNode(Opcodes.NEW, list))
+            setup.instructions.add(new InsnNode(Opcodes.DUP))
+            setup.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0))
+            setup.instructions.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, parent, 'getListenerList', '()' + listType, false))
+            setup.instructions.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, list, '<init>', '(' + listType + ')V', false))
+            setup.instructions.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, 'LISTENER_LIST', listType))
+            setup.instructions.add(new InsnNode(Opcodes.RETURN)); node.methods.add(setup)
+            def getter = new MethodNode(Opcodes.ACC_PUBLIC, 'getListenerList', '()' + listType, null, null)
+            getter.instructions.add(new FieldInsnNode(Opcodes.GETSTATIC, owner, 'LISTENER_LIST', listType))
+            getter.instructions.add(new InsnNode(Opcodes.ARETURN)); node.methods.add(getter)
+            def writer = new ClassWriter(ClassWriter.COMPUTE_MAXS); node.accept(writer)
+            def target = output.get().file(owner + '.class').asFile
+            target.parentFile.mkdirs(); target.bytes = writer.toByteArray()
+            def sha = java.security.MessageDigest.getInstance('SHA-256').digest(input.bytes as byte[]).encodeHex().toString()
+            report.add(owner + ': input=' + input.jar + '; sha256=' + sha + '; noArgConstructor=1; setup=1; listenerListGetter=1')
+        }
+
+        // Invoke the actual FML transformer in a disposable, isolated loader. Never define these
+        // TEST classes in the Gradle daemon loader or add this output to a normal FML profile.
+        def urls = (sourceSets.main.compileClasspath.files + rootProject.buildscript.configurations.classpath.files)
+                .findAll { it.exists() }.collect { it.toURI().toURL() }.unique()
+        new URLClassLoader(urls as URL[], ClassLoader.getPlatformClassLoader()).withCloseable { isolated ->
+            String transformerName = 'net.minecraftforge.fml.common.asm.transformers.EventSubscriptionTransformer'
+            def transformerInput = read(transformerName.replace('.', '/'))
+            def transformerClass = isolated.loadClass(transformerName)
+            def transformer = transformerClass.getConstructor().newInstance()
+            def transform = transformerClass.getMethod('transform', String, String, byte[].class)
+            def methodBytes = { ClassNode owner, MethodNode method ->
+                def writer = new ClassWriter(0)
+                writer.visit(owner.version, owner.access, owner.name, owner.signature, owner.superName,
+                        owner.interfaces as String[])
+                method.accept(writer); writer.visitEnd(); writer.toByteArray()
+            }
+            String entityEvent = 'net/minecraftforge/event/entity/EntityEvent'
+            String livingEvent = 'net/minecraftforge/event/entity/living/LivingEvent'
+            String attackEvent = 'net/minecraftforge/event/entity/living/LivingAttackEvent'
+            [[entityEvent, event, '(Lnet/minecraft/entity/Entity;)V'],
+             [livingEvent, entityEvent, '(Lnet/minecraft/entity/EntityLivingBase;)V'],
+             [attackEvent, livingEvent, '(Lnet/minecraft/entity/EntityLivingBase;Lnet/minecraft/util/DamageSource;F)V']].each { row ->
+                String owner = row[0], parent = row[1]
+                def input = read(owner)
+                def original = new ClassNode(); new ClassReader(input.bytes as byte[]).accept(original, 0)
+                if (original.superName != parent || original.methods.count { it.name == '<init>' && it.desc == row[2] } != 1)
+                    throw new GradleException('Attack event original hierarchy/constructor drift: ' + owner)
+                if (original.methods.any { it.name == '<init>' && it.desc == '()V' })
+                    throw new GradleException('Attack event input already transformed: ' + owner)
+                String binaryName = owner.replace('/', '.')
+                byte[] bytes = transform.invoke(transformer, binaryName, binaryName, input.bytes as byte[]) as byte[]
+                def transformed = new ClassNode(); new ClassReader(bytes).accept(transformed, 0)
+                [['<init>', '()V'], ['setup', '()V'], ['getListenerList', '()' + listType]].each { signature ->
+                    if (transformed.methods.count { it.name == signature[0] && it.desc == signature[1] } != 1)
+                        throw new GradleException('Actual FML event transform did not produce ' + owner + ' ' + signature)
+                }
+                if (transformed.fields.count { it.desc == listType && (it.access & Opcodes.ACC_STATIC) != 0 } != 1)
+                    throw new GradleException('Actual FML ListenerList field drift: ' + owner)
+                original.methods.each { method ->
+                    def matches = transformed.methods.findAll { it.name == method.name && it.desc == method.desc }
+                    if (matches.size() != 1 || !Arrays.equals(methodBytes(original, method), methodBytes(transformed, matches[0])))
+                        throw new GradleException('Actual FML transform changed original event method body: ' + owner + '.' + method.name + method.desc)
+                }
+                def setup = transformed.methods.find { it.name == 'setup' && it.desc == '()V' }
+                if (setup.instructions.findAll { it instanceof MethodInsnNode && it.owner == parent
+                        && it.name == 'getListenerList' && it.desc == '()' + listType }.size() != 1)
+                    throw new GradleException('Actual FML hierarchical ListenerList parent drift: ' + owner)
+                if (owner == attackEvent) {
+                    def cancel = transformed.methods.findAll { it.name == 'isCancelable' && it.desc == '()Z' }
+                    if (cancel.size() != 1 || cancel[0].instructions.findAll { it.opcode >= 0 }*.opcode != [Opcodes.ICONST_1, Opcodes.IRETURN])
+                        throw new GradleException('Actual FML attack Cancelable contract drift')
+                }
+                def target = output.get().file(owner + '.class').asFile
+                target.parentFile.mkdirs(); target.bytes = bytes
+                def digest = { byte[] data -> java.security.MessageDigest.getInstance('SHA-256').digest(data).encodeHex().toString() }
+                report.add(owner + ': ACTUAL_FML_TRANSFORM; input=' + input.jar + '; inputSha256=' + digest(input.bytes as byte[])
+                        + '; inputJarSha256=' + digest(input.jar.bytes) + '; outputSha256=' + digest(bytes) + '; originalMethodsUnchanged=' + original.methods.size()
+                        + '; noArgConstructor=1; setup=1; hierarchicalListenerList=1; cancelable=' + (owner == attackEvent))
+            }
+            report.add('transformer=' + transformerInput.jar + '; jarSha256='
+                    + java.security.MessageDigest.getInstance('SHA-256').digest(transformerInput.jar.bytes).encodeHex().toString() + '; classSha256='
+                    + java.security.MessageDigest.getInstance('SHA-256').digest(transformerInput.bytes as byte[]).encodeHex().toString()
+                    + '; loader=isolated URLClassLoader; transformedClassesNotDefinedInDaemon=true; count=3')
+        }
+
+        output.get().file('event-bridge-input.txt').asFile.text = report.join('\n') + '\n'
+    }
+}
+
+tasks.named('test', Test).configure {
+    dependsOn prepare
+    classpath = files(output) + classpath
+}

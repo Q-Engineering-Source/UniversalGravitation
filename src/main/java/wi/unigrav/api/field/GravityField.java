@@ -64,6 +64,20 @@ public final class GravityField {
     }
 
     private final ConcurrentHashMap<Id, GravityContribution> entries = new ConcurrentHashMap<>();
+    private long revision;
+
+    /** An immutable contribution roster and its mutation revision, captured atomically. */
+    public record Observation(long revision, Map<Id, GravityContribution> entries) {
+        public Observation { entries = Map.copyOf(entries); }
+    }
+
+    public synchronized Observation observe() {
+        return new Observation(revision, entries);
+    }
+
+    public synchronized boolean isCurrent(Observation observation) {
+        return observation != null && observation.revision() == revision;
+    }
 
     /** Registers (or replaces, for an existing id) a gravity source. */
     public Registration register(String namespace, String path, GravitySource source) {
@@ -82,11 +96,12 @@ public final class GravityField {
     }
 
     /** Registers (or replaces, for an existing id) a gravity contribution. */
-    public Registration registerContribution(Id id, GravityContribution contribution) {
+    public synchronized Registration registerContribution(Id id, GravityContribution contribution) {
         if (contribution == null) {
             throw new IllegalArgumentException("contribution must not be null");
         }
         entries.put(id, contribution);
+        revision++;
         return new Registration() {
             private final AtomicBoolean closed = new AtomicBoolean();
 
@@ -114,16 +129,22 @@ public final class GravityField {
                     // live: replacing the MP player's EntitySource with the
                     // SP one — equal entities, record equals — wiped the
                     // player source right out of the field).
-                    entries.computeIfPresent(id,
-                            (key, current) -> current == contribution ? null : current);
+                    synchronized (GravityField.this) {
+                        if (entries.get(id) == contribution) {
+                            entries.remove(id);
+                            revision++;
+                        }
+                    }
                 }
             }
         };
     }
 
     /** Removes the entry with the given id; returns true if one was present. */
-    public boolean unregister(Id id) {
-        return entries.remove(id) != null;
+    public synchronized boolean unregister(Id id) {
+        boolean removed = entries.remove(id) != null;
+        if (removed) revision++;
+        return removed;
     }
 
     /**

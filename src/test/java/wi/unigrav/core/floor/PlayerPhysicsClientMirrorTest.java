@@ -4,6 +4,9 @@ import java.nio.file.Path;
 import java.util.UUID;
 import java.util.Optional;
 import dev.crlhitbox.api.geometry.Vec3d;
+import dev.crlhitbox.api.geometry.Rotation3d;
+import wi.unigrav.core.player.FreeEyeAnchor;
+import wi.unigrav.core.client.PlayerPhysicsClientInstallationTestSupport;
 import net.minecraft.init.Bootstrap;
 import net.minecraft.entity.player.EntityPlayer;
 import org.junit.jupiter.api.BeforeAll;
@@ -24,6 +27,45 @@ import static org.junit.jupiter.api.Assertions.*;
 /** Real Entity storage projection, not a client runtime or GPU fixture. */
 class PlayerPhysicsClientMirrorTest {
     @BeforeAll static void bootstrap() { Bootstrap.register(); }
+
+    @Test void independentFullBodyProfileInstallsRawShortMetadataAndAuthorizesItsExactAck(@TempDir Path directory) {
+        try (var world = BootWorldFixture.open(directory, new UUID(0, 11201), true)) {
+            var player = world.serverPlayer(new UUID(0, 11202));
+            var center = new Vec3d(8, 70, 9);
+            var q = new Rotation3d(.1, .2, .3, .9);
+            var raw = new PlayerBodyShape.Dimensions((double).6F, .5999999642372131, (double).4F);
+            var shape = new PlayerBodyShape.FreeCapsule(raw,
+                    new PlayerBodyShape.CollisionProfile((double).6F, (double)1.8F),
+                    Optional.of(new FreeEyeAnchor(
+                            FreeEyeAnchor.STORED_BASIS_V1,
+                            center, new Vec3d(8,70.4,9), q)));
+            var placement = new PlayerBodyPlacement(center, q, shape);
+            var scope = new PlayerPhysicalSnapshot.Scope(player.getUniqueID(), new UUID(0,11203), 0, 1);
+            var snapshot = new PlayerPhysicalSnapshot(scope, 1, placement, new Vec3d(2,0,0),
+                    Optional.of(new PlayerPhysicalSnapshot.Contacts(false,false,false,0)));
+            var session = new PlayerPhysicsClientSession(candidate -> true, () -> {}, () -> {});
+            var installation = new PlayerPhysicsClientInstallationTestSupport(session, player);
+            assertTrue(session.receive(new PlayerPhysicsProtocol.Packet(PlayerPhysicsProtocol.Kind.OFFER, scope, 0, 1,
+                    Optional.empty(), Optional.empty(), Optional.empty())));
+            session.prepare(new CPacketPlayer.Position(0,0,0,false), new Vec3d(0,0,0),0,0,false,
+                    Optional.empty(), packet -> {});
+            var owned = new PlayerPhysicsProtocol.Packet(PlayerPhysicsProtocol.Kind.OWNED, scope,1,1,
+                    Optional.empty(), Optional.of(snapshot), Optional.empty());
+            assertTrue(installation.install(owned));
+            assertTrue(PlayerPhysicsClientMirror.matchesAcceptedPresentationGeometry(player, snapshot));
+            assertEquals((float)raw.width(), player.width);
+            assertEquals((float)raw.height(), player.height);
+            assertEquals((float)raw.eyeHeight(), player.getEyeHeight());
+            assertEquals(placement.bounds().min().y(), player.posY);
+            assertEquals(snapshot, session.presentationSnapshot().orElseThrow());
+            var input = session.input(new PlayerPhysicsProtocol.Controls(new Vec3d(0,0,0),new Vec3d(0,0,1),
+                    false,false,false,false,1)).orElseThrow();
+            assertEquals(new PlayerPhysicsProtocol.BodyReferenceAcknowledgement(owned.sequence(),snapshot.revision()),
+                    input.bodyReferenceAcknowledgement().orElseThrow());
+            installation.inputSendSucceeded(input);
+            assertTrue(session.input(input.controls().orElseThrow()).orElseThrow().bodyReferenceAcknowledgement().isEmpty());
+        }
+    }
 
     @Test void clientPoseCallbackRetainsOwnedSideColliderButPreservesCorrections(@TempDir Path directory) {
         try (var world = BootWorldFixture.open(directory, new UUID(0, 10031), true)) {

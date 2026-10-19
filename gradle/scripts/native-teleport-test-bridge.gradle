@@ -1,0 +1,75 @@
+import java.util.zip.ZipFile
+import org.objectweb.asm.ClassReader
+import org.objectweb.asm.ClassWriter
+import org.objectweb.asm.Opcodes
+import org.objectweb.asm.tree.*
+
+buildscript {
+    dependencies { classpath files(rootProject.buildscript.configurations.classpath) }
+}
+
+def bridgeOutput = layout.buildDirectory.dir('test-native-teleport-bridge')
+def bridge = tasks.register('prepareNativeTeleportTestBridge') {
+    dependsOn tasks.named('compileTestJava')
+    inputs.files(sourceSets.main.compileClasspath)
+    inputs.file(file('gradle/scripts/native-teleport-test-bridge.gradle'))
+    inputs.file(file('src/test/java/wi/unigrav/core/floor/NativeTeleportPendingTestBridge.java'))
+    outputs.dir(bridgeOutput)
+    doLast {
+        def owner = 'net/minecraft/network/NetHandlerPlayServer'
+        def matches = []
+        sourceSets.main.compileClasspath.files.findAll { it.isFile() && it.name.endsWith('.jar') }.each { jar ->
+            new ZipFile(jar).withCloseable { zip ->
+                def entry = zip.getEntry(owner + '.class')
+                if (entry != null) matches.add([jar: jar, bytes: zip.getInputStream(entry).bytes])
+            }
+        }
+        if (matches.size() != 1) throw new GradleException('Expected exactly one native NetHandlerPlayServer input: ' + matches*.jar)
+        def node = new ClassNode()
+        new ClassReader(matches[0].bytes as byte[]).accept(node, 0)
+        if (node.name != owner) throw new GradleException('Unexpected native teleport bridge owner')
+        def fields = node.fields.findAll { it.name == 'targetPos' }
+        if (fields.size() != 1 || fields[0].desc != 'Lnet/minecraft/util/math/Vec3d;'
+                || (fields[0].access & (Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC)) != Opcodes.ACC_PRIVATE)
+            throw new GradleException('Native targetPos field no longer matches the read-only bridge contract')
+        [['processConfirmTeleport', '(Lnet/minecraft/network/play/client/CPacketConfirmTeleport;)V'],
+         ['setPlayerLocation', '(DDDFFLjava/util/Set;)V']].each { signature ->
+            if (node.methods.count { it.name == signature[0] && it.desc == signature[1] } != 1)
+                throw new GradleException('Missing exact native teleport method: ' + signature)
+        }
+        def iface = 'wi/unigrav/core/floor/NativeTeleportPendingTestBridge'
+        def methodName = 'unigrav$test$nativeTeleportPendingCleared'
+        if (node.interfaces.contains(iface) || node.methods.any { it.name == methodName })
+            throw new GradleException('Native teleport test bridge was already applied')
+        // Keep every pre-existing MethodNode untouched: no renaming, wrapping or injected callbacks.
+        def originals = node.methods.collect { it }
+        node.interfaces.add(iface)
+        def method = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_SYNTHETIC, methodName, '()Z', null, null)
+        def pending = new LabelNode()
+        method.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0))
+        method.instructions.add(new FieldInsnNode(Opcodes.GETFIELD, owner, 'targetPos', fields[0].desc))
+        method.instructions.add(new JumpInsnNode(Opcodes.IFNONNULL, pending))
+        method.instructions.add(new InsnNode(Opcodes.ICONST_1))
+        method.instructions.add(new InsnNode(Opcodes.IRETURN))
+        method.instructions.add(pending)
+        method.instructions.add(new FrameNode(Opcodes.F_SAME, 0, null, 0, null))
+        method.instructions.add(new InsnNode(Opcodes.ICONST_0))
+        method.instructions.add(new InsnNode(Opcodes.IRETURN))
+        node.methods.add(method)
+        if (node.methods.size() != originals.size() + 1 || !originals.indices.every { node.methods[it].is(originals[it]) })
+            throw new GradleException('Read-only bridge changed original native methods')
+        def writer = new ClassWriter(ClassWriter.COMPUTE_MAXS)
+        node.accept(writer)
+        def target = bridgeOutput.get().file(owner + '.class').asFile
+        target.parentFile.mkdirs()
+        target.bytes = writer.toByteArray()
+        def digest = java.security.MessageDigest.getInstance('SHA-256').digest(matches[0].bytes as byte[]).encodeHex().toString()
+        bridgeOutput.get().file('native-teleport-bridge-input.txt').asFile.text =
+                'TEST_ONLY; NOT_PRODUCTION_MIXIN\ninput=' + matches[0].jar + '\nsha256=' + digest + '\noriginalMethodsUntouched=true\n'
+    }
+}
+
+tasks.named('test', Test).configure {
+    dependsOn bridge
+    classpath = files(bridgeOutput) + classpath
+}

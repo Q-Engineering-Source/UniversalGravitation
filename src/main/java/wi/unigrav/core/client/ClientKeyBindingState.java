@@ -31,6 +31,14 @@ public final class ClientKeyBindingState {
                 : Keyboard.isKeyDown(keyCode);
     }
 
+    /** Samples the configured physical key without the GUI conflict-context gate. */
+    public static boolean isPhysicalDown(KeyBinding binding) {
+        if (binding == null) return false;
+        int keyCode = binding.getKeyCode();
+        if (keyCode == Keyboard.KEY_NONE) return false;
+        return keyCode < 0 ? Mouse.isButtonDown(keyCode + 100) : Keyboard.isKeyDown(keyCode);
+    }
+
     private static boolean modifierSatisfied(KeyBinding binding) {
         KeyModifier modifier = binding.getKeyModifier();
         return modifier == null || modifier == KeyModifier.NONE

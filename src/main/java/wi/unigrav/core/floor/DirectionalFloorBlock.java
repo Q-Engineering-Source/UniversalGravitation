@@ -1,6 +1,7 @@
 package wi.unigrav.core.floor;
 
 import java.util.Objects;
+import java.util.List;
 
 import net.minecraft.block.BlockDirectional;
 import net.minecraft.block.SoundType;
@@ -16,19 +17,14 @@ import net.minecraft.util.Rotation;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.World;
 
-/**
- * Common six-facing physical block for the built-in floor registrations.
- *
- * <p>The {@linkplain #kind() kind} is declarative only in this milestone. It
- * deliberately does not provide a field, magnetic filtering, or a player
- * collider; those require their own server-authoritative runtime paths.</p>
- */
-public final class DirectionalFloorBlock extends BlockDirectional {
+/** Common six-facing physical block for the built-in floor registrations. */
+public class DirectionalFloorBlock extends BlockDirectional {
 
     /** Distinguishes the later gravity and magnetic runtime integrations. */
     public enum Kind {
         GRAVITY,
-        MAGNETIC
+        MAGNETIC,
+        DOUBLE_SIDED_GRAVITY
     }
 
     private final Kind kind;
@@ -36,15 +32,29 @@ public final class DirectionalFloorBlock extends BlockDirectional {
     public DirectionalFloorBlock(Kind kind) {
         super(Material.IRON);
         this.kind = Objects.requireNonNull(kind, "kind");
-        setDefaultState(blockState.getBaseState().withProperty(FACING, EnumFacing.UP));
+        setDefaultState(initialState(blockState.getBaseState()));
         setCreativeTab(CreativeTabs.BUILDING_BLOCKS);
         setHardness(5.0F);
         setResistance(10.0F);
         setSoundType(SoundType.METAL);
     }
 
+    protected IBlockState initialState(IBlockState baseState) {
+        return baseState.withProperty(FACING, EnumFacing.UP);
+    }
+
     public Kind kind() {
         return kind;
+    }
+
+    /** The designated outward face for single-sided floors. */
+    List<EnumFacing> emissionFaces(IBlockState state) {
+        Objects.requireNonNull(state, "state");
+        if (state.getBlock() != this) {
+            throw new IllegalArgumentException("floor state must belong to this block");
+        }
+        EnumFacing facing = state.getValue(FACING);
+        return List.of(facing);
     }
 
     @Override

@@ -1,5 +1,6 @@
 package wi.unigrav.core.boost;
 
+import java.math.BigDecimal;
 import java.util.Objects;
 
 import wi.unigrav.api.math.Vec3;
@@ -25,6 +26,78 @@ public final class BoostMovementBudget {
         public boolean accepted() { return failure == Failure.NONE; }
     }
 
+    /** Ledger reservation only; the caller still proves owner/revision, geometry and every path segment. */
+    public record CenterPathAdmission(long sequence, long serverTick, Vec3 transportOrigin,
+            Vec3 centerOrigin, double grant, Failure failure) {
+        public boolean accepted() { return failure == Failure.NONE; }
+    }
+
+    /**
+     * Reserves cumulative center travel, not net transport displacement. The owner supplies an
+     * actual origin and a verified path upper bound; this ledger does not grant collision authority.
+     * A first center origin, or one after native rebase, is confirmed only by successful commit.
+     */
+    public CenterPathAdmission reserveCenterPath(long sequence, long serverTick,
+            Vec3 expectedTransportOrigin, Vec3 centerOrigin, double requestedPathUpper) {
+        if (hasPending()) {
+            lastDiagnosticFailure = DiagnosticFailure.PENDING;
+            return deniedCenter(sequence, serverTick, expectedTransportOrigin, centerOrigin, Failure.PENDING);
+        }
+        if (!BoostProtocol.finite(expectedTransportOrigin) || !BoostProtocol.finite(centerOrigin)
+                || !finitePath(requestedPathUpper) || !position.equals(expectedTransportOrigin)
+                || confirmedCenter != null && !confirmedCenter.equals(centerOrigin)) {
+            lastDiagnosticFailure = DiagnosticFailure.INVALID_INPUT;
+            return deniedCenter(sequence, serverTick, expectedTransportOrigin, centerOrigin, Failure.INVALID_INPUT);
+        }
+        if (!precheck(sequence, serverTick, expectedTransportOrigin)) {
+            return deniedCenter(sequence, serverTick, expectedTransportOrigin, centerOrigin,
+                    lastDenied(sequence, expectedTransportOrigin).failure());
+        }
+        double grant = Math.min(requestedPathUpper, Math.min(proposalPerTickDistance(), distanceCredit));
+        pendingCenter = new CenterPathAdmission(sequence, serverTick, position, centerOrigin, grant, Failure.NONE);
+        debit(grant);
+        lastDiagnosticFailure = DiagnosticFailure.NONE;
+        return pendingCenter;
+    }
+
+    /**
+     * Commits one already-spent path reservation. The supplied upper bound must include all
+     * actual segments; checking its net-distance lower bound cannot reconstruct a folded path.
+     * Transport may change independently of center travel (for example a proxy after rotation).
+     */
+    public boolean commitCenterPath(CenterPathAdmission ticket, Vec3 finalCenter,
+            Vec3 actualTransport, double verifiedPathUpper) {
+        if (ticket == null || pendingCenter != ticket || !ticket.accepted() || ticket.serverTick() != lastTick
+                || !BoostProtocol.finite(finalCenter) || !BoostProtocol.finite(actualTransport)
+                || !finitePath(verifiedPathUpper) || verifiedPathUpper > ticket.grant()
+                || !coversNetCenterDistance(ticket.centerOrigin(), finalCenter, verifiedPathUpper)) return false;
+        position = actualTransport;
+        confirmedCenter = finalCenter;
+        clearPending();
+        return true;
+    }
+
+    /** Settles the exact pending reservation without refunding its already-spent grant. */
+    public void abortCenterPath(CenterPathAdmission ticket) {
+        if (ticket != null && pendingCenter == ticket) clearPending();
+    }
+
+    private static boolean finitePath(double path) { return Double.isFinite(path) && path >= 0; }
+
+    /** Exact binary64 squares avoid an epsilon or a rounded sqrt becoming a movement permit. */
+    private static boolean coversNetCenterDistance(Vec3 from, Vec3 to, double path) {
+        BigDecimal x = new BigDecimal(to.x()).subtract(new BigDecimal(from.x()));
+        BigDecimal y = new BigDecimal(to.y()).subtract(new BigDecimal(from.y()));
+        BigDecimal z = new BigDecimal(to.z()).subtract(new BigDecimal(from.z()));
+        BigDecimal distanceSquared = x.multiply(x).add(y.multiply(y)).add(z.multiply(z));
+        BigDecimal upper = new BigDecimal(path);
+        return upper.multiply(upper).compareTo(distanceSquared) >= 0;
+    }
+
+    private static CenterPathAdmission deniedCenter(long sequence, long tick, Vec3 transport,
+            Vec3 center, Failure failure) {
+        return new CenterPathAdmission(sequence, tick, transport, center, 0, failure);
+    }
     private double ceilingMps;
     private double distanceCredit;
     // A single finite allowance for cumulative native/coordinate rounding; it never refills.
@@ -38,6 +111,8 @@ public final class BoostMovementBudget {
     private long seenSequence;
     private Vec3 position;
     private Admission pending;
+    private CenterPathAdmission pendingCenter;
+    private Vec3 confirmedCenter;
     private boolean pendingReserved;
     private DiagnosticFailure lastDiagnosticFailure = DiagnosticFailure.NONE;
 
@@ -126,6 +201,7 @@ public final class BoostMovementBudget {
                 || distance > perTickDistance() + NATIVE_POSITION_TOLERANCE) return false;
         debit(distance);
         position = actualPosition;
+        confirmedCenter = null;
         clearPending();
         return true;
     }
@@ -139,13 +215,14 @@ public final class BoostMovementBudget {
         if (admission == null || pending != admission || !pendingReserved || !admission.accepted()
                 || !BoostProtocol.finite(nativePosition)) return false;
         position = nativePosition;
+        confirmedCenter = null;
         clearPending();
         return true;
     }
 
     /** Releases a pending ticket. A clipped ticket was already debited and is not refunded. */
     public void abort(Admission admission) {
-        if (pending == admission) clearPending();
+        if (admission != null && pending == admission) clearPending();
     }
 
     /**
@@ -247,6 +324,7 @@ public final class BoostMovementBudget {
         clearPending();
         advance(serverTick);
         position = acceptedPosition;
+        confirmedCenter = null;
     }
 
     public Vec3 position() { return position; }
@@ -258,7 +336,7 @@ public final class BoostMovementBudget {
     /** Read-only diagnostic state; it does not alter admission, refill, or rounding semantics. */
     public Snapshot snapshot() {
         return new Snapshot(ceilingMps, proposalCeilingMps, distanceCredit, roundingCredit,
-                lastTick, seenSequence, pending != null, decayActive, lastDiagnosticFailure);
+                lastTick, seenSequence, hasPending(), decayActive, lastDiagnosticFailure);
     }
 
     public record Snapshot(double ceilingMps, double proposalCeilingMps, double distanceCredit,
@@ -276,7 +354,7 @@ public final class BoostMovementBudget {
     }
 
     private boolean precheck(long sequence, long serverTick, Vec3 destination) {
-        if (pending != null) {
+        if (hasPending()) {
             lastDiagnosticFailure = DiagnosticFailure.PENDING;
             return false;
         }
@@ -313,8 +391,11 @@ public final class BoostMovementBudget {
         distanceCredit = Math.max(0.0D, distanceCredit - distance);
     }
 
+    private boolean hasPending() { return pending != null || pendingCenter != null; }
+
     private void clearPending() {
         pending = null;
+        pendingCenter = null;
         pendingReserved = false;
     }
 

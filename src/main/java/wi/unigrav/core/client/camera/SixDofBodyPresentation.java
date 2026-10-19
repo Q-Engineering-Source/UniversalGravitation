@@ -12,12 +12,14 @@ import net.minecraft.util.math.MathHelper;
 import dev.crlhitbox.api.geometry.Vec3d;
 import wi.unigrav.UnigravMod;
 import wi.unigrav.core.player.CardinalFrame;
+import wi.unigrav.core.player.PlayerBodyReference;
+import wi.unigrav.core.player.PlayerBodyPlacement;
 import wi.unigrav.core.player.PlayerBodyShape;
 import wi.unigrav.core.player.PlayerPhysicalSnapshot;
 
 /** UIE contract boundary: gait turns the visual root, never the camera's authoritative attitude. */
 public final class SixDofBodyPresentation {
-    static final int MODEL_UP_BODY_POSE_FLIGHT_API = 10;
+    static final int MODEL_UP_BODY_POSE_FLIGHT_API = 11;
 
     private SixDofBodyPresentation() { }
 
@@ -29,37 +31,118 @@ public final class SixDofBodyPresentation {
         return new Sample(FlightBodyPose.modelUpY(attitudes.body(), attitudes.head()), tracking(view));
     }
 
-    /** Computes the shared report/body attitudes without linking the API 10 pose wrapper. */
+    /** The accepted body follows physical Q; live UIE head/camera Q never replaces collision geometry. */
+    public static Sample sampleFree(PlayerPhysicalSnapshot snapshot, FlightAttitude view) {
+        FreePoseAttitudes attitudes = acceptedFreePoseAttitudes(snapshot, view);
+        return new Sample(FlightBodyPose.modelUpY(attitudes.body(), attitudes.head(),
+                acceptedRootOffset(snapshot.placement())), tracking(view));
+    }
+
+    /** Shared local/remote Free presentation: accepted body Q and the same live UIE head sample. */
+    static FreePoseAttitudes acceptedFreePoseAttitudes(PlayerPhysicalSnapshot snapshot, FlightAttitude view) {
+        if (!(snapshot.placement().shape() instanceof PlayerBodyShape.FreeCapsule))
+            throw new IllegalArgumentException("Free presentation requires an accepted FreeCapsule shape");
+        var q = snapshot.placement().attitude();
+        return new FreePoseAttitudes(new FlightAttitude(q.x(), q.y(), q.z(), q.w()), view);
+    }
+    /** Computes the shared report/body attitudes without constructing a body pose. */
     static FreePoseAttitudes freePoseAttitudes(FlightAttitude view, float bodyYawOffsetDegrees) {
         FlightAttitude body = view.rotateLocal(0, 1, 0,
                 -Math.toRadians(bodyYawOffsetDegrees));
         return new FreePoseAttitudes(body, view);
     }
 
-    /** Builds a cardinal model from accepted physical up and interpolated native body heading. */
-    public static Sample sampleCardinal(PlayerPhysicalSnapshot snapshot, FlightVector worldLook,
+    /** Accepted up and the owner's presented body forward are independent of the live render head look. */
+    public static Sample sampleCardinal(PlayerPhysicalSnapshot snapshot,
+                                        PlayerBodyReference.Effective effectiveReference,
+                                        FlightVector worldLook, FlightVector viewRelativeBodyForward,
                                         float previousBodyYaw, float bodyYaw, float partialTicks) {
+        CardinalBodyBasis basis = cardinalBodyBasis(snapshot, effectiveReference,
+                viewRelativeBodyForward, previousBodyYaw, bodyYaw, partialTicks);
+        FlightAttitude view = attitudeFromWorldLook(basis.up(), worldLook, basis.bodyHeading());
+        return sampleCardinalAttitudes(snapshot, basis.body(), view);
+    }
+
+    /** Uses one complete render quaternion for both UIE tracking and the presented head pose. */
+    static Sample sampleCardinalView(PlayerPhysicalSnapshot snapshot,
+            PlayerBodyReference.Effective effectiveReference, CardinalCameraTransition.RenderSample render,
+            FlightVector renderedEyeFromTransport,
+            FlightVector viewRelativeBodyForward, float previousBodyYaw, float bodyYaw,
+            float partialTicks) {
+        if (render == null) throw new IllegalArgumentException("render sample is required");
+        CardinalBodyBasis basis = cardinalBodyBasis(snapshot, effectiveReference,
+                viewRelativeBodyForward, previousBodyYaw, bodyYaw, partialTicks);
+        // Apply only the shared reference transition to the body; live mouse pitch
+        // stays in the head/camera and never tilts the standing collision capsule.
+        Vec3d eyeFromFeet = snapshot.placement().eye()
+                .subtract(snapshot.placement().physicalFeet().orElseThrow());
+        FlightVector renderedEyeFromRoot = render.presentReferenceVector(fromWorld(eyeFromFeet));
+        FlightVector root = new FlightVector(renderedEyeFromTransport.x - renderedEyeFromRoot.x,
+                renderedEyeFromTransport.y - renderedEyeFromRoot.y,
+                renderedEyeFromTransport.z - renderedEyeFromRoot.z);
+        return new Sample(FlightBodyPose.modelUpY(render.presentBody(basis.body()), render.attitude(), root),
+                tracking(render.attitude()));
+    }
+
+    private static CardinalBodyBasis cardinalBodyBasis(PlayerPhysicalSnapshot snapshot,
+            PlayerBodyReference.Effective effectiveReference, FlightVector viewRelativeBodyForward,
+            float previousBodyYaw, float bodyYaw, float partialTicks) {
         if (!(snapshot.placement().shape() instanceof PlayerBodyShape.Cardinal cardinal)) {
             throw new IllegalArgumentException("cardinal presentation requires an accepted cardinal shape");
         }
         if (!Float.isFinite(partialTicks)) throw new IllegalArgumentException("partialTicks must be finite");
+        if (effectiveReference == null || effectiveReference.frame() != cardinal.frame()) {
+            throw new IllegalArgumentException("accepted presentation reference must match cardinal geometry");
+        }
         FlightVector up = fromWorld(cardinal.frame().up());
-        FlightVector acceptedForward = fromWorld(snapshot.placement().attitude().basisZ());
-        FlightVector tangentFallback = usableProjection(acceptedForward, up);
-        if (tangentFallback == null) tangentFallback = fromWorld(cardinal.frame().attitude().basisZ()).normalize();
-
-        FlightVector bodyHeading = tangentFallback;
-        if (Float.isFinite(previousBodyYaw) && Float.isFinite(bodyYaw)) {
+        FlightVector frameTangent = fromWorld(cardinal.frame().attitude().basisZ()).normalize();
+        FlightVector bodyHeading;
+        if (viewRelativeBodyForward != null) {
+            bodyHeading = usableProjection(viewRelativeBodyForward, up);
+            if (bodyHeading == null) throw new IllegalArgumentException("body forward is not tangent to its accepted frame");
+        } else if (usesFrozenHeading(effectiveReference)) {
+            bodyHeading = usableProjection(fromWorld(effectiveReference.tangentHeading()), up);
+            if (bodyHeading == null) throw new IllegalArgumentException("accepted heading is not tangent to its frame");
+        } else if (Float.isFinite(previousBodyYaw) && Float.isFinite(bodyYaw)) {
             float interpolatedYaw = previousBodyYaw
                     + MathHelper.wrapDegrees(bodyYaw - previousBodyYaw) * MathHelper.clamp(partialTicks, 0, 1);
             double yaw = Math.toRadians(interpolatedYaw);
             FlightVector nativeHeading = new FlightVector(-Math.sin(yaw), 0, Math.cos(yaw));
             FlightVector projected = usableProjection(nativeHeading, up);
-            if (projected != null) bodyHeading = projected;
-        }
+            bodyHeading = projected == null ? frameTangent : projected;
+        } else bodyHeading = frameTangent;
         FlightAttitude body = attitudeFromUpForward(up, bodyHeading);
-        FlightAttitude view = attitudeFromWorldLook(up, worldLook, tangentFallback);
-        return new Sample(FlightBodyPose.modelUpY(body, view), tracking(view));
+        return new CardinalBodyBasis(up, bodyHeading, body);
+    }
+
+    private static Sample sampleCardinalAttitudes(PlayerPhysicalSnapshot snapshot,
+            FlightAttitude body, FlightAttitude view) {
+        return new Sample(FlightBodyPose.modelUpY(body, view, acceptedRootOffset(snapshot.placement())),
+                tracking(view));
+    }
+
+    private record CardinalBodyBasis(FlightVector up, FlightVector bodyHeading, FlightAttitude body) { }
+
+    /** Keeps the accepted model root at its physical feet relative to this placement's transport. */
+    private static FlightVector acceptedRootOffset(PlayerBodyPlacement placement) {
+        Vec3d physicalFeet = placement.physicalFeet().orElseGet(() -> {
+            if (!(placement.shape() instanceof PlayerBodyShape.FreeCapsule))
+                throw new IllegalArgumentException("accepted root offset requires a supported body shape");
+            var capsule = placement.capsule();
+            Vec3d lower = capsule.centerline().start();
+            Vec3d up = placement.bodyUp();
+            double radius = capsule.radius();
+            // Match the accepted Free foot's exact lower - up * radius operation with one final rounding.
+            return new Vec3d(Math.fma(-up.x(), radius, lower.x()),
+                    Math.fma(-up.y(), radius, lower.y()), Math.fma(-up.z(), radius, lower.z()));
+        });
+        Vec3d offset = physicalFeet.subtract(placement.transport());
+        return new FlightVector(offset.x(), offset.y(), offset.z());
+    }
+
+    private static boolean usesFrozenHeading(PlayerBodyReference.Effective reference) {
+        return reference.source() == PlayerBodyReference.Source.MANUAL
+                || reference.source() == PlayerBodyReference.Source.ENVIRONMENT;
     }
 
     private static FlightAttitude attitudeFromWorldLook(FlightVector up, FlightVector worldLook,
@@ -71,6 +154,16 @@ public final class SixDofBodyPresentation {
         if (viewUp == null) viewUp = usableProjection(frameTangent(up), forward);
         if (viewUp == null) throw new IllegalArgumentException("worldLook cannot form a view basis");
         return attitudeFromUpForward(viewUp, forward);
+    }
+
+    /** Seeds one new accepted Cardinal camera lifecycle from its full current look and accepted frame. */
+    static FlightAttitude seedCardinalCameraView(PlayerBodyReference.Effective effectiveReference,
+            FlightAttitude currentView) {
+        if (effectiveReference == null || currentView == null) {
+            throw new IllegalArgumentException("accepted reference and current view are required");
+        }
+        return attitudeFromWorldLook(fromWorld(effectiveReference.frame().up()),
+                currentView.forward(), fromWorld(effectiveReference.tangentHeading()));
     }
 
     private static FlightAttitude attitudeFromUpForward(FlightVector up, FlightVector forward) {

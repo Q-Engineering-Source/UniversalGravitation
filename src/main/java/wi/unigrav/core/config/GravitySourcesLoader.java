@@ -21,6 +21,8 @@ import wi.unigrav.api.gravity.HarmonicDamping;
 import wi.unigrav.api.gravity.KeplerianOrbit;
 import wi.unigrav.api.gravity.SphericalHarmonics;
 import wi.unigrav.api.math.Vec3;
+import wi.unigrav.core.AmbientWorldFields;
+import net.minecraft.world.World;
 
 /**
  * Data-driven gravity-source loading: reads every {@code *.json} file in
@@ -31,6 +33,7 @@ import wi.unigrav.api.math.Vec3;
  * <p>Schema (one source per file):
  * <pre>
  * {
+ *   "dimension": 0,                      // optional integer; absent means all worlds
  *   "id": "unigrav:example_planet",      // namespace:path (namespace defaults to "unigrav")
  *   "mu": 3.986e14,                      // gravitational parameter, m³/s² (required)
  *   "kind": "static" | "orbit",          // (required)
@@ -101,7 +104,7 @@ public final class GravitySourcesLoader {
                 pending.add(new Pending(parseId(requiredString(root, "id", file.getName())),
                         root, file.getName()));
             } catch (IOException | JsonParseException | IllegalStateException e) {
-                UnigravMod.LOGGER.error("Skipping gravity source file {}: {}", file.getName(), e.toString());
+                UnigravMod.LOGGER.error("Skipping gravity source file {}: {}", file.getName(), e);
             }
         }
 
@@ -119,13 +122,15 @@ public final class GravitySourcesLoader {
                         nextRound.add(p); // center not registered yet
                         continue;
                     }
-                    registrations.add(GravityFields.get().register(p.id(), source));
+                    Integer dimension = parseDimension(p.root(), p.fileName());
+                    registrations.add(GravityFields.get().register(p.id(), dimension == null
+                            ? source : new DimensionSource(dimension, source)));
                     UnigravMod.LOGGER.info("Registered gravity source {} from {}", p.id(), p.fileName());
                     loaded++;
                     progress = true;
                 } catch (IllegalArgumentException | JsonParseException e) {
                     UnigravMod.LOGGER.error("Skipping gravity source {} from {}: {}",
-                            p.id(), p.fileName(), e.getMessage());
+                            p.id(), p.fileName(), e);
                     progress = true; // permanently failed: do not retry
                 }
             }
@@ -221,6 +226,31 @@ public final class GravitySourcesLoader {
             source = source.withSoftening(optionalDouble(root, "softening", 0.0));
         }
         return source;
+    }
+
+    /** Missing dimension preserves the original all-world semantics. */
+    private static Integer parseDimension(JsonObject root, String file) {
+        if (!root.has("dimension")) return null;
+        JsonElement dimension = root.get("dimension");
+        if (!dimension.isJsonPrimitive() || !dimension.getAsJsonPrimitive().isNumber())
+            throw new IllegalArgumentException("dimension must be an integer in " + file);
+        try { return dimension.getAsBigDecimal().intValueExact(); }
+        catch (ArithmeticException failure) {
+            throw new IllegalArgumentException("dimension must be an integer in " + file, failure);
+        }
+    }
+
+    private record DimensionSource(int dimension, GravitySource source)
+            implements GravitySource, AmbientWorldFields.Selection {
+        @Override public boolean appliesTo(World world) { return world.provider.getDimension() == dimension; }
+        @Override public double gravitationalParameter() { return source.gravitationalParameter(); }
+        @Override public Vec3 position(double time) { return source.position(time); }
+        @Override public Vec3 accelerationAt(Vec3 position, double time) { return source.accelerationAt(position, time); }
+        @Override public double softeningLength() { return source.softeningLength(); }
+        @Override public SphericalHarmonics harmonics() { return source.harmonics(); }
+        @Override public double angularVelocity() { return source.angularVelocity(); }
+        @Override public Vec3 rotationAxis() { return source.rotationAxis(); }
+        @Override public double initialPhase() { return source.initialPhase(); }
     }
 
     private static SphericalHarmonics parseHarmonics(JsonObject h, String file) {

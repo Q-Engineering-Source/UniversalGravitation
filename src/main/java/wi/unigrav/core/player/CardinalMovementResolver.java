@@ -324,7 +324,6 @@ public final class CardinalMovementResolver {
         private Work work() { return new Work(queryCount, candidateCount, offsetCount); }
 
         private List<AxisAlignedBB> query(AxisAlignedBB localBounds) {
-            if (queryCount == limits.maxQueries()) throw new QueryFailure(Failure.QUERY_LIMIT, null);
             AxisAlignedBB worldBounds = transform(localBounds, frame::toWorld);
             queryCount++;
             List<AxisAlignedBB> raw;
@@ -340,9 +339,7 @@ public final class CardinalMovementResolver {
             } catch (RuntimeException failure) {
                 throw new QueryFailure(Failure.INVALID_COLLIDER, failure);
             }
-            if (count < 0 || count > limits.maxCandidateObservations() - candidateCount) {
-                throw new QueryFailure(Failure.CANDIDATE_LIMIT, null);
-            }
+            if (count < 0) throw new QueryFailure(Failure.INVALID_COLLIDER, null);
             candidateCount += count;
             List<AxisAlignedBB> world = new ArrayList<>(count);
             List<AxisAlignedBB> local = new ArrayList<>(count);
@@ -362,7 +359,6 @@ public final class CardinalMovementResolver {
 
         private double clip(int axis, List<AxisAlignedBB> candidates, AxisAlignedBB box, double delta) {
             for (AxisAlignedBB collider : candidates) {
-                if (offsetCount == limits.maxOffsetTests()) throw new QueryFailure(Failure.OFFSET_LIMIT, null);
                 offsetCount++;
                 delta = switch (axis) {
                     case 0 -> collider.calculateXOffset(box, delta);

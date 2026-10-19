@@ -1,6 +1,7 @@
 package wi.unigrav.core.floor;
 
 import net.minecraft.item.ItemStack;
+import net.minecraft.nbt.NBTTagCompound;
 import net.minecraft.util.ResourceLocation;
 
 /**
@@ -56,15 +57,23 @@ public final class MagneticItemRule {
         if (stack == null || stack.isEmpty()) {
             return false;
         }
-        ResourceLocation itemName = stack.getItem().getRegistryName();
-        if (itemName == null || !registryNamespace.equals(itemName.getNamespace())
-                || !registryPath.equals(itemName.getPath())) {
-            return false;
-        }
-        if (metadata != null && metadata.intValue() != stack.getMetadata()) {
-            return false;
-        }
-        return nbtPattern == null || nbtPattern.matches(stack.getTagCompound());
+        if (!matchesItemAndMetadata(stack, stack.getItem().getRegistryName(), stack.getMetadata())) return false;
+        return nbtPattern == null || matchesTag(stack.getTagCompound());
+    }
+
+    boolean matchesItemAndMetadata(ItemStack stack, ResourceLocation itemName, int stackMetadata) {
+        return stack != null && !stack.isEmpty() && itemName != null
+                && registryNamespace.equals(itemName.getNamespace())
+                && registryPath.equals(itemName.getPath())
+                && (metadata == null || metadata.intValue() == stackMetadata);
+    }
+
+    boolean requiresNbt() {
+        return nbtPattern != null;
+    }
+
+    boolean matchesTag(NBTTagCompound actualTag) {
+        return nbtPattern == null || nbtPattern.matches(actualTag);
     }
 
 }

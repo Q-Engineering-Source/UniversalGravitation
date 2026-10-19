@@ -17,6 +17,7 @@ import wi.unigrav.core.client.camera.SixDofBodyPresentation;
 import wi.unigrav.core.player.CardinalFrame;
 import wi.unigrav.core.player.PlayerBodyPlacement;
 import wi.unigrav.core.player.PlayerBodyShape;
+import wi.unigrav.core.player.PlayerBodyReference;
 import wi.unigrav.core.player.PlayerPhysicalSnapshot;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -93,7 +94,7 @@ class WalkingBodyPoseIntegrationTest {
             float previousYaw = 310;
             float bodyYaw = 30;
             float partialTicks = .5F;
-            var sampled = SixDofBodyPresentation.sampleCardinal(accepted, view.forward(),
+            var sampled = SixDofBodyPresentation.sampleCardinal(accepted, safeNative(frame), view.forward(), null,
                     previousYaw, bodyYaw, partialTicks);
             var transform = PlayerBodyRenderTransform.fromFlightPose(sampled.body());
 
@@ -108,7 +109,7 @@ class WalkingBodyPoseIntegrationTest {
             assertHeadLook(view.forward(), transform);
 
             FlightAttitude negatedView = new FlightAttitude(-view.x, -view.y, -view.z, -view.w);
-            var negated = SixDofBodyPresentation.sampleCardinal(accepted, negatedView.forward(),
+            var negated = SixDofBodyPresentation.sampleCardinal(accepted, safeNative(frame), negatedView.forward(), null,
                     previousYaw, bodyYaw, partialTicks);
             var negatedTransform = PlayerBodyRenderTransform.fromFlightPose(negated.body());
             assertVector(transform.modelUpToWorld(), negatedTransform.modelUpToWorld(), 1.0e-9,
@@ -116,6 +117,15 @@ class WalkingBodyPoseIntegrationTest {
             assertVector(transform.modelForwardToWorld(), negatedTransform.modelForwardToWorld(), 1.0e-9,
                     "q and -q keep the interpolated body heading " + frame);
             assertHeadLook(negatedView.forward(), negatedTransform);
+
+            double freeYawRadians = Math.toRadians(71);
+            FlightVector freeViewForward = new FlightVector(-Math.sin(freeYawRadians), 0,
+                    Math.cos(freeYawRadians));
+            var viewRelative = SixDofBodyPresentation.sampleCardinal(accepted, safeNative(frame),
+                    freeViewForward, freeViewForward, previousYaw, bodyYaw, partialTicks);
+            assertVector(projectedHeading(frame, 71),
+                    PlayerBodyRenderTransform.fromFlightPose(viewRelative.body()).modelForwardToWorld(), 1.0e-9,
+                    "G/free view-relative body follows live camera heading inside accepted physical up " + frame);
         }
 
         // These native yaw headings point along the physical up axis and therefore have no
@@ -130,8 +140,8 @@ class WalkingBodyPoseIntegrationTest {
                     new PlayerBodyShape.Cardinal(frame, new PlayerBodyShape.Dimensions(.6, 1.8, 1.62)));
             var accepted = new PlayerPhysicalSnapshot(new PlayerPhysicalSnapshot.Scope(new UUID(0, 9711),
                     new UUID(0, 9712), 0, 1), 1, placement, new Vec3d(0, 0, 0));
-            var sampled = SixDofBodyPresentation.sampleCardinal(accepted,
-                    world(frame.up()), yaw, yaw, 1);
+            var sampled = SixDofBodyPresentation.sampleCardinal(accepted, safeNative(frame),
+                    world(frame.up()), null, yaw, yaw, 1);
             var transform = PlayerBodyRenderTransform.fromFlightPose(sampled.body());
             assertVector(world(placement.attitude().basisZ()), transform.modelForwardToWorld(), 1.0e-9,
                     "degenerate native body yaw falls back to accepted attitude " + frame);
@@ -146,12 +156,36 @@ class WalkingBodyPoseIntegrationTest {
                 new PlayerBodyPlacement(new Vec3d(0, 0, 0), CardinalFrame.Y_POS.attitude(),
                         new PlayerBodyShape.Cardinal(CardinalFrame.Y_POS,
                                 new PlayerBodyShape.Dimensions(.6, 1.8, 1.62))), new Vec3d(0, 0, 0));
-        var vanilla = SixDofBodyPresentation.sampleCardinal(baseline, new FlightVector(0, 0, 1), 0, 0, 1);
+        var vanilla = SixDofBodyPresentation.sampleCardinal(baseline, safeNative(CardinalFrame.Y_POS),
+                new FlightVector(0, 0, 1), null, 0, 0, 1);
         var vanillaTransform = PlayerBodyRenderTransform.fromFlightPose(vanilla.body());
         assertVector(new FlightVector(0, 1, 0), vanillaTransform.modelUpToWorld(), 1.0e-9,
                 "native Y+ yaw-zero baseline retains world up");
         assertVector(new FlightVector(0, 0, 1), vanillaTransform.modelForwardToWorld(), 1.0e-9,
                 "native Y+ yaw-zero baseline retains +Z body heading");
+
+        for (CardinalFrame frame : CardinalFrame.values()) {
+            var placement = new PlayerBodyPlacement(new Vec3d(0, 0, 0), frame.attitude(),
+                    new PlayerBodyShape.Cardinal(frame, new PlayerBodyShape.Dimensions(.6, 1.8, 1.62)));
+            var accepted = new PlayerPhysicalSnapshot(new PlayerPhysicalSnapshot.Scope(new UUID(0, 9731),
+                    new UUID(0, 9732), 0, 1), 1, placement, new Vec3d(0, 0, 0));
+            Vec3d frozen = frame.attitude().basisX();
+            var manual = new PlayerBodyReference.Effective(PlayerBodyReference.Source.MANUAL, frame, frozen);
+            var sampled = SixDofBodyPresentation.sampleCardinal(accepted, manual,
+                    FlightAttitude.fromMinecraftDegrees(113, -17, 0).forward(),
+                    FlightAttitude.fromMinecraftDegrees(113, -17, 0).forward(), 10, 113, .5F);
+            var transform = PlayerBodyRenderTransform.fromFlightPose(sampled.body());
+            assertVector(projectedHeading(FlightAttitude.fromMinecraftDegrees(113, -17, 0).forward(), world(frame.up())),
+                    transform.modelForwardToWorld(), 1.0e-9,
+                    "explicit owner body forward follows presentation within accepted physical up " + frame);
+            assertVector(world(frame.up()), transform.modelUpToWorld(), 1.0e-9,
+                    "manual body presentation remains fenced to accepted physical up " + frame);
+        }
+    }
+
+    private static PlayerBodyReference.Effective safeNative(CardinalFrame frame) {
+        return new PlayerBodyReference.Effective(PlayerBodyReference.Source.SAFE_NATIVE, frame,
+                PlayerBodyReference.initialHeading(frame, 0));
     }
 
     @Test void acceptedGroundAndNearFootStepsReachUieRootWithoutChangingCamera(@TempDir Path directory) {
@@ -234,6 +268,12 @@ class WalkingBodyPoseIntegrationTest {
                 heading.y - up.y * upComponent, heading.z - up.z * upComponent);
         if (tangent.lengthSquared() <= 1.0e-12) return world(frame.attitude().basisZ());
         return tangent.normalize();
+    }
+
+    private static FlightVector projectedHeading(FlightVector heading, FlightVector up) {
+        double component = heading.dot(up);
+        return new FlightVector(heading.x - up.x * component, heading.y - up.y * component,
+                heading.z - up.z * component).normalize();
     }
 
     private static FlightVector world(dev.crlhitbox.api.geometry.Vec3d vector) {

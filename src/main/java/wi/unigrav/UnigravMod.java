@@ -1,6 +1,9 @@
 package wi.unigrav;
 
+import wi.unigrav.core.EntityGravitySources;
+import wi.unigrav.core.AmbientWorldFields;
 import java.io.File;
+import java.nio.file.Path;
 
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.fml.common.Loader;
@@ -11,6 +14,7 @@ import net.minecraftforge.fml.relauncher.Side;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.common.SidedProxy;
 import net.minecraftforge.fml.common.event.FMLPreInitializationEvent;
+import net.minecraftforge.fml.common.event.FMLServerAboutToStartEvent;
 import net.minecraftforge.fml.common.event.FMLServerStartingEvent;
 import net.minecraftforge.fml.common.event.FMLServerStoppingEvent;
 import org.apache.logging.log4j.LogManager;
@@ -31,8 +35,12 @@ import wi.unigrav.core.ServerMotionTimingDiagnostics;
 import wi.unigrav.core.config.EntityBindingsLoader;
 import wi.unigrav.core.config.GravitySourcesLoader;
 import wi.unigrav.core.config.MassPresetsLoader;
+import wi.unigrav.core.config.FloorConfigLoader;
 import wi.unigrav.core.collision.ChbDependency;
 import wi.unigrav.core.floor.FloorWorldFields;
+import wi.unigrav.core.floor.FloorRuntime;
+import wi.unigrav.core.floor.ServerLifetime;
+import net.minecraft.server.MinecraftServer;
 import wi.unigrav.core.player.NativePlayerMovement;
 import wi.unigrav.core.player.GIntentNetwork;
 import wi.unigrav.core.player.GIntentServer;
@@ -54,7 +62,7 @@ import wi.unigrav.proxy.IProxy;
  */
 @Mod(modid = Reference.MOD_ID, name = Reference.MOD_NAME, version = Reference.VERSION,
      acceptableRemoteVersions = "*",
-     dependencies = "required-after:crlhitbox@[0.1.0-SNAPSHOT];after:neofontrender_ui_enhancements")
+     dependencies = "required-after:crlhitbox@[0.1.0-ug-telemetry-candidate.1];after:neofontrender_ui_enhancements")
 public class UnigravMod {
 
     public static final Logger LOGGER = LogManager.getLogger(Reference.MOD_NAME);
@@ -79,6 +87,8 @@ public class UnigravMod {
     private final EntityBindingsLoader bindingsLoader = new EntityBindingsLoader();
     private final GlobalGravityTakeover takeover = new GlobalGravityTakeover();
     private final ServerMotionTimingDiagnostics motionTiming = new ServerMotionTimingDiagnostics();
+    private MinecraftServer floorServer;
+    private ServerLifetime floorServerLifetime;
 
     /** Network channel; currently only the client→server impact report. */
     public static SimpleNetworkWrapper NETWORK;
@@ -97,12 +107,14 @@ public class UnigravMod {
         NativePlayerMovement.INSTANCE.install();
         entityBinder = new GravityEntityBinder();
         entityBinder.registerOnEventBus();
-        PlayerPhysicsNetwork.initialize(PlayerPhysicsServer.INSTANCE::receive);
+        PlayerPhysicsNetwork.initialize(PlayerPhysicsServer.INSTANCE::receiveRaw);
         PlayerPhysicsServer.INSTANCE.install();
         PlayerRenderPoseNetwork.initialize(PlayerRenderPoseTracker.INSTANCE::receive);
         PlayerRenderPoseTracker.INSTANCE.install();
         MinecraftForge.EVENT_BUS.register(motionTiming);
         MassPresetsLoader.load(event.getModConfigurationDirectory());
+        MinecraftForge.EVENT_BUS.register(AmbientWorldFields.class);
+        MinecraftForge.EVENT_BUS.register(EntityGravitySources.class);
         worldGravity = new WorldGravityManager();
         worldGravity.registerOnEventBus();
         chunkGravity = new ChunkGravityManager();
@@ -118,7 +130,21 @@ public class UnigravMod {
     }
 
     @Mod.EventHandler
+    public void serverAboutToStart(FMLServerAboutToStartEvent event) {
+        MinecraftServer server = event.getServer();
+        Path floorConfig = FloorConfigLoader.ensureDefault(Loader.instance().getConfigDir().toPath());
+        var compiled = FloorConfigLoader.compile(FloorConfigLoader.parse(floorConfig), 1L);
+        floorServerLifetime = FloorWorldFields.start(server, compiled);
+        floorServer = server;
+        LOGGER.info("Started floor generation {} for server lifetime {}",
+                compiled.revision(), System.identityHashCode(floorServerLifetime));
+    }
+
+    @Mod.EventHandler
     public void serverStarting(FMLServerStartingEvent event) {
+        if (floorServer != event.getServer() || floorServerLifetime == null || !floorServerLifetime.isActive()) {
+            throw new IllegalStateException("floor runtime was not initialized for this server lifetime");
+        }
         motionTiming.start();
         event.registerServerCommand(new UnigravCommand());
         event.registerServerCommand(new RemoteBoostCommand());
@@ -138,14 +164,32 @@ public class UnigravMod {
         PlayerPhysicsServer.INSTANCE.stop();
         GIntentServer.INSTANCE.stop();
         NativePlayerMovement.INSTANCE.stop();
-        FloorWorldFields.clearAll();
+        MinecraftServer stoppingServer = floorServer;
+        ServerLifetime stoppingLifetime = floorServerLifetime;
+        if (stoppingServer != null && stoppingLifetime != null) {
+            try {
+                FloorWorldFields.stop(stoppingServer, stoppingLifetime);
+            } catch (FloorRuntime.PublishedRetirementFailure failure) {
+                LOGGER.error("Stopped floor root for server lifetime but generation retirement failed", failure);
+            } finally {
+                if (floorServer == stoppingServer && floorServerLifetime == stoppingLifetime) {
+                    floorServer = null;
+                    floorServerLifetime = null;
+                }
+            }
+        }
         RemoteBoostServer.INSTANCE.stop();
         // Unbind entities first: restores noGravity on REPLACE-bound
         // entities before the world is saved.
         takeover.disable();
         bindingsLoader.unloadAll();
-        for (var world : FMLCommonHandler.instance().getMinecraftServerInstance().worlds) entityBinder.releaseWorld(world);
+        MinecraftServer gravityServer = FMLCommonHandler.instance().getMinecraftServerInstance();
+        for (var world : gravityServer.worlds) entityBinder.releaseWorld(world);
         sourcesLoader.unloadAll();
+        worldGravity.stop(gravityServer);
+        chunkGravity.stop(gravityServer);
+        regionGravity.stop(gravityServer);
+        AmbientWorldFields.stop(gravityServer);
     }
 
 }

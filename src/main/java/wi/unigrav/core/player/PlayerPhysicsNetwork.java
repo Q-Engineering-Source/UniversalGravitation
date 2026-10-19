@@ -19,18 +19,16 @@ public final class PlayerPhysicsNetwork {
     private PlayerPhysicsNetwork() {}
 
     /** Called only when the full server owner and both retirement paths are ready. */
-    public static void initialize(BiConsumer<PlayerPhysicsProtocol.Packet, NetHandlerPlayServer> server) {
+    public static void initialize(BiConsumer<PlayerPhysicsInboundConnections.RawInboundFrame, NetHandlerPlayServer> server) {
         Objects.requireNonNull(server, "server");
         if (channel != null) throw new IllegalStateException("Physics network already initialized");
         var created = NetworkRegistry.INSTANCE.newSimpleChannel(PlayerPhysicsProtocol.CHANNEL);
         created.registerMessage((Message message, MessageContext context) -> {
-            if (message.packet().clientbound()) throw new IllegalArgumentException("Clientbound physics message on server");
-            server.accept(message.packet(), context.getServerHandler());
+            server.accept(message.rawFrame(), context.getServerHandler());
             return null;
         }, Message.class, 0, Side.SERVER);
         created.registerMessage((Message message, MessageContext context) -> {
-            if (!message.packet().clientbound()) throw new IllegalArgumentException("Serverbound physics message on client");
-            UnigravMod.proxy.receivePlayerPhysics(message.packet(), context.netHandler);
+            UnigravMod.proxy.receiveRawPlayerPhysics(message.rawFrame(), context.netHandler);
             return null;
         }, Message.class, 0, Side.CLIENT);
         channel = created;
@@ -50,19 +48,22 @@ public final class PlayerPhysicsNetwork {
     }
     public static final class Message implements IMessage {
         private PlayerPhysicsProtocol.Packet packet;
+        private PlayerPhysicsInboundConnections.RawInboundFrame rawFrame;
         public Message() {}
         public Message(PlayerPhysicsProtocol.Packet packet) { this.packet = Objects.requireNonNull(packet, "packet"); }
         public PlayerPhysicsProtocol.Packet packet() {
-            if (packet == null) throw new IllegalStateException("No decoded packet");
+            if (packet == null) throw new IllegalStateException("Inbound physics messages carry a raw frame, not a decoded packet");
             return packet;
+        }
+        public PlayerPhysicsInboundConnections.RawInboundFrame rawFrame() {
+            if (rawFrame == null) throw new IllegalStateException("No captured raw physics frame");
+            return rawFrame;
         }
         @Override public void fromBytes(ByteBuf buffer) {
             packet = null;
-            int size = buffer.readableBytes();
-            if (size > PlayerPhysicsProtocol.MAX_BYTES) throw new IllegalArgumentException("Physics packet length");
-            byte[] bytes = new byte[size];
-            buffer.readBytes(bytes);
-            packet = PlayerPhysicsProtocol.decode(bytes);
+            int actualBodyBytes = buffer.readableBytes();
+            rawFrame = PlayerPhysicsInboundConnections.INSTANCE.captureRawFrame(buffer);
+            buffer.skipBytes(actualBodyBytes);
         }
         @Override public void toBytes(ByteBuf buffer) { buffer.writeBytes(PlayerPhysicsProtocol.encode(packet())); }
     }

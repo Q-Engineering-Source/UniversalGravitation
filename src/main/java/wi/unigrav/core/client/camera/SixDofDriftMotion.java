@@ -13,12 +13,17 @@ final class SixDofDriftMotion {
 
     static Vec3 worldIntent(SixDofCameraOrientation.Snapshot attitude, Intent intent) {
         if (!isValid(attitude, intent, Vec3.ZERO, 0, 0, 0.05)) return Vec3.ZERO;
-        double x = Math.fma(intent.forward(), attitude.forward().x(),
-                Math.fma(intent.right(), attitude.right().x(), intent.up() * attitude.up().x()));
-        double y = Math.fma(intent.forward(), attitude.forward().y(),
-                Math.fma(intent.right(), attitude.right().y(), intent.up() * attitude.up().y()));
-        double z = Math.fma(intent.forward(), attitude.forward().z(),
-                Math.fma(intent.right(), attitude.right().z(), intent.up() * attitude.up().z()));
+        return worldIntent(SixDofMovementFrame.fromCamera(attitude), intent);
+    }
+
+    static Vec3 worldIntent(SixDofMovementFrame movementFrame, Intent intent) {
+        if (!isValid(movementFrame, intent, Vec3.ZERO, 0, 0, 0.05)) return Vec3.ZERO;
+        double x = Math.fma(intent.forward(), movementFrame.forward().x(),
+                Math.fma(intent.right(), movementFrame.right().x(), intent.up() * movementFrame.up().x()));
+        double y = Math.fma(intent.forward(), movementFrame.forward().y(),
+                Math.fma(intent.right(), movementFrame.right().y(), intent.up() * movementFrame.up().y()));
+        double z = Math.fma(intent.forward(), movementFrame.forward().z(),
+                Math.fma(intent.right(), movementFrame.right().z(), intent.up() * movementFrame.up().z()));
         double length = Math.hypot(Math.hypot(x, y), z);
         if (!Double.isFinite(length)) return Vec3.ZERO;
         double scale = length > 1 ? 1 / length : 1;
@@ -54,12 +59,24 @@ final class SixDofDriftMotion {
             return Vec3.ZERO;
         }
 
+        return deltaVelocity(SixDofMovementFrame.fromCamera(attitude), intent,
+                currentVelocityMps, accelerationMps2, speedLimitMps, deltaSeconds);
+    }
+
+    static Vec3 deltaVelocity(SixDofMovementFrame movementFrame, Intent intent,
+            Vec3 currentVelocityMps, double accelerationMps2, double speedLimitMps,
+            double deltaSeconds) {
+        if (!isValid(movementFrame, intent, currentVelocityMps, accelerationMps2, speedLimitMps,
+                deltaSeconds)) {
+            return Vec3.ZERO;
+        }
+
         double effectiveDelta = Math.min(deltaSeconds, MAX_DELTA_SECONDS);
         double magnitude = accelerationMps2 * effectiveDelta;
         if (!Double.isFinite(magnitude) || magnitude == 0.0) {
             return Vec3.ZERO;
         }
-        Vec3 rawDelta = worldIntent(attitude, intent).scale(magnitude);
+        Vec3 rawDelta = worldIntent(movementFrame, intent).scale(magnitude);
         if (!isFinite(rawDelta) || speedLimitMps == 0.0) {
             return isFinite(rawDelta) ? rawDelta : Vec3.ZERO;
         }
@@ -80,6 +97,23 @@ final class SixDofDriftMotion {
                 && isFinite(attitude.forward())
                 && isFinite(attitude.right())
                 && isFinite(attitude.up())
+                && isFinite(currentVelocity)
+                && Double.isFinite(acceleration)
+                && acceleration >= 0.0
+                && Double.isFinite(speedLimit)
+                && speedLimit >= 0.0
+                && Double.isFinite(deltaSeconds)
+                && deltaSeconds > 0.0;
+    }
+
+    private static boolean isValid(SixDofMovementFrame movementFrame, Intent intent,
+            Vec3 currentVelocity, double acceleration, double speedLimit, double deltaSeconds) {
+        return movementFrame != null
+                && intent != null
+                && currentVelocity != null
+                && isFinite(movementFrame.forward())
+                && isFinite(movementFrame.right())
+                && isFinite(movementFrame.up())
                 && isFinite(currentVelocity)
                 && Double.isFinite(acceleration)
                 && acceleration >= 0.0

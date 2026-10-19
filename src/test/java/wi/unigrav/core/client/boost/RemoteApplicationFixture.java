@@ -27,4 +27,9 @@ public final class RemoteApplicationFixture {
     public Optional<PlayerPhysicsProtocol.ApplicationId> application() {
         return session.applicationReceipt().map(PlayerPhysicsProtocol.ApplicationId::from);
     }
+
+    /** Returns the exact state receipt accepted by the real remote client session. */
+    public Optional<BoostProtocol.StateApplication> stateApplication() {
+        return session.applicationReceipt();
+    }
 }

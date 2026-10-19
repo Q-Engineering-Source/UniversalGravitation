@@ -1,6 +1,7 @@
 package wi.unigrav.core.player;
 
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * Shape parameters, independent of placement, view, support and propulsion.
@@ -8,6 +9,9 @@ import java.util.Objects;
  */
 public sealed interface PlayerBodyShape {
     Dimensions dimensions();
+
+    /** Collision recipe dimensions; native actor dimensions remain independently exact. */
+    default Dimensions geometryDimensions() { return dimensions(); }
 
     /**
      * Native positive dimensions; capsule representability is a separate admission.
@@ -51,13 +55,36 @@ public sealed interface PlayerBodyShape {
         }
     }
 
+    /** Full physical body dimensions, independent of a native short-pose W/H/eye record. */
+    record CollisionProfile(double diameter, double length) {
+        public CollisionProfile {
+            if (!Double.isFinite(diameter) || diameter / 2 <= 0 || !Double.isFinite(length) || length < diameter)
+                throw new IllegalArgumentException("physical capsule requires finite length >= diameter > 0");
+        }
+        public static CollisionProfile fromNative(NativeBodyProfileProducer.Profile observed) {
+            Objects.requireNonNull(observed, "observed");
+            return new CollisionProfile(observed.diameter(), observed.length());
+        }
+    }
+
     /** A capsule whose long axis follows the independently accepted body attitude. */
-    record FreeCapsule(Dimensions dimensions) implements PlayerBodyShape {
+    record FreeCapsule(Dimensions dimensions, CollisionProfile collisionProfile, Optional<FreeEyeAnchor> eyeAnchor) implements PlayerBodyShape {
+        public FreeCapsule(Dimensions dimensions) {
+            this(dimensions, new CollisionProfile(dimensions.width(), dimensions.height()), Optional.empty());
+        }
+        public FreeCapsule(Dimensions dimensions, CollisionProfile collisionProfile) {
+            this(dimensions, collisionProfile, Optional.empty());
+        }
         public FreeCapsule {
             Objects.requireNonNull(dimensions, "dimensions");
-            if (!dimensions.supportsCapsule()) {
-                throw new IllegalArgumentException("capsule height must be at least its width");
-            }
+            Objects.requireNonNull(collisionProfile, "collisionProfile");
+            Objects.requireNonNull(eyeAnchor, "eyeAnchor");
+        }
+        @Override public Dimensions geometryDimensions() {
+            // Preserve the exact original object and arithmetic path for every ordinary profile.
+            return Double.doubleToRawLongBits(dimensions.width()) == Double.doubleToRawLongBits(collisionProfile.diameter())
+                    && Double.doubleToRawLongBits(dimensions.height()) == Double.doubleToRawLongBits(collisionProfile.length())
+                    ? dimensions : new Dimensions(collisionProfile.diameter(), collisionProfile.length(), dimensions.eyeHeight());
         }
     }
 }

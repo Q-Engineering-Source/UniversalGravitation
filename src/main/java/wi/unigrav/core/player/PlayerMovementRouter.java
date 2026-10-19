@@ -54,7 +54,7 @@ public final class PlayerMovementRouter {
     public void reanchorNativeUpdate(EntityPlayerMP player, double x, double y, double z, float yaw, float pitch) {
         // The owner already installed its exact collider. Rebuilding it from firstGood would also undo
         // a native teleport issued inside onUpdateEntity. Unknown tail divergence is not rolled back here.
-        if (physics != null && physics.drivesMotion(player)) return;
+        if (physics != null && physics.preservesNativeUpdateGeometry(player)) return;
         player.setPositionAndRotation(x, y, z, yaw, pitch);
     }
 

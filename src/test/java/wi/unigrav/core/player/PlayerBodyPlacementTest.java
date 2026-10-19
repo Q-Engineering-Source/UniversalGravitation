@@ -115,6 +115,51 @@ class PlayerBodyPlacementTest {
     }
 
     @Test
+    void cardinalTargetsKeepAcceptedFreeFootAtNativeWidthForAllSixFrames() {
+        var dimensions = new PlayerBodyShape.Dimensions(0.6F, 1.8F, 1.62F);
+        Vec3d center = new Vec3d(0.1, 10.0, -0.5);
+        var free = acceptedFree(center, Rotation3d.identity(), dimensions);
+        Vec3d acceptedFoot = free.freePhysicalFoot();
+        assertEquals(Double.doubleToRawLongBits(0.1), Double.doubleToRawLongBits(acceptedFoot.x()));
+
+        for (CardinalFrame frame : CardinalFrame.values()) {
+            var work = new StoredDyadic.Work();
+            var target = PlayerBodyPlacement.cardinalFromAcceptedFreeDesiredFoot(free, frame, dimensions, work);
+            Vec3d physicalFoot = target.physicalFeet().orElseThrow();
+            assertRawVectorEquals(acceptedFoot, physicalFoot);
+            assertEquals(frame, ((PlayerBodyShape.Cardinal) target.shape()).frame());
+
+            int normalAxis = frame == CardinalFrame.X_POS || frame == CardinalFrame.X_NEG ? 0
+                    : frame == CardinalFrame.Y_POS || frame == CardinalFrame.Y_NEG ? 1 : 2;
+            for (int axis = 0; axis < 3; axis++) {
+                if (axis != normalAxis) assertNativeProfileExtent(target.bounds(), axis, dimensions.width());
+            }
+            assertTrue(work.units() > 0, "native-center correction is charged to the shared numeric work");
+        }
+    }
+
+    @Test
+    void cardinalTargetUsesItsActualMidpointWhenSourceTangentFootIsNotRepresentable() {
+        var dimensions = new PlayerBodyShape.Dimensions(0.6F, 1.8F, 1.62F);
+        var free = acceptedFree(new Vec3d(1.0e-10, 10.0, -0.5), Rotation3d.identity(), dimensions);
+        Vec3d sourceFoot = free.freePhysicalFoot();
+        var target = PlayerBodyPlacement.cardinalFromAcceptedFreeDesiredFoot(free, CardinalFrame.Y_POS,
+                dimensions, new StoredDyadic.Work());
+        Vec3d actualFoot = target.physicalFeet().orElseThrow();
+
+        assertNotEquals(Double.doubleToRawLongBits(sourceFoot.x()), Double.doubleToRawLongBits(actualFoot.x()),
+                "the actual finite native AABB midpoint is the target; source-foot equality is impossible here");
+        assertNativeProfileExtent(target.bounds(), 0, dimensions.width());
+        assertNativeProfileExtent(target.bounds(), 2, dimensions.width());
+        assertEquals(Double.doubleToRawLongBits((double) (float) dimensions.width()),
+                Double.doubleToRawLongBits(target.shape().dimensions().width()));
+        assertEquals(sourceFoot.y(), actualFoot.y());
+        assertEquals(sourceFoot.z(), actualFoot.z());
+        assertTrue(contains(target.bounds(), target.capsule().bounds()),
+                "the native Cardinal box must contain the real terminal Cardinal capsule");
+    }
+
+    @Test
     void tangentBodyHeadingDoesNotRotateTheCardinalCollisionBox() {
         var ordinary = cardinal(CardinalFrame.Y_POS);
         var heading = new PlayerBodyPlacement(CENTER, new Rotation3d(0, 1, 0, 1), ordinary.shape());
@@ -232,6 +277,45 @@ class PlayerBodyPlacementTest {
 
     private static PlayerBodyPlacement cardinal(CardinalFrame frame) {
         return new PlayerBodyPlacement(CENTER, frame.attitude(), new PlayerBodyShape.Cardinal(frame, DIMENSIONS));
+    }
+
+    private static PlayerBodyPlacement acceptedFree(Vec3d center, Rotation3d attitude,
+                                                     PlayerBodyShape.Dimensions dimensions) {
+        var shape = new PlayerBodyShape.FreeCapsule(dimensions);
+        var work = new StoredDyadic.Work();
+        var limits = StoredRealizationLimits.derive(center, attitude, dimensions, work);
+        var geometry = StoredCapsuleGeometry.fromRecipe(center, attitude, dimensions,
+                limits.nominalHalfLine(), RealizationRelation.nominal(limits));
+        Aabb bounds = geometry.capsule().bounds();
+        return PlayerBodyPlacement.fromAcceptedFreeGeometry(center, attitude, shape, geometry, bounds,
+                new Vec3d(center.x(), bounds.min().y(), center.z()));
+    }
+
+    private static double axisExtent(Aabb bounds, int axis) {
+        return switch (axis) {
+            case 0 -> bounds.max().x() - bounds.min().x();
+            case 1 -> bounds.max().y() - bounds.min().y();
+            case 2 -> bounds.max().z() - bounds.min().z();
+            default -> throw new IllegalArgumentException("axis must be 0..2");
+        };
+    }
+
+    private static void assertNativeProfileExtent(Aabb bounds, int axis, double nativeWidth) {
+        double extent = axisExtent(bounds, axis);
+        assertTrue(extent >= nativeWidth && extent <= Math.nextUp(Math.nextUp(nativeWidth)),
+                "actual bounds use the float-derived profile width with only its bounded outward rounding");
+    }
+
+    private static boolean contains(Aabb outer, Aabb inner) {
+        return outer.min().x() <= inner.min().x() && outer.min().y() <= inner.min().y()
+                && outer.min().z() <= inner.min().z() && outer.max().x() >= inner.max().x()
+                && outer.max().y() >= inner.max().y() && outer.max().z() >= inner.max().z();
+    }
+
+    private static void assertRawVectorEquals(Vec3d expected, Vec3d actual) {
+        assertEquals(Double.doubleToRawLongBits(expected.x()), Double.doubleToRawLongBits(actual.x()), "x");
+        assertEquals(Double.doubleToRawLongBits(expected.y()), Double.doubleToRawLongBits(actual.y()), "y");
+        assertEquals(Double.doubleToRawLongBits(expected.z()), Double.doubleToRawLongBits(actual.z()), "z");
     }
 
     private static PlayerBodyPlacement capsule(Vec3d center, Rotation3d attitude) {

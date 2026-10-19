@@ -31,6 +31,10 @@ public final class PlayerPhysicsClientOffer {
         return true;
     }
 
+    boolean isCurrentOffer(PlayerPhysicsProtocol.Packet exactOffer) {
+        return offer == exactOffer;
+    }
+
     public CPacketPlayer prepare(CPacketPlayer packet, Vec3d transport, float yaw, float pitch,
             boolean remoteCustody, Optional<BoostProtocol.StateApplication> application,
             Consumer<PlayerPhysicsProtocol.Packet> outbound) {

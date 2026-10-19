@@ -22,17 +22,25 @@ import net.minecraft.util.ResourceLocation;
 public final class MagneticBlockRule {
     private final String registryId;
     private final Block block;
+    private final Integer metadata;
     private final Map<String, String> stateProperties;
     private final Map<IProperty<?>, Comparable<?>> requiredValues;
     private final NbtPattern tileEntityPattern;
 
     public MagneticBlockRule(String registryId, Map<String, String> stateProperties, NbtPattern tileEntityPattern) {
+        this(registryId, stateProperties, null, tileEntityPattern);
+    }
+
+    public MagneticBlockRule(String registryId, Map<String, String> stateProperties, Integer metadata,
+                             NbtPattern tileEntityPattern) {
         ResourceLocation location = ExactRegistryId.parse(registryId);
         if (!Block.REGISTRY.containsKey(location)) {
             throw new IllegalArgumentException("unknown magnetic block registry ID: " + location);
         }
         this.registryId = location.toString();
         this.block = Objects.requireNonNull(Block.REGISTRY.getObject(location), "registered block");
+        if (metadata != null && metadata < 0) throw new IllegalArgumentException("metadata must be nonnegative");
+        this.metadata = metadata;
         this.stateProperties = Map.copyOf(stateProperties);
         this.tileEntityPattern = tileEntityPattern;
         Map<String, IProperty<?>> available = new HashMap<>();
@@ -58,6 +66,10 @@ public final class MagneticBlockRule {
         return stateProperties;
     }
 
+    public Integer metadata() {
+        return metadata;
+    }
+
     /** Allows a world reader to avoid serializing TE data for an unconditional rule. */
     public boolean requiresTileEntityNbt() {
         return tileEntityPattern != null;
@@ -68,6 +80,7 @@ public final class MagneticBlockRule {
         if (state == null || state.getBlock() != block) {
             return false;
         }
+        if (metadata != null && metadata.intValue() != block.getMetaFromState(state)) return false;
         for (Map.Entry<IProperty<?>, Comparable<?>> required : requiredValues.entrySet()) {
             if (!required.getValue().equals(state.getProperties().get(required.getKey()))) {
                 return false;

@@ -4,12 +4,14 @@ import java.nio.file.Path;
 import java.util.Optional;
 import java.util.UUID;
 import dev.crlhitbox.api.geometry.Vec3d;
+import dev.crlhitbox.api.geometry.Rotation3d;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.init.Bootstrap;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import wi.unigrav.core.client.PlayerPhysicsClientPresentation;
+import wi.unigrav.core.client.PlayerPhysicsClientMirror;
 import wi.unigrav.core.client.ClientPhysicsTickQueue;
 import wi.unigrav.core.client.PlayerPhysicsClientSession;
 import wi.unigrav.core.boost.RemoteBoostBoundedDispatcher;
@@ -17,12 +19,105 @@ import wi.unigrav.core.player.PlayerPhysicsProtocol;
 import net.minecraft.network.play.client.CPacketPlayer;
 import wi.unigrav.core.player.CardinalFrame;
 import wi.unigrav.core.player.PlayerBodyPlacement;
+import wi.unigrav.core.player.PlayerBodyReference;
 import wi.unigrav.core.player.PlayerBodyShape;
 import wi.unigrav.core.player.PlayerPhysicalSnapshot;
 import wi.unigrav.api.math.Vec3;
 import static org.junit.jupiter.api.Assertions.*;
 
 class PlayerPhysicsPresentationTest {
+    @Test void freeEyeUsesAcceptedQuaternionAndOnlySameScopeShapeHistory(@TempDir Path directory) {
+        try (var fixture = BootWorldFixture.open(directory, new UUID(0, 921), true)) {
+            var player = fixture.serverPlayer(new UUID(0, 922));
+            var scope = new PlayerPhysicalSnapshot.Scope(player.getUniqueID(), new UUID(0, 923), player.dimension, 1);
+            var shape = new PlayerBodyShape.FreeCapsule(new PlayerBodyShape.Dimensions(.6F, 1.8F, 1.62F));
+            var contacts = Optional.of(new PlayerPhysicalSnapshot.Contacts(false, false, false, 0));
+            var first = new PlayerPhysicalSnapshot(scope, 1,
+                    new PlayerBodyPlacement(new Vec3d(8, 70, 8), Rotation3d.identity(), shape), new Vec3d(0, 0, 0), contacts);
+            var next = new PlayerPhysicalSnapshot(scope, 2,
+                    new PlayerBodyPlacement(new Vec3d(10, 71, 12), new Rotation3d(.3, .4, .2, .5), shape),
+                    new Vec3d(1, 2, 3), contacts);
+            var presentation = new PlayerPhysicsClientPresentation();
+            assertTrue(presentation.install(player, first));
+            assertTrue(presentation.install(player, next));
+            assertEquals(first.placement().eye(), presentation.acceptedFreeEyePosition(player, next, 0));
+            assertEquals(next.placement().eye(), presentation.acceptedFreeEyePosition(player, next, 1));
+            var changedScope = new PlayerPhysicalSnapshot(new PlayerPhysicalSnapshot.Scope(player.getUniqueID(),
+                    new UUID(0, 924), player.dimension, 2), 1, next.placement(), next.worldVelocity(), contacts);
+            assertTrue(presentation.install(player, changedScope));
+            assertEquals(changedScope.placement().eye(), presentation.acceptedFreeEyePosition(player, changedScope, 0));
+            player.posX += 1;
+            assertNull(presentation.acceptedFreeEyePosition(player, changedScope, .5F));
+        }
+    }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void freeTickSpanUsesRealStartAndRetainsIndependentEyeAnchor(boolean anchored, @TempDir Path directory) {
+        try (var fixture = BootWorldFixture.open(directory, new UUID(0, 925), true)) {
+            var player = fixture.serverPlayer(new UUID(0, 926));
+            var scope = new PlayerPhysicalSnapshot.Scope(player.getUniqueID(), new UUID(0, 927), player.dimension, 1);
+            var dimensions = new PlayerBodyShape.Dimensions(.6F, 1.8F, 1.62F);
+            var center = new Vec3d(8, 70, 8);
+            var q = new Rotation3d(.1, .2, .3, .9);
+            var shape = anchored ? new PlayerBodyShape.FreeCapsule(dimensions,
+                    new PlayerBodyShape.CollisionProfile(dimensions.width(), dimensions.height()),
+                    Optional.of(new wi.unigrav.core.player.FreeEyeAnchor(
+                            wi.unigrav.core.player.FreeEyeAnchor.STORED_BASIS_V1, center,
+                            new Vec3d(8.125, 70.375, 8.25), q))) : new PlayerBodyShape.FreeCapsule(dimensions);
+            var placement = new PlayerBodyPlacement(center, q, shape);
+            var contacts = Optional.of(new PlayerPhysicalSnapshot.Contacts(false, false, false, 0));
+            var a = new PlayerPhysicalSnapshot(scope, 1, placement, new Vec3d(0, 0, 0), contacts);
+            var c = new PlayerPhysicalSnapshot(scope, 2,
+                    new PlayerBodyPlacement(center.add(new Vec3d(0, 0, .12)), q, shape), new Vec3d(0, 0, 2.4), contacts);
+            var presentation = new PlayerPhysicsClientPresentation();
+            presentation.beginClientTick(1); assertTrue(presentation.install(player, a));
+            presentation.beginClientTick(2); assertTrue(presentation.install(player, c));
+            var rendered = presentation.acceptedFreeEyePosition(player, c, .62F);
+            assertEquals(a.placement().eye().add(c.placement().eye().subtract(a.placement().eye()).multiply((double).62F)), rendered);
+            assertEquals(rendered, presentation.acceptedFreeEyePosition(player, c, .62F), "getters do not advance time");
+            presentation.beginClientTick(3);
+            var afterStart = presentation.acceptedFreeEyePosition(player, c, .28F);
+            assertEquals(c.placement().eye(), afterStart,
+                    "same current revision without a new install must not replay the old Free span after START");
+            assertTrue(afterStart.z() >= rendered.z(), "forward authority cannot reverse merely because partial reset");
+            var b = new PlayerPhysicalSnapshot(scope, 3,
+                    new PlayerBodyPlacement(center.add(new Vec3d(0, 0, .24)), q, shape), c.worldVelocity(), contacts);
+            var d = new PlayerPhysicalSnapshot(scope, 4,
+                    new PlayerBodyPlacement(center.add(new Vec3d(0, 0, .36)), q, shape), c.worldVelocity(), contacts);
+            var stale = presentation.prepare(player, b);
+            presentation.beginClientTick(4); assertFalse(presentation.commitPrepared(stale));
+            assertTrue(presentation.install(player, b)); assertTrue(presentation.install(player, d));
+            assertEquals(c.placement().eye(), presentation.acceptedFreeEyePosition(player, d, 0), "burst shares tick start");
+            assertEquals(d.placement().eye(), presentation.acceptedFreeEyePosition(player, d, 1));
+            var sameTick = presentation.prepare(player, d); presentation.beginClientTick(4);
+            assertTrue(sameTick.isBoundTo(presentation, player, d));
+            presentation.beginClientTick(5);
+            assertEquals(d.placement().eye(), presentation.acceptedFreeEyePosition(player, d, .28F));
+            var reverse = new PlayerPhysicalSnapshot(scope, 5, placement, new Vec3d(0, 0, -2.4), contacts);
+            assertTrue(presentation.install(player, reverse));
+            assertEquals(d.placement().eye().add(reverse.placement().eye().subtract(d.placement().eye()).multiply(.5)),
+                    presentation.acceptedFreeEyePosition(player, reverse, .5F), "real reverse motion is not clamped");
+            var successor = new PlayerPhysicalSnapshot(new PlayerPhysicalSnapshot.Scope(scope.playerId(), new UUID(0, 928),
+                    scope.dimension(), 2), 1, d.placement(), d.worldVelocity(), contacts);
+            assertTrue(presentation.install(player, successor));
+            assertEquals(successor.placement().eye(), presentation.acceptedFreeEyePosition(player, successor, 0));
+            var other = fixture.serverPlayer(new UUID(0, 929));
+            var otherPose = new PlayerPhysicalSnapshot(new PlayerPhysicalSnapshot.Scope(other.getUniqueID(), new UUID(0, 930),
+                    other.dimension, 1), 1, placement, c.worldVelocity(), contacts);
+            assertTrue(presentation.install(other, otherPose));
+            assertNull(presentation.acceptedFreeEyePosition(player, successor, .5F));
+            assertEquals(otherPose.placement().eye(), presentation.acceptedFreeEyePosition(other, otherPose, 0));
+            var cardinal = snapshot(other, 2, 12, false);
+            assertTrue(presentation.install(other, cardinal));
+            assertNull(presentation.acceptedFreeEyePosition(other, cardinal, .5F));
+            assertTrue(presentation.install(other, otherPose));
+            assertEquals(otherPose.placement().eye(), presentation.acceptedFreeEyePosition(other, otherPose, 0), "shape cut");
+            presentation.reset(); assertNull(presentation.acceptedFreeEyePosition(other, otherPose, .5F));
+            assertTrue(presentation.install(other, otherPose));
+            assertEquals(otherPose.placement().eye(), presentation.acceptedFreeEyePosition(other, otherPose, 0));
+        }
+    }
+
     @BeforeAll static void bootstrap() { Bootstrap.register(); }
 
     @Test void risingFallingAndTangentMovementRetainAllThreeHistoryComponents(@TempDir Path directory) {
@@ -129,6 +224,77 @@ class PlayerPhysicsPresentationTest {
         }
     }
 
+    @Test void acceptedPhysicalEyeInterpolatesOnlyWithinCurrentInstalledScopeAndGeometry(@TempDir Path directory) {
+        try (var world = BootWorldFixture.open(directory, new UUID(0, 9935), true)) {
+            var player = world.serverPlayer(new UUID(0, 9936));
+            var presentation = new PlayerPhysicsClientPresentation();
+            var first = snapshot(player, 1, 8, false);
+            var second = snapshot(player, 2, 10, false);
+            var effective = new PlayerBodyReference.Effective(PlayerBodyReference.Source.ENVIRONMENT,
+                    CardinalFrame.Y_POS, new Vec3d(0, 0, 1));
+            assertTrue(presentation.install(player, first));
+            assertTrue(presentation.install(player, second));
+
+            Vec3d before = first.placement().eye();
+            Vec3d after = second.placement().eye();
+            assertEquals(before, presentation.acceptedEyePosition(player, second, effective, 0));
+            assertEquals(new Vec3d((before.x() + after.x()) / 2, (before.y() + after.y()) / 2,
+                    (before.z() + after.z()) / 2),
+                    presentation.acceptedEyePosition(player, second, effective, .5F));
+            assertEquals(after, presentation.acceptedEyePosition(player, second, effective, 1));
+            assertNull(presentation.acceptedEyePosition(player,
+                    new PlayerPhysicalSnapshot(second.scope(), second.revision(), second.placement(),
+                            second.worldVelocity(), second.contacts()), effective, .5F),
+                    "an equal but separately received snapshot is not the installed presentation identity");
+
+            player.posZ += .25;
+            assertNull(presentation.acceptedEyePosition(player, second, effective, .5F),
+                    "live actor drift beyond accepted geometry fences the eye provider");
+
+            presentation.reset();
+            var replacement = snapshot(player, 3, 500, false);
+            assertTrue(presentation.install(player, replacement));
+            assertEquals(replacement.placement().eye(),
+                    presentation.acceptedEyePosition(player, replacement, effective, 0),
+                    "reset/lifetime replacement cannot interpolate from the prior world location");
+        }
+    }
+
+    @Test void cardinalTickSpanKeepsBurstAnchorAndInvalidatesEarlierPreparation(@TempDir Path directory) {
+        try (var world = BootWorldFixture.open(directory, new UUID(0, 9981), true)) {
+            var player = world.serverPlayer(new UUID(0, 9982));
+            var presentation = new PlayerPhysicsClientPresentation();
+            var effective = new PlayerBodyReference.Effective(PlayerBodyReference.Source.ENVIRONMENT,
+                    CardinalFrame.Y_POS, new Vec3d(0, 0, 1));
+            var a = snapshot(player, 1, 8, false);
+            presentation.beginClientTick(1);
+            assertTrue(presentation.install(player, a));
+            var b = snapshot(player, 2, 9, false);
+            var stale = presentation.prepare(player, b);
+            presentation.beginClientTick(2);
+            assertFalse(presentation.commitPrepared(stale));
+            assertTrue(presentation.install(player, b));
+            var c = snapshot(player, 3, 10, false);
+            assertTrue(presentation.install(player, c));
+            assertEquals(a.placement().eye(), presentation.acceptedEyePosition(player, c, effective, 0));
+            var sameTick = presentation.prepare(player, c);
+            presentation.beginClientTick(2);
+            assertTrue(sameTick.isBoundTo(presentation, player, c), "duplicate tick does not mutate the span");
+            presentation.beginClientTick(3);
+            assertEquals(c.placement().eye(), presentation.acceptedEyePosition(player, c, effective, .32F));
+            var reverse = snapshot(player, 4, 7, false);
+            assertTrue(presentation.install(player, reverse));
+            assertEquals(c.placement().eye(), presentation.acceptedEyePosition(player, reverse, effective, 0));
+            assertEquals(reverse.placement().eye(), presentation.acceptedEyePosition(player, reverse, effective, 1));
+            assertEquals(c.placement().eye().add(reverse.placement().eye().subtract(c.placement().eye()).multiply(.5)),
+                    presentation.acceptedEyePosition(player, reverse, effective, .5F));
+            presentation.reset();
+            var replacement = snapshot(player, 5, 500, false);
+            assertTrue(presentation.install(player, replacement));
+            assertEquals(replacement.placement().eye(), presentation.acceptedEyePosition(player, replacement, effective, 0));
+        }
+    }
+
     @Test void acceptedWalkFeedsLimbsAndBobbingDistanceOncePerClientTick(@TempDir Path directory) {
         try (var world = BootWorldFixture.open(directory, new UUID(0, 771), true)) {
             var player = world.serverPlayer(new UUID(0, 772));
@@ -222,6 +388,191 @@ class PlayerPhysicsPresentationTest {
             presentation.tick(player);
             assertEquals(0, player.distanceWalkedModified, "no displacement accumulated across the native window");
         }
+    }
+
+    @Test void preparationIsPureAndCommitOnlyChangesPresentationState(@TempDir Path directory) {
+        try (var world = BootWorldFixture.open(directory, new UUID(0, 9841), true)) {
+            var player = world.serverPlayer(new UUID(0, 9842));
+            var otherActor = world.player(new UUID(0, 9848));
+            var first = snapshot(player, 1, 8, true);
+            var state = strafeSnapshot(player, 2, 8.2);
+            var presentation = new PlayerPhysicsClientPresentation();
+            var reference = new PlayerBodyReference.Effective(PlayerBodyReference.Source.ENVIRONMENT,
+                    CardinalFrame.Y_POS, new Vec3d(0, 0, 1));
+            assertTrue(presentation.install(player, first));
+            Vec3d visibleEyeBefore = presentation.acceptedEyePosition(player, first, reference, .5F);
+            float bodyOffsetBefore = presentation.bodyYawOffset(player, 1);
+            ActorState beforePrepare = actorState(player);
+
+            var prepared = presentation.prepare(player, state);
+            assertTrue(prepared.isBoundTo(presentation, player, state));
+            assertFalse(prepared.isBoundTo(new PlayerPhysicsClientPresentation(), player, state));
+            assertFalse(prepared.isBoundTo(presentation, otherActor, state));
+            assertFalse(prepared.isBoundTo(presentation, player, strafeSnapshot(player, 2, 8.2)));
+            assertActorStateEquals(beforePrepare, player);
+            assertEquals(visibleEyeBefore, presentation.acceptedEyePosition(player, first, reference, .5F),
+                    "preparation leaves the currently committed eye presentation unchanged");
+            assertEquals(bodyOffsetBefore, presentation.bodyYawOffset(player, 1), 0);
+
+            player.setPosition(40, 90, 42);
+            player.prevPosX = -101;
+            player.prevPosY = -102;
+            player.prevPosZ = -103;
+            player.width = .65F;
+            player.height = 1.4F;
+            player.eyeHeight = 1.1F;
+            player.motionX = 11;
+            player.motionY = 12;
+            player.motionZ = 13;
+            player.onGround = false;
+            player.collidedHorizontally = true;
+            player.collidedVertically = false;
+            player.collided = true;
+            player.fallDistance = 17;
+            ActorState beforeCommit = actorState(player);
+
+            assertTrue(presentation.commitPrepared(prepared));
+            assertActorStateEquals(beforeCommit, player);
+            assertFalse(prepared.isBoundTo(presentation, player, state),
+                    "successful commit advances the presentation generation");
+            assertNull(presentation.acceptedEyePosition(player, state, reference, .5F),
+                    "commit does not repair actor geometry through the mirror");
+
+            assertTrue(PlayerPhysicsClientMirror.install(player, state));
+            Vec3d firstEye = first.placement().eye();
+            Vec3d nextEye = state.placement().eye();
+            assertEquals(new Vec3d((firstEye.x() + nextEye.x()) / 2,
+                            (firstEye.y() + nextEye.y()) / 2,
+                            (firstEye.z() + nextEye.z()) / 2),
+                    presentation.acceptedEyePosition(player, state, reference, .5F));
+        }
+    }
+
+    @Test void preparedAndCompatibilityInstallsProduceEquivalentTickAndEyePresentation(@TempDir Path directory) {
+        try (var world = BootWorldFixture.open(directory, new UUID(0, 9843), true)) {
+            var compatibilityActor = world.serverPlayer(new UUID(0, 9844));
+            var preparedActor = world.serverPlayer(new UUID(0, 9845));
+            compatibilityActor.rotationYaw = preparedActor.rotationYaw = 0;
+            var compatibility = new PlayerPhysicsClientPresentation();
+            var split = new PlayerPhysicsClientPresentation();
+            var reference = new PlayerBodyReference.Effective(PlayerBodyReference.Source.ENVIRONMENT,
+                    CardinalFrame.Y_POS, new Vec3d(0, 0, 1));
+
+            for (int revision = 1; revision <= 4; revision++) {
+                double x = 8 + revision * .1;
+                var compatibilityState = strafeSnapshot(compatibilityActor, revision, x);
+                var preparedState = strafeSnapshot(preparedActor, revision, x);
+                assertTrue(compatibility.install(compatibilityActor, compatibilityState));
+
+                assertTrue(PlayerPhysicsClientMirror.install(preparedActor, preparedState));
+                var prepared = split.prepare(preparedActor, preparedState);
+                assertTrue(prepared.isBoundTo(split, preparedActor, preparedState));
+                assertTrue(split.commitPrepared(prepared));
+
+                assertEquals(compatibility.acceptedEyePosition(compatibilityActor, compatibilityState, reference, .5F),
+                        split.acceptedEyePosition(preparedActor, preparedState, reference, .5F),
+                        "both APIs retain the same accepted eye interpolation");
+                compatibilityActor.onEntityUpdate();
+                preparedActor.onEntityUpdate();
+                compatibility.tick(compatibilityActor);
+                split.tick(preparedActor);
+                assertEquals(compatibilityActor.prevPosX, preparedActor.prevPosX, 0);
+                assertEquals(compatibilityActor.lastTickPosX, preparedActor.lastTickPosX, 0);
+                assertEquals(compatibilityActor.limbSwingAmount, preparedActor.limbSwingAmount, 0);
+                assertEquals(compatibilityActor.limbSwing, preparedActor.limbSwing, 0);
+                assertEquals(compatibilityActor.distanceWalkedModified, preparedActor.distanceWalkedModified, 0);
+                assertEquals(compatibilityActor.renderYawOffset, preparedActor.renderYawOffset, 0);
+                assertEquals(compatibility.bodyYawOffset(compatibilityActor, 1),
+                        split.bodyYawOffset(preparedActor, 1), 0);
+            }
+        }
+    }
+
+    @Test void resetRepeatedCommitAndForeignPreparationCannotRestoreOrOverwriteState(@TempDir Path directory) {
+        try (var world = BootWorldFixture.open(directory, new UUID(0, 9846), true)) {
+            var player = world.serverPlayer(new UUID(0, 9847));
+            var first = snapshot(player, 1, 8, true);
+            var second = strafeSnapshot(player, 2, 8.2);
+            var third = strafeSnapshot(player, 3, 8.4);
+            var presentation = new PlayerPhysicsClientPresentation();
+            var reference = new PlayerBodyReference.Effective(PlayerBodyReference.Source.ENVIRONMENT,
+                    CardinalFrame.Y_POS, new Vec3d(0, 0, 1));
+
+            assertTrue(presentation.install(player, first));
+            assertNotNull(presentation.acceptedEyePosition(player, first, reference, .5F));
+            var staleAfterTick = presentation.prepare(player, second);
+            presentation.tick(player);
+            assertFalse(staleAfterTick.isBoundTo(presentation, player, second));
+            assertFalse(presentation.commitPrepared(staleAfterTick));
+            var stale = presentation.prepare(player, second);
+            presentation.reset();
+            assertFalse(stale.isBoundTo(presentation, player, second));
+            assertFalse(presentation.commitPrepared(stale));
+            assertNull(presentation.acceptedEyePosition(player, first, reference, .5F),
+                    "a stale result cannot restore presentation cleared by reset");
+            assertEquals(0, presentation.bodyYawOffset(player, 1));
+
+            var winning = presentation.prepare(player, second);
+            var competing = presentation.prepare(player, third);
+            assertTrue(presentation.commitPrepared(winning));
+            assertFalse(presentation.commitPrepared(competing),
+                    "another successful commit invalidates preparations from its prior generation");
+            assertFalse(presentation.commitPrepared(winning), "a prepared result can commit only once");
+
+            var otherPresentation = new PlayerPhysicsClientPresentation();
+            var foreign = otherPresentation.prepare(player, third);
+            assertFalse(presentation.commitPrepared(foreign));
+            assertTrue(foreign.isBoundTo(otherPresentation, player, third));
+            assertTrue(otherPresentation.commitPrepared(foreign),
+                    "rejecting a foreign result leaves its owning presentation unchanged");
+        }
+    }
+
+    private record ActorState(double posX, double posY, double posZ,
+                              double prevPosX, double prevPosY, double prevPosZ,
+                              float width, float height, float eyeHeight,
+                              double motionX, double motionY, double motionZ,
+                              boolean onGround, boolean collidedHorizontally,
+                              boolean collidedVertically, boolean collided,
+                              float fallDistance, Object bounds) { }
+
+    private static ActorState actorState(EntityPlayer player) {
+        return new ActorState(player.posX, player.posY, player.posZ,
+                player.prevPosX, player.prevPosY, player.prevPosZ,
+                player.width, player.height, player.eyeHeight,
+                player.motionX, player.motionY, player.motionZ,
+                player.onGround, player.collidedHorizontally, player.collidedVertically,
+                player.collided, player.fallDistance, player.getEntityBoundingBox());
+    }
+
+    private static void assertActorStateEquals(ActorState expected, EntityPlayer actual) {
+        ActorState observed = actorState(actual);
+        assertEquals(expected.posX(), observed.posX(), 0);
+        assertEquals(expected.posY(), observed.posY(), 0);
+        assertEquals(expected.posZ(), observed.posZ(), 0);
+        assertEquals(expected.prevPosX(), observed.prevPosX(), 0);
+        assertEquals(expected.prevPosY(), observed.prevPosY(), 0);
+        assertEquals(expected.prevPosZ(), observed.prevPosZ(), 0);
+        assertEquals(expected.width(), observed.width(), 0);
+        assertEquals(expected.height(), observed.height(), 0);
+        assertEquals(expected.eyeHeight(), observed.eyeHeight(), 0);
+        assertEquals(expected.motionX(), observed.motionX(), 0);
+        assertEquals(expected.motionY(), observed.motionY(), 0);
+        assertEquals(expected.motionZ(), observed.motionZ(), 0);
+        assertEquals(expected.onGround(), observed.onGround());
+        assertEquals(expected.collidedHorizontally(), observed.collidedHorizontally());
+        assertEquals(expected.collidedVertically(), observed.collidedVertically());
+        assertEquals(expected.collided(), observed.collided());
+        assertEquals(expected.fallDistance(), observed.fallDistance(), 0);
+        assertSame(expected.bounds(), observed.bounds());
+    }
+
+    private static PlayerPhysicalSnapshot strafeSnapshot(EntityPlayer player, long revision, double x) {
+        var base = snapshot(player, revision, 8, true);
+        var placement = base.placement();
+        return new PlayerPhysicalSnapshot(base.scope(), revision,
+                new PlayerBodyPlacement(new Vec3d(x, 65, 8), placement.attitude(), placement.shape()),
+                new Vec3d(4, 0, 0), base.contacts());
     }
 
     private static PlayerPhysicalSnapshot snapshot(EntityPlayer player, long revision, double z, boolean ground) {

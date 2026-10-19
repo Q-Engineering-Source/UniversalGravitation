@@ -10,8 +10,8 @@ import wi.unigrav.api.math.Vec3;
 /**
  * Per-world persisted world-gravity setting: the acceleration vector (m/s²)
  * of the uniform gravity contribution registered for this world, plus an
- * enabled flag. Stored in the overworld's map storage and applied to all
- * dimensions (the field is dimension-agnostic for now).
+ * enabled flag. Stored in the server map storage under a dimension-specific key; dimension zero
+ * retains its original key and serialized format.
  *
  * <p>{@code initialized} distinguishes "new world, seed from config" from
  * "world with a deliberate setting" so that later config changes never
@@ -36,14 +36,16 @@ public final class WorldGravityData extends WorldSavedData {
         super(name);
     }
 
-    /** Returns the data attached to the overworld's map storage. */
+    /** Returns this dimension's persisted data; field ownership remains the actual World object. */
     public static WorldGravityData get(WorldServer overworld) {
         MapStorage storage = overworld.getMapStorage();
+        String key = overworld.provider.getDimension() == 0 ? DATA_NAME
+                : DATA_NAME + "_dimension_" + overworld.provider.getDimension();
         WorldGravityData data = (WorldGravityData) storage.getOrLoadData(
-                WorldGravityData.class, DATA_NAME);
+                WorldGravityData.class, key);
         if (data == null) {
-            data = new WorldGravityData();
-            storage.setData(DATA_NAME, data);
+            data = new WorldGravityData(key);
+            storage.setData(key, data);
         }
         return data;
     }

@@ -8,6 +8,8 @@ import net.minecraft.entity.item.EntityItem;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.inventory.EntityEquipmentSlot;
 import net.minecraft.item.ItemStack;
+import net.minecraft.nbt.NBTTagCompound;
+import net.minecraft.util.ResourceLocation;
 
 import wi.unigrav.core.BodyPhysics;
 
@@ -55,9 +57,23 @@ public final class MagneticResponseRules {
     }
 
     private static double maximumResponse(List<MagneticItemRule> rules, ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return 0.0;
+        ResourceLocation itemName = stack.getItem().getRegistryName();
+        int metadata = stack.getMetadata();
+        if (itemName == null) return 0.0;
         double response = 0.0;
+        NBTTagCompound actualTag = null;
+        boolean tagRead = false;
         for (MagneticItemRule rule : rules) {
-            if (rule.matches(stack)) response = Math.max(response, rule.responseScalar());
+            if (!rule.matchesItemAndMetadata(stack, itemName, metadata)) continue;
+            if (rule.requiresNbt()) {
+                if (!tagRead) {
+                    actualTag = stack.getTagCompound();
+                    tagRead = true;
+                }
+                if (!rule.matchesTag(actualTag)) continue;
+            }
+            response = Math.max(response, rule.responseScalar());
         }
         return response;
     }

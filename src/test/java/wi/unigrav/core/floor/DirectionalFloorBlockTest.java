@@ -63,16 +63,22 @@ class DirectionalFloorBlockTest {
     }
 
     @Test
-    void blocksAreConcreteIronFullCubesAndCarryTheTwoStableIds() {
+    void blocksAreConcreteIronFullCubesAndCarryTheStableIds() {
         DirectionalFloorBlock gravity = FloorBlocks.GRAVITY_FLOOR;
         DirectionalFloorBlock magnetic = FloorBlocks.MAGNETIC_FLOOR;
+        DirectionalFloorBlock doubleSided = FloorBlocks.DOUBLE_SIDED_GRAVITY_FLOOR;
         assertEquals(DirectionalFloorBlock.Kind.GRAVITY, gravity.kind());
         assertEquals(DirectionalFloorBlock.Kind.MAGNETIC, magnetic.kind());
+        assertEquals(DirectionalFloorBlock.Kind.DOUBLE_SIDED_GRAVITY, doubleSided.kind());
         assertEquals(Reference.MOD_ID + ":gravity_floor", gravity.getRegistryName().toString());
         assertEquals(Reference.MOD_ID + ":magnetic_floor", magnetic.getRegistryName().toString());
+        assertEquals(Reference.MOD_ID + ":double_sided_gravity_floor", doubleSided.getRegistryName().toString());
         assertEquals(Material.IRON, gravity.getMaterial(gravity.getDefaultState()));
         assertTrue(gravity.isFullCube(gravity.getDefaultState()));
         assertTrue(gravity.isOpaqueCube(gravity.getDefaultState()));
+        assertEquals(Material.IRON, doubleSided.getMaterial(doubleSided.getDefaultState()));
+        assertTrue(doubleSided.isFullCube(doubleSided.getDefaultState()));
+        assertTrue(doubleSided.isOpaqueCube(doubleSided.getDefaultState()));
     }
 
     private static EnumFacing facingAfter(DirectionalFloorBlock block, EnumFacing facing, Rotation rotation) {

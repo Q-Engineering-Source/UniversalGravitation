@@ -1,0 +1,86 @@
+import java.util.zip.ZipFile
+import org.objectweb.asm.*
+import org.objectweb.asm.tree.*
+
+buildscript { dependencies { classpath files(rootProject.buildscript.configurations.classpath) } }
+
+// TEST ONLY. Preserve native body; exact callsite wrappers are not production Mixin/refmap evidence.
+def output=layout.buildDirectory.dir('test-movement-stat-bridge')
+def bridge=tasks.register('prepareMovementStatTestBridge') {
+    dependsOn tasks.named('compileTestJava')
+    inputs.files(sourceSets.main.compileClasspath)
+    inputs.file(file('gradle/scripts/movement-stat-test-bridge.gradle'))
+    inputs.file(file('src/test/java/wi/unigrav/core/player/MovementStatTestBridge.java'))
+    outputs.dir(output)
+    doLast {
+        String owner='net/minecraft/entity/player/EntityPlayer'
+        String hooks='wi/unigrav/core/player/MovementStatTestBridge'
+        String body=hooks+'$Body', descriptor='(DDD)V'
+        def matches=[]
+        sourceSets.main.compileClasspath.files.findAll { it.isFile() && it.name.endsWith('.jar') }.each { jar ->
+            new ZipFile(jar).withCloseable { zip ->
+                def entry=zip.getEntry(owner+'.class')
+                if(entry!=null)matches.add([jar:jar,bytes:zip.getInputStream(entry).withCloseable { it.bytes }])
+            }
+        }
+        if(matches.size()!=1)throw new GradleException('Expected exactly one mapped EntityPlayer: '+matches.size())
+        def node=new ClassNode();new ClassReader(matches[0].bytes as byte[]).accept(node,0)
+        def selected=node.methods.findAll { it.name=='addMovementStat' && it.desc==descriptor }
+        if(selected.size()!=1)throw new GradleException('Native stat selector drift: '+selected.size())
+        def method=selected[0]
+        if((method.access & Opcodes.ACC_PUBLIC)==0 || (method.access & (Opcodes.ACC_STATIC|Opcodes.ACC_ABSTRACT|Opcodes.ACC_NATIVE))!=0)
+            throw new GradleException('Native stat access/body drift')
+        if(node.interfaces.contains(body) || node.methods.any { it.name=='unigrav$test$movementStat' })
+            throw new GradleException('EntityPlayer stat bridge already applied')
+        def expected=[:]
+        ['isRiding','isInWater','isOnLadder','isSprinting','isSneaking','isElytraFlying'].each { expected[it+'()Z']=1 }
+        expected['isInsideOfMaterial(Lnet/minecraft/block/material/Material;)Z']=1
+        expected['addStat(Lnet/minecraft/stats/StatBase;I)V']=8
+        expected['addExhaustion(F)V']=5
+        def counts=[:].withDefault {0}
+        def helperDescriptors=['run':'(L'+owner+';DDD)V']
+        expected.each { key,value ->
+            int split=key.indexOf('(')
+            helperDescriptors[key.substring(0,split)]='(L'+owner+';'+key.substring(split+1)
+        }
+        def helperFiles=sourceSets.test.output.classesDirs.files.collect { new File(it,hooks+'.class') }.findAll { it.isFile() }
+        if(helperFiles.size()!=1)throw new GradleException('Expected one compiled stat helper: '+helperFiles)
+        def helperNode=new ClassNode();new ClassReader(helperFiles[0].bytes).accept(helperNode,ClassReader.SKIP_CODE)
+        helperDescriptors.each { name,desc ->
+            def found=helperNode.methods.findAll { it.name==name && it.desc==desc &&
+                (it.access & (Opcodes.ACC_PUBLIC|Opcodes.ACC_STATIC))==(Opcodes.ACC_PUBLIC|Opcodes.ACC_STATIC) }
+            if(found.size()!=1)throw new GradleException('Stat helper ABI drift: '+name+desc)
+        }
+        def bodyFiles=sourceSets.test.output.classesDirs.files.collect { new File(it,body+'.class') }.findAll { it.isFile() }
+        if(bodyFiles.size()!=1)throw new GradleException('Expected one compiled Body interface')
+        def bodyNode=new ClassNode();new ClassReader(bodyFiles[0].bytes).accept(bodyNode,ClassReader.SKIP_CODE)
+        if((bodyNode.access & Opcodes.ACC_INTERFACE)==0 || bodyNode.methods.count { it.name=='unigrav$test$movementStat' && it.desc==descriptor }!=1)
+            throw new GradleException('Stat Body interface ABI drift')
+        method.instructions.toArray().each { instruction ->
+            if(!(instruction instanceof MethodInsnNode))return
+            String key=instruction.name+instruction.desc
+            if(!expected.containsKey(key))return
+            if(instruction.owner!=owner || instruction.opcode!=Opcodes.INVOKEVIRTUAL || instruction.itf)
+                throw new GradleException('Native stat invoke owner/opcode drift: '+instruction.owner+'/'+key)
+            counts[key]++
+            method.instructions.set(instruction,new MethodInsnNode(Opcodes.INVOKESTATIC,hooks,instruction.name,
+                    helperDescriptors[instruction.name],false))
+        }
+        if(counts!=expected)throw new GradleException('Native stat exact callsite drift: '+counts+' expected '+expected)
+        // Rename, never replace the native algorithm. Replacements retain identical stack effects.
+        method.name='unigrav$test$movementStat';node.interfaces.add(body)
+        def wrapper=new MethodNode(Opcodes.ACC_PUBLIC,'addMovementStat',descriptor,null,null)
+        wrapper.instructions.add(new VarInsnNode(Opcodes.ALOAD,0))
+        [1,3,5].each { wrapper.instructions.add(new VarInsnNode(Opcodes.DLOAD,it)) }
+        wrapper.instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC,hooks,'run',helperDescriptors['run'],false))
+        wrapper.instructions.add(new InsnNode(Opcodes.RETURN));node.methods.add(wrapper)
+        def writer=new ClassWriter(ClassWriter.COMPUTE_MAXS);node.accept(writer)
+        def destination=output.get().file(owner+'.class').asFile;destination.parentFile.mkdirs();destination.bytes=writer.toByteArray()
+        def report=['TEST_ONLY; NOT_PRODUCTION_MIXIN','input='+matches[0].jar,
+            'inputClassSha256='+java.security.MessageDigest.getInstance('SHA-256').digest(matches[0].bytes as byte[]).encodeHex(),
+            'selector=addMovementStat(DDD)V; count=1','invokeOwner='+owner+'; opcode=INVOKEVIRTUAL',
+            'counts='+counts,'nativeBodyRenamed=1; wrapper=1; interface=1']
+        output.get().file('movement-stat-bridge-input.txt').asFile.text=report.join('\n')+'\n'
+    }
+}
+tasks.named('test',Test).configure {dependsOn bridge;classpath=files(output)+classpath}

@@ -1,0 +1,421 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import java.security.MessageDigest
+import java.nio.file.Files
+import java.nio.file.StandardOpenOption
+
+// One profile-specific receipt: compile/assemble remain possible, check/build cannot
+// substitute headless TP confirmation or the raw25/provenance5 host for this case.
+def profile = 'sleepNativeResume'
+def caseName = 'actualSleepWakeCompletesNativeTransferAndResumesOriginalBudget'
+def sleepMode = providers.gradleProperty('sleepNativeResumeIntegration').map { it == 'true' }.getOrElse(false)
+def fixture = tasks.named('sleepNativeFixtureJar', Jar)
+def releaseJar = tasks.named(enable_shadow.toBoolean() ? 'remapShadowJar' : 'remapJar')
+def hashBytes = { byte[] bytes -> MessageDigest.getInstance('SHA-256').digest(bytes).encodeHex().toString().toUpperCase(Locale.ROOT) }
+def hashFile = { File input ->
+    if (!input.isFile()) throw new GradleException("Missing sleep evidence input: ${input}")
+    def digest = MessageDigest.getInstance('SHA-256')
+    input.withInputStream { stream -> byte[] block = new byte[65536]; int size
+        while ((size = stream.read(block)) != -1) digest.update(block, 0, size)
+    }
+    digest.digest().encodeHex().toString().toUpperCase(Locale.ROOT)
+}
+
+// Unimined exports this actual host dependency through a lazy provider. Produce a
+// repeatable JAR before taking input identity; never normalize an observed input afterwards.
+def mappingFile = { file('.gradle/unimined/local/mappings/srg2mcp.jar').canonicalFile }
+def mappingMembers = { byte[] bytes ->
+    def members = new TreeMap<String, byte[]>()
+    new java.util.zip.ZipInputStream(new ByteArrayInputStream(bytes)).withCloseable { zip ->
+        java.util.zip.ZipEntry entry
+        while ((entry = zip.nextEntry) != null) {
+            if (entry.directory || members.containsKey(entry.name))
+                throw new GradleException('Unexpected directory or duplicate in generated MCP mapping JAR')
+            members[entry.name] = zip.readAllBytes()
+        }
+    }
+    if (members.keySet().toList() != ['fields.csv', 'methods.csv', 'params.csv'])
+        throw new GradleException('Generated MCP mapping JAR does not contain its three exact CSV members')
+    members
+}
+def canonicalMapping = { Map<String, byte[]> members ->
+    def bytes = new ByteArrayOutputStream()
+    new java.util.zip.ZipOutputStream(bytes).withCloseable { zip ->
+        members.each { name, body ->
+            def entry = new java.util.zip.ZipEntry(name)
+            entry.setTimeLocal(java.time.LocalDateTime.of(1980, 1, 1, 0, 0))
+            entry.method = java.util.zip.ZipEntry.STORED
+            entry.size = body.length
+            entry.compressedSize = body.length
+            def crc = new java.util.zip.CRC32(); crc.update(body); entry.crc = crc.value
+            zip.putNextEntry(entry); zip.write(body); zip.closeEntry()
+        }
+    }
+    bytes.toByteArray()
+}
+def preparedMapping = null
+project.ext.ugPrepareHostMappingIdentity = { File reportDirectory ->
+    if (preparedMapping != null) throw new GradleException('Mapping input was already prepared for this host')
+    // Resolve both public classpaths first, including the provider's export side effect.
+    def runtime = sourceSets.main.runtimeClasspath.files.findAll { it.isFile() }*.canonicalFile
+    def actualHost = tasks.named('runClient', JavaExec).get().classpath.files.findAll { it.isFile() }*.canonicalFile
+    File target = mappingFile()
+    if (runtime.count { it == target } != 1 || actualHost.count { it == target } != 1)
+        throw new GradleException('Exact generated mapping JAR is not in both actual runtime and host classpaths')
+    byte[] original = Files.readAllBytes(target.toPath())
+    def members = mappingMembers(original)
+    byte[] canonical = canonicalMapping(members)
+    def verified = mappingMembers(canonical)
+    if (members.any { name, body -> !Arrays.equals(body, verified[name]) })
+        throw new GradleException('Deterministic mapping production changed a CSV member')
+    File directory = new File(reportDirectory, 'mapping-input')
+    Files.createDirectories(directory.toPath())
+    Files.write(new File(directory, 'producer.jar').toPath(), original, StandardOpenOption.CREATE_NEW)
+    Files.write(new File(directory, 'host.jar').toPath(), canonical, StandardOpenOption.CREATE_NEW)
+    if (!Arrays.equals(original, canonical)) {
+        def temporary = Files.createTempFile(target.parentFile.toPath(), 'srg2mcp-repeatable-', '.jar')
+        try {
+            Files.write(temporary, canonical)
+            Files.move(temporary, target.toPath(), java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        } catch (Throwable failure) {
+            try { Files.deleteIfExists(temporary) } catch (Throwable cleanup) {
+                if (cleanup != failure) failure.addSuppressed(cleanup)
+            }
+            throw failure
+        }
+    }
+    preparedMapping = [path: target.canonicalPath, producerSha256: hashBytes(original),
+            sha256: hashBytes(canonical), members: members.collect { name, body ->
+                [name: name, bytes: body.length, sha256: hashBytes(body)]
+            }]
+    Files.writeString(new File(directory, 'identity.json').toPath(),
+            JsonOutput.prettyPrint(JsonOutput.toJson(preparedMapping)), java.nio.charset.StandardCharsets.UTF_8,
+            StandardOpenOption.CREATE_NEW)
+    if (hashFile(target) != preparedMapping.sha256)
+        throw new GradleException('Mapping input changed during preparation')
+}
+project.ext.ugVerifyHostMappingIdentity = { ->
+    if (preparedMapping == null || hashFile(mappingFile()) != preparedMapping.sha256)
+        throw new GradleException('Generated mapping input changed after host identity preparation')
+    def actualHost = tasks.named('runClient', JavaExec).get().classpath.files.findAll { it.isFile() }*.canonicalFile
+    if (actualHost.count { it == mappingFile() } != 1 || hashFile(mappingFile()) != preparedMapping.sha256)
+        throw new GradleException('Final host classpath regenerated or replaced its mapping input')
+}
+def describeFiles = { Collection<File> files ->
+    def unique = new LinkedHashMap<String, File>()
+    files.findAll { it.isFile() }.each { unique.putIfAbsent(it.canonicalPath, it) }
+    def projectPath = projectDir.canonicalFile.toPath().normalize()
+    unique.values().collect { input ->
+        def inputPath = input.canonicalFile.toPath().normalize()
+        def path = inputPath.startsWith(projectPath) ? projectPath.relativize(inputPath).toString() : inputPath.toString()
+        [path: path.replace('\\', '/'), bytes: input.length(), sha256: hashFile(input)]
+    }
+            .sort { a, b -> a.path <=> b.path }
+}
+def sourceDescription = {
+    describeFiles(fileTree(projectDir) {
+        include 'src/**', 'gradle/**', 'build.gradle', 'settings.gradle', 'gradle.properties', 'gradlew', 'gradlew.bat'
+        exclude '**/build/**'
+    }.files)
+}
+def host = tasks.named('runClient', JavaExec)
+// These exact files are both inputs and normal runtime state. No other config path is mutable.
+def stateNames = ['cleanroom_load_timings.dat', 'neofontrender-ui-chat-history.mv.db', 'splash.properties']
+def configRoot = { new File(host.get().workingDir, 'config').canonicalFile }
+def exactStateFile = { String name ->
+    if (!stateNames.contains(name)) throw new GradleException("Unknown sleep state path: ${name}")
+    File input = new File(configRoot(), name)
+    if (input.canonicalFile.parentFile != configRoot() || input.canonicalFile.name != name)
+        throw new GradleException("Sleep state is not the exact canonical config child: ${input}")
+    input
+}
+def splashValues = { byte[] bytes ->
+    def properties = new Properties()
+    properties.load(new InputStreamReader(new ByteArrayInputStream(bytes), java.nio.charset.StandardCharsets.UTF_8))
+    new TreeMap(properties.collectEntries { key, value -> [(key.toString()): value.toString()] })
+}
+def validateTiming = { byte[] bytes ->
+    def input = new DataInputStream(new ByteArrayInputStream(bytes))
+    if (input.readInt() != 4) throw new GradleException('Wrong Cleanroom timing state version')
+    int count = input.readInt()
+    // Each producer row is writeUTF(name) + writeInt(duration); no fixed phase registry is assumed.
+    if (count < 0 || count > input.available().intdiv(6)) throw new GradleException('Invalid Cleanroom timing row count')
+    count.times { input.readUTF(); input.readInt() }
+    if (input.available() != 0) throw new GradleException('Trailing Cleanroom timing state bytes')
+}
+def stateSnapshot = { File archiveDirectory ->
+    if (archiveDirectory != null) Files.createDirectories(archiveDirectory.toPath())
+    stateNames.collect { name ->
+        File input = exactStateFile(name)
+        if (!input.isFile()) throw new GradleException("Missing exact sleep state input: ${input}")
+        byte[] bytes = Files.readAllBytes(input.toPath())
+        if (name == 'cleanroom_load_timings.dat') validateTiming(bytes)
+        def row = [name: name, path: input.canonicalPath, bytes: bytes.length, sha256: hashBytes(bytes)]
+        if (archiveDirectory != null) {
+            File archive = new File(archiveDirectory, name)
+            Files.write(archive.toPath(), bytes, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
+            row.archive = archive.canonicalPath
+        }
+        row
+    }
+}
+def stateIdentity = { List state ->
+    if (state == null || state*.name != stateNames) throw new GradleException('Wrong or missing exact sleep state set')
+    state.collect { row -> row.findAll { key, value -> key != 'archive' } }
+}
+def verifyStateArchive = { List state, File expectedDirectory ->
+    if (state == null || state*.name != stateNames) throw new GradleException('Wrong or missing exact sleep state set')
+    state.each { row ->
+        File original = new File(expectedDirectory, row.name).canonicalFile
+        if (row.path != exactStateFile(row.name).canonicalPath || row.archive != original.path
+                || !original.isFile() || original.length() != row.bytes || hashFile(original) != row.sha256)
+            throw new GradleException("Missing or altered original sleep state: ${row.name}")
+        if (row.name == 'cleanroom_load_timings.dat') validateTiming(Files.readAllBytes(original.toPath()))
+    }
+}
+def stableConfig = {
+    def all = fileTree(configRoot()).files
+    // Canonical equality, never a suffix/glob exclusion. Unknown and new files stay byte-exact inputs.
+    def mutable = stateNames.collect { exactStateFile(it).absoluteFile.toPath().normalize() }.toSet()
+    [files: describeFiles(all.findAll { !mutable.contains(it.absoluteFile.toPath().normalize()) }),
+     paths: all.collect { configRoot().toPath().relativize(it.absoluteFile.toPath().normalize()).toString().replace('\\', '/') }.sort(),
+     splash: splashValues(Files.readAllBytes(exactStateFile('splash.properties').toPath()))]
+}
+def commonIdentity = { Collection<File> actualJunit = null ->
+    def mods = new File(host.get().workingDir, 'mods')
+    def runtime = fileTree(mods) { include '*.jar'; exclude '*integration-fixture*.jar', '*native*fixture*.jar' }.files
+    if (!runtime.any { it.name.toLowerCase(Locale.ROOT).contains('fugue') }
+            || !runtime.any { it.name.toLowerCase(Locale.ROOT).contains('scalar') })
+        throw new GradleException('Sleep normal FML host requires actual Fugue and scalar runtime mods')
+    [source: sourceDescription(), main: describeFiles(sourceSets.main.output.files.collectMany {
+        it.isDirectory() ? fileTree(it).files.toList() : [it]
+    }), release: hashFile(releaseJar.get().archiveFile.get().asFile),
+     dependencies: describeFiles((runtime + sourceSets.main.runtimeClasspath.files
+             + (actualJunit != null ? actualJunit : configurations.clientIntegrationRuntimeClasspath.files.findAll {
+                 ['junit-', 'opentest4j-', 'apiguardian-'].any { prefix -> it.name.startsWith(prefix) }
+             })).findAll { it.isFile() }),
+     config: stableConfig(), workingDirectory: host.get().workingDir.canonicalPath]
+}
+def identity = { commonIdentity() + [fixture: hashFile(fixture.get().archiveFile.get().asFile)] }
+def commonPart = { Map value -> value.findAll { key, entry -> key != 'fixture' } }
+// JSON object order is not identity: parsed receipts and live maps must hash identically.
+Closure canonicalIdentityValue
+canonicalIdentityValue = { Object value ->
+    if (value instanceof Map) return new TreeMap(value.collectEntries { key, entry -> [(key.toString()): canonicalIdentityValue(entry)] })
+    if (value instanceof Collection) return value.collect { canonicalIdentityValue(it) }
+    value
+}
+def identityHash = { Map value -> hashBytes(JsonOutput.toJson(canonicalIdentityValue(value)).getBytes('UTF-8')) }
+def inputHash = { Map stable, List before -> identityHash([identity: stable, inputState: stateIdentity(before)]) }
+def validNonce = { String nonce -> nonce != null && nonce ==~ '[0-9a-fA-F-]{36}' }
+def validateReceipt = { Map receipt, Map current, String nonce ->
+    if (receipt == null) throw new GradleException('Missing mandatory sleep evidence receipt')
+    if (receipt.schema != 2 || receipt.profile != profile || receipt.cases != [caseName])
+        throw new GradleException('Wrong sleep evidence profile/case/schema')
+    if (!validNonce(nonce) || receipt.nonce != nonce) throw new GradleException('Sleep evidence run nonce mismatch')
+    if (receipt.exit != 0 || receipt.found != 1 || receipt.started != 1 || receipt.succeeded != 1
+            || receipt.failed != 0 || receipt.aborted != 0 || receipt.skipped != 0)
+        throw new GradleException('Sleep evidence did not execute its single mandatory case successfully')
+    if (receipt.identity != current || receipt.identityHash != inputHash(receipt.identity, receipt.inputState))
+        throw new GradleException('Sleep evidence belongs to different stable source/main/fixture/release/dependency/config input')
+}
+def validateTransition = { Map receipt, Map current, List currentState, Map chain, String freshNonce ->
+    validateReceipt(receipt, current, receipt?.nonce)
+    if (stateIdentity(currentState) == stateIdentity(receipt.exitState)) return
+    if (chain == null || !validNonce(freshNonce) || chain.nonce != freshNonce || chain.sleepNonce != receipt.nonce
+            || chain.sleepInputHash != receipt.identityHash || chain.common != commonPart(current)
+            || stateIdentity(chain.before) != stateIdentity(receipt.exitState)
+            || stateIdentity(chain.after) != stateIdentity(currentState)
+            || chain.tests != 40 || chain.started != 40 || chain.unique != 40
+            || chain.caseSetSha256 != 'A878EFC56BCC17EFE80F3A6988856FF420BEA32CE45638833DA15397F29538F8' || chain.succeeded != 40 || chain.failed != 0 || chain.aborted != 0 || chain.skipped != 0)
+        throw new GradleException('Current sleep state has no matching fresh native40 transition')
+}
+def readSleepReceipt = {
+    def path = providers.gradleProperty('sleepEvidenceReceipt').orNull
+    def nonce = providers.gradleProperty('sleepEvidenceNonce').orNull
+    if (!path || !file(path).isFile() || !nonce) throw new GradleException('Missing mandatory -PsleepEvidenceReceipt and matching -PsleepEvidenceNonce')
+    File source = file(path).canonicalFile
+    Map receipt = new JsonSlurper().parse(source) as Map
+    validateReceipt(receipt, identity(), nonce)
+    verifyStateArchive(receipt.inputState, new File(source.parentFile, 'state-before'))
+    verifyStateArchive(receipt.exitState, new File(source.parentFile, 'state-after'))
+    File result = file(receipt.result)
+    if (hashFile(result) != receipt.resultSha256) throw new GradleException('Sleep host result bytes changed')
+    def lines = ['PASS tests=1 succeeded=1 failed=0 aborted=0 skipped=0', "cases=${caseName}",
+            "profile=${profile}", 'started=1', "nonce=${nonce}", "identity=${receipt.identityHash}"]
+    if (result.readLines('UTF-8') != lines.collect { it.toString() }) throw new GradleException('Sleep host result does not match its receipt')
+    [receipt: receipt, file: source, sha256: hashFile(source)]
+}
+// A private two-script seam: only the actual fresh native gate can publish a completed transition.
+project.ext.ugSleepNativeState = [
+    beforeNative: { File directory, Collection<File> actualJunit ->
+        def observed = readSleepReceipt()
+        def nativeCommon = commonIdentity(actualJunit)
+        if (nativeCommon != commonIdentity()) throw new GradleException('Native40 common dependency inputs differ from sleep')
+        List before = stateSnapshot(new File(directory, 'state-before'))
+        validateTransition(observed.receipt, identity(), before, null, null)
+        [sleepNonce: observed.receipt.nonce, sleepInputHash: observed.receipt.identityHash,
+         sleepReceipt: observed.file.canonicalPath, sleepReceiptSha256: observed.sha256,
+         common: nativeCommon, before: before]
+    },
+    afterNative: { Map retained, File directory, Collection<File> actualJunit ->
+        if (retained == null || retained.common != commonIdentity(actualJunit)) throw new GradleException('Native40 stable inputs changed')
+        def observed = readSleepReceipt()
+        if (observed.file.canonicalPath != retained.sleepReceipt || observed.sha256 != retained.sleepReceiptSha256)
+            throw new GradleException('Native40 sleep predecessor changed')
+        List after = stateSnapshot(new File(directory, 'state-after'))
+        verifyStateArchive(retained.before, new File(directory, 'state-before'))
+        retained + [after: after]
+    }
+]
+
+def invocationNonce = UUID.randomUUID().toString()
+def retainedIdentity = null
+def retainedState = null
+def receiptOutput = layout.buildDirectory.file("reports/sleep-native/${invocationNonce}/receipt.json")
+// Retain metadata beside the receipt so rejected input drift remains attributable.
+def writeIdentityDiagnostic = { String name, Object value ->
+    File output = layout.buildDirectory.file("reports/sleep-native/${invocationNonce}/${name}").get().asFile
+    Files.createDirectories(output.parentFile.toPath())
+    Files.writeString(output.toPath(), JsonOutput.prettyPrint(JsonOutput.toJson(value)) + '\n',
+            java.nio.charset.StandardCharsets.UTF_8, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
+}
+
+if (sleepMode) {
+    tasks.named('clientIntegrationTest').configure { dependsOn releaseJar }
+    host.configure { JavaExec task ->
+        mustRunAfter fixture, releaseJar
+        doFirst {
+            if (gradle.taskGraph.hasTask(tasks.named('clientIntegrationTest').get())) {
+                project.ext.ugPrepareHostMappingIdentity.call(receiptOutput.get().asFile.parentFile)
+                retainedIdentity = identity()
+                retainedState = stateSnapshot(new File(receiptOutput.get().asFile.parentFile, 'state-before'))
+                writeIdentityDiagnostic('identity-before.json', [identity: retainedIdentity, state: retainedState])
+                task.systemProperty 'unigrav.sleepEvidence.nonce', invocationNonce
+                task.systemProperty 'unigrav.sleepEvidence.identity', inputHash(retainedIdentity, retainedState)
+                project.ext.ugVerifyHostMappingIdentity.call()
+            }
+        }
+    }
+    tasks.named('clientIntegrationTest').configure {
+        doLast {
+            project.ext.ugVerifyHostMappingIdentity.call()
+            if (host.get().executionResult.get().exitValue != 0)
+                throw new GradleException('Sleep host did not exit normally with code zero')
+            def resultFile = file(host.get().systemProperties['unigrav.clientIntegration.result'])
+            def expected = ['PASS tests=1 succeeded=1 failed=0 aborted=0 skipped=0', "cases=${caseName}",
+                    "profile=${profile}", 'started=1', "nonce=${invocationNonce}", "identity=${inputHash(retainedIdentity, retainedState)}"]
+            if (resultFile.readLines('UTF-8') != expected.collect { it.toString() })
+                throw new GradleException("Sleep host receipt text/identity mismatch: ${resultFile}")
+            def current = identity()
+            if (current != retainedIdentity) {
+                def drift = new GradleException('Sleep host stable inputs changed during the real run')
+                try {
+                    writeIdentityDiagnostic('identity-after.json', current)
+                    def differences = [:]
+                    ['source', 'main', 'fixture', 'release', 'dependencies', 'config', 'workingDirectory'].each { category ->
+                        if (retainedIdentity[category] != current[category])
+                            differences[category] = [before: retainedIdentity[category], after: current[category]]
+                    }
+                    writeIdentityDiagnostic('identity-diff.json', differences)
+                    stateSnapshot(new File(receiptOutput.get().asFile.parentFile, 'state-after'))
+                } catch (Throwable diagnosticFailure) {
+                    if (diagnosticFailure != drift) drift.addSuppressed(diagnosticFailure)
+                }
+                throw drift
+            }
+            List after = stateSnapshot(new File(receiptOutput.get().asFile.parentFile, 'state-after'))
+            verifyStateArchive(retainedState, new File(receiptOutput.get().asFile.parentFile, 'state-before'))
+            def receipt = [schema: 2, profile: profile, cases: [caseName], nonce: invocationNonce,
+                    exit: 0, found: 1, started: 1, succeeded: 1, failed: 0, aborted: 0, skipped: 0,
+                    identity: current, inputState: retainedState, exitState: after,
+                    identityHash: inputHash(current, retainedState), result: resultFile.absolutePath,
+                    resultSha256: hashFile(resultFile)]
+            validateReceipt(receipt, current, invocationNonce)
+            File output = receiptOutput.get().asFile; output.parentFile.mkdirs()
+            if (output.exists()) throw new GradleException("Refusing to replace sleep receipt: ${output}")
+            output.setText(JsonOutput.prettyPrint(JsonOutput.toJson(receipt)) + '\n', 'UTF-8')
+            logger.lifecycle("Sleep native evidence receipt: ${output}; nonce=${invocationNonce}")
+        }
+    }
+}
+
+def gate = tasks.register('sleepNativeEvidenceGate') {
+    group = 'verification'
+    description = 'Requires a same-candidate real normal-FML sleep/wake/resume receipt (never raw25 or headless).'
+    dependsOn tasks.named('classes'), fixture, releaseJar
+    mustRunAfter tasks.named('cardinalNativeIntegrationTest'), tasks.named('test')
+    doNotTrackState('Revalidates immutable same-input evidence on every full check/build')
+    doLast {
+        def observed = readSleepReceipt()
+        List currentState = stateSnapshot(null)
+        def nativeProof = project.ext.ugFreshNative39StateTransition.call()
+        Map chain = null
+        String freshNonce = null
+        if (nativeProof != null) {
+            File nativeReceipt = file(nativeProof.receipt)
+            if (hashFile(nativeReceipt) != nativeProof.sha256) throw new GradleException('Fresh native40 receipt changed')
+            Map verified = new JsonSlurper().parse(nativeReceipt) as Map
+            if (verified.status != 'PASS' || verified.nonce != nativeProof.nonce
+                    || verified.identitySha256 != nativeProof.identityHash || verified.stateTransition != nativeProof.transition
+                    || verified.tests != 40 || verified.started != 40 || verified.unique != 40
+                    || verified.caseSetSha256 != 'A878EFC56BCC17EFE80F3A6988856FF420BEA32CE45638833DA15397F29538F8' || verified.succeeded != 40 || verified.failed != 0
+                    || verified.aborted != 0 || verified.skipped != 0)
+                throw new GradleException('Fresh native40 transition does not belong to its verified receipt')
+            chain = verified.stateTransition
+            freshNonce = nativeProof.nonce
+            verifyStateArchive(chain.before, new File(nativeReceipt.parentFile, 'state-before'))
+            verifyStateArchive(chain.after, new File(nativeReceipt.parentFile, 'state-after'))
+        }
+        validateTransition(observed.receipt, identity(), currentState, chain, freshNonce)
+        logger.lifecycle("Verified same-candidate sleep native evidence: ${observed.file}")
+    }
+}
+// Exercise the actual gate validator, including skipped execution; no alternate permissive validator.
+def gateContract = tasks.register('sleepNativeEvidenceGateContractTest') {
+    group = 'verification'
+    doLast {
+        // Exercise the production identity/transition validator, not a permissive substitute.
+        def current = [source: 'contract-input', fixture: 'sleep-fixture', config: [files: [], splash: [enabled: 'true']]]
+        def nonce = '00000000-0000-0000-0000-000000000001'
+        def nativeNonce = '00000000-0000-0000-0000-000000000002'
+        def rows = { String hash -> stateNames.collect { [name: it, path: it, bytes: 1, sha256: hash] } }
+        def before = rows('input')
+        def exit = rows('sleep-exit')
+        def post = rows('native-exit')
+        def good = [schema: 2, profile: profile, cases: [caseName], nonce: nonce, exit: 0,
+                    found: 1, started: 1, succeeded: 1, failed: 0, aborted: 0, skipped: 0,
+                    identity: current, inputState: before, exitState: exit, identityHash: inputHash(current, before)]
+        def chain = [nonce: nativeNonce, sleepNonce: nonce, sleepInputHash: good.identityHash,
+                     common: commonPart(current), before: exit, after: post,
+                     tests: 40, started: 40, unique: 40, caseSetSha256: 'A878EFC56BCC17EFE80F3A6988856FF420BEA32CE45638833DA15397F29538F8', succeeded: 40, failed: 0, aborted: 0, skipped: 0]
+        validateTransition(good, current, exit, null, null)
+        validateTransition(good, current, post, chain, nativeNonce)
+        def reject = { Closure attempt ->
+            boolean rejected = false
+            try { attempt() } catch (GradleException expected) { rejected = true }
+            if (!rejected) throw new GradleException('Sleep evidence negative contract unexpectedly passed')
+        }
+        reject { validateReceipt(null, current, nonce) }
+        reject { validateReceipt(good + [profile: 'raw25'], current, nonce) }
+        reject { validateReceipt(good, current, nativeNonce) }
+        reject { validateReceipt(good + [identity: current + [source: 'old-source']], current, nonce) }
+        reject { validateReceipt(good + [skipped: 1], current, nonce) }
+        reject { validateTransition(good, current, post, chain, nonce) }
+        reject { validateTransition(good, current, post, chain + [nonce: nonce], nativeNonce) }
+        reject { validateTransition(good, current, post, chain + [before: before], nativeNonce) }
+        reject { validateTransition(good, current, rows('replaced'), chain, nativeNonce) }
+        reject { validateTransition(good, current, post, null, nativeNonce) }
+        reject { validateTransition(good, current, post, chain + [skipped: 1], nativeNonce) }
+        reject { validateTransition(good, current, post, chain + [tests: 39, started: 39, unique: 39, succeeded: 39], nativeNonce) }
+        reject { validateTransition(good, current, post, chain + [tests: 41, started: 41, unique: 41, succeeded: 41], nativeNonce) }
+        reject { validateTransition(good, current, post, chain + [caseSetSha256: 'replaced-case'], nativeNonce) }
+        reject { validateTransition(good, current + [config: [files: [[path: 'ordinary.cfg', sha256: 'changed']], splash: [enabled: 'true']]], exit, null, null) }
+        reject { validateTransition(good, current + [config: [files: [], splash: [enabled: 'false']]], exit, null, null) }
+        reject { validateTransition(good, current + [config: [files: [[path: 'unknown-new.cfg', sha256: 'new']], splash: [enabled: 'true']]], exit, null, null) }
+    }
+}
+gate.configure { dependsOn gateContract }
+tasks.named('check').configure { dependsOn gate }
+tasks.named('build').configure { dependsOn gate }

@@ -24,15 +24,17 @@ class MagneticBlockReaderTest {
     }
 
     @Test
-    void unconditionalMatchDoesNotSerializeEvenWhenAnotherMatchingRuleNeedsNbt() {
+    void orderedEarlierNbtMatchIsNotOvertakenByLaterUnconditionalRule() {
         AtomicInteger reads = new AtomicInteger();
-        var nbt = new MagneticBlockRule("minecraft:furnace", Map.of(), NbtPattern.compile(new NBTTagCompound()));
+        NBTTagCompound expected = new NBTTagCompound();
+        expected.setInteger("BurnTime", 0);
+        var nbt = new MagneticBlockRule("minecraft:furnace", Map.of(), NbtPattern.compile(expected));
         var unconditional = new MagneticBlockRule("minecraft:furnace", Map.of(), null);
         assertTrue(MagneticBlockReader.matchesStored(Blocks.FURNACE.getDefaultState(), () -> {
             reads.incrementAndGet();
-            throw new AssertionError("unnecessary TE serialization");
+            return expected;
         }, List.of(nbt, unconditional)));
-        assertEquals(0, reads.get());
+        assertEquals(1, reads.get());
     }
 
     @Test
@@ -77,17 +79,37 @@ class MagneticBlockReaderTest {
     }
 
     @Test
-    void qualifiedSelectionPrefersTheFirstStateRuleBeforeAnyNbtSerialization() {
+    void qualifiedSelectionKeepsEarlierNbtSelectorAheadOfLaterCatchAll() {
         AtomicInteger reads = new AtomicInteger();
-        var nbt = new MagneticBlockRule("minecraft:furnace", Map.of(), NbtPattern.compile(new NBTTagCompound()));
+        NBTTagCompound expected = new NBTTagCompound();
+        expected.setInteger("BurnTime", 0);
+        var nbt = new MagneticBlockRule("minecraft:furnace", Map.of(), NbtPattern.compile(expected));
         var unconditional = new MagneticBlockRule("minecraft:furnace", Map.of(), null);
         var rules = rules(7, binding("nbt-first", nbt), binding("state-second", unconditional));
         var match = MagneticBlockReader.matchQualifiedStored(Blocks.FURNACE.getDefaultState(), () -> {
             reads.incrementAndGet();
-            throw new AssertionError("state selection must not serialize a tile entity");
+            return expected;
         }, rules).orElseThrow();
-        assertEquals(new MagneticBlockReader.MaterialMatch("state-second", MagneticBlockReader.EvidenceKind.STORED_STATE), match);
-        assertEquals(0, reads.get());
+        assertEquals(new MagneticBlockReader.MaterialMatch("nbt-first",
+                MagneticBlockReader.EvidenceKind.MATCHED_TILE_ENTITY_NBT), match);
+        assertEquals(1, reads.get());
+    }
+
+    @Test
+    void orderedNbtSelectorFallsThroughToLaterCatchAllOnlyAfterOneNonmatchingRead() {
+        AtomicInteger reads = new AtomicInteger();
+        NBTTagCompound expected = new NBTTagCompound();
+        expected.setString("CustomName", "special");
+        var nbt = new MagneticBlockRule("minecraft:furnace", Map.of(), NbtPattern.compile(expected));
+        var unconditional = new MagneticBlockRule("minecraft:furnace", Map.of(), null);
+        var rules = rules(9, binding("special", nbt), binding("fallback", unconditional));
+        var match = MagneticBlockReader.matchQualifiedStored(Blocks.FURNACE.getDefaultState(), () -> {
+            reads.incrementAndGet();
+            return new NBTTagCompound();
+        }, rules).orElseThrow();
+        assertEquals(new MagneticBlockReader.MaterialMatch("fallback",
+                MagneticBlockReader.EvidenceKind.STORED_STATE), match);
+        assertEquals(1, reads.get());
     }
 
     @Test

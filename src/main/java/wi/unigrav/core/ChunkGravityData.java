@@ -14,8 +14,8 @@ import wi.unigrav.api.math.Vec3;
 /**
  * Per-world persisted chunk gravity overrides: chunk column (x, z) →
  * acceleration vector (m/s²), spanning all heights. Stored in the
- * overworld's map storage; like everything else in the current field model
- * the overrides are dimension-agnostic (same x/z column in every dimension).
+ * server map storage under a dimension-specific key; dimension zero retains its
+ * original key and serialized format.
  */
 public final class ChunkGravityData extends WorldSavedData {
 
@@ -33,14 +33,16 @@ public final class ChunkGravityData extends WorldSavedData {
         super(name);
     }
 
-    /** Returns the data attached to the overworld's map storage. */
+    /** Returns this dimension's persisted data; field ownership remains the actual World object. */
     public static ChunkGravityData get(WorldServer overworld) {
         MapStorage storage = overworld.getMapStorage();
+        String key = overworld.provider.getDimension() == 0 ? DATA_NAME
+                : DATA_NAME + "_dimension_" + overworld.provider.getDimension();
         ChunkGravityData data = (ChunkGravityData) storage.getOrLoadData(
-                ChunkGravityData.class, DATA_NAME);
+                ChunkGravityData.class, key);
         if (data == null) {
-            data = new ChunkGravityData();
-            storage.setData(DATA_NAME, data);
+            data = new ChunkGravityData(key);
+            storage.setData(key, data);
         }
         return data;
     }

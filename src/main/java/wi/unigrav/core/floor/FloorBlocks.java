@@ -17,6 +17,8 @@ public final class FloorBlocks {
             "gravity_floor", DirectionalFloorBlock.Kind.GRAVITY);
     public static final DirectionalFloorBlock MAGNETIC_FLOOR = create(
             "magnetic_floor", DirectionalFloorBlock.Kind.MAGNETIC);
+    public static final DirectionalFloorBlock DOUBLE_SIDED_GRAVITY_FLOOR = createDoubleSided(
+            "double_sided_gravity_floor");
 
     private FloorBlocks() {
     }
@@ -28,14 +30,22 @@ public final class FloorBlocks {
         return block;
     }
 
+    private static DoubleSidedGravityFloorBlock createDoubleSided(String path) {
+        DoubleSidedGravityFloorBlock block = new DoubleSidedGravityFloorBlock();
+        block.setRegistryName(Reference.MOD_ID, path);
+        block.setTranslationKey(Reference.MOD_ID + "." + path);
+        return block;
+    }
+
     @SubscribeEvent
     public static void registerBlocks(RegistryEvent.Register<Block> event) {
-        event.getRegistry().registerAll(GRAVITY_FLOOR, MAGNETIC_FLOOR);
+        event.getRegistry().registerAll(GRAVITY_FLOOR, MAGNETIC_FLOOR, DOUBLE_SIDED_GRAVITY_FLOOR);
     }
 
     @SubscribeEvent
     public static void registerItems(RegistryEvent.Register<Item> event) {
-        event.getRegistry().registerAll(itemBlock(GRAVITY_FLOOR), itemBlock(MAGNETIC_FLOOR));
+        event.getRegistry().registerAll(
+                itemBlock(GRAVITY_FLOOR), itemBlock(MAGNETIC_FLOOR), itemBlock(DOUBLE_SIDED_GRAVITY_FLOOR));
     }
 
     private static ItemBlock itemBlock(Block block) {

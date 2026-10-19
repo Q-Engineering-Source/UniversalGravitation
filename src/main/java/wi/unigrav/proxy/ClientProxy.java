@@ -9,6 +9,10 @@ import net.minecraftforge.fml.client.registry.ClientRegistry;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.entity.EntityPlayerSP;
 import net.minecraft.entity.EntityLivingBase;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.util.math.AxisAlignedBB;
+import java.util.function.BooleanSupplier;
 import net.minecraft.network.INetHandler;
 
 import wi.unigrav.UnigravMod;
@@ -17,7 +21,7 @@ import wi.unigrav.core.client.ClientGravityTicker;
 import wi.unigrav.core.client.ClientGIntent;
 import wi.unigrav.core.client.PlayerPhysicsClient;
 import wi.unigrav.core.player.GIntentProtocol;
-import wi.unigrav.core.player.PlayerPhysicsProtocol;
+import wi.unigrav.core.player.PlayerPhysicsInboundConnections;
 import wi.unigrav.core.player.PlayerRenderPoseProtocol;
 import wi.unigrav.core.client.PlayerRenderPoseMirror;
 import wi.unigrav.core.client.ClientImpactDetector;
@@ -29,10 +33,30 @@ import wi.unigrav.core.client.boost.RemoteBoostClient;
 
 public class ClientProxy extends CommonProxy {
 
+    @Override public void runNativeEnvironment(Entity actor, Runnable original) {
+        if (actor.world.isRemote && actor instanceof EntityPlayerSP player)
+            PlayerPhysicsClient.runNativeEnvironment(player, original);
+        else super.runNativeEnvironment(actor, original);
+    }
+    @Override public boolean nativeWaterMovement(Entity actor, BooleanSupplier original) {
+        return actor.world.isRemote && actor instanceof EntityPlayerSP player
+                ? PlayerPhysicsClient.nativeWaterMovement(player, original) : super.nativeWaterMovement(actor, original);
+    }
+    @Override public boolean nativeInLava(Entity actor, BooleanSupplier original) {
+        return actor.world.isRemote && actor instanceof EntityPlayerSP player
+                ? PlayerPhysicsClient.nativeInLava(player, original) : super.nativeInLava(actor, original);
+    }
+
     @Override public void runNativePose(EntityLivingBase actor, Runnable original) {
         if (actor.world.isRemote && actor instanceof EntityPlayerSP player)
             PlayerPhysicsClient.runNativePose(player, original);
         else super.runNativePose(actor, original);
+    }
+
+    @Override public AxisAlignedBB aquaPoseClearanceBox(EntityPlayer actor, AxisAlignedBB aquaCandidate) {
+        return actor.world.isRemote && actor instanceof EntityPlayerSP player
+                ? PlayerPhysicsClient.aquaPoseClearanceBox(player, aquaCandidate)
+                : super.aquaPoseClearanceBox(actor, aquaCandidate);
     }
 
     @Override public float physicalEyeHeight(EntityLivingBase actor, float nativeHeight) {
@@ -86,8 +110,9 @@ public class ClientProxy extends CommonProxy {
     }
 
     @Override
-    public void receivePlayerPhysics(PlayerPhysicsProtocol.Packet packet, INetHandler handler) {
-        PlayerPhysicsClient.receive(packet, handler);
+    public void receiveRawPlayerPhysics(PlayerPhysicsInboundConnections.RawInboundFrame raw,
+            INetHandler handler) {
+        PlayerPhysicsClient.receiveRaw(raw, handler);
     }
 
     @Override

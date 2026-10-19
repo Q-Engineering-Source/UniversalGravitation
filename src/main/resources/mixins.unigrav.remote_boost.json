@@ -13,14 +13,27 @@
     "BlockLandingPhysicsMixin",
     "BlockSlimePhysicsMixin",
     "EntityVelocityPhysicsMixin",
+    "EntityBodyProfileMixin",
     "ExplosionPhysicsMixin",
     "EntityLivingBasePhysicsMixin",
+    "EntityNativeEnvironmentMixin",
+    "EntityLivingNativeEnvironmentMixin",
+    "EntityCardinalNativeBoundaryMixin",
+    "LivingCardinalNativeBoundaryMixin",
+    "PlayerCardinalNativeBoundaryMixin",
+    "InstalledFreeFallMixin",
+    "MovementStatNativeBoundaryMixin",
+    "WorldCardinalNativeBoundaryMixin",
+    "WorldCollisionProvenanceMixin",
     "EntityPlayerPoseMixin",
     "EntityPlayerEyeMixin",
     "AquaPlayerGeometryMixin",
+    "DraconicFlightInputMixin",
+    "DraconicJumpInputMixin",
     "EntityPlayerEquipmentMixin",
     "InventoryPlayerEquipmentMixin",
     "NetHandlerPlayServerMixin",
+    "NetworkManagerPhysicsLifetimeMixin",
     "EntityTrackerEntryMixin",
     "ChunkFloorMutationMixin"
   ],
@@ -30,3 +43,4 @@
     "NetHandlerPlayClientMixin"
   ]
 }
+

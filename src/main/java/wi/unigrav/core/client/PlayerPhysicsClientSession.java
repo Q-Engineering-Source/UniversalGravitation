@@ -733,7 +733,12 @@ public final class PlayerPhysicsClientSession {
         }
         var input = new PlayerMobilityIntent.Input(Optional.ofNullable(pendingMobilityRequest),
                 mobilityPressId, mobilityHeld && !blocked, focused);
-        return controls.withMobility(input).withJump(controls.jump() && pressed);
+        // WALK's backpack gesture is an edge. Ordinary jumping and accepted FLIGHT use
+        // the same held level as the server, including every predicted/replayed slot.
+        boolean sustained = !controlEligible || accepted != null
+                && accepted.mode() == PlayerMobilityIntent.Mode.FLIGHT;
+        return controls.withMobility(input).withJump(controls.jump()
+                && (sustained ? input.held() : pressed));
     }
     private PlayerPhysicsProtocol.BodyReferenceAcknowledgement ordinaryModeAcknowledgement;
     private PlayerPhysicsProtocol.BodyReferenceAcknowledgement nativeRestoreAcknowledgement;

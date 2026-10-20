@@ -24,6 +24,28 @@ class PlayerMobilityInputTest {
         var next = session.sampleMobility(JUMP,true,true,true);
         assertTrue(next.jump()); assertTrue(next.mobility().pressId()>first.mobility().pressId());
     }
+    @Test void ordinaryHeldSpaceRemainsHeldForPredictionAcrossMultipleJumps() {
+        var session = session();
+        long press = 0;
+        for (int tick = 0; tick < 40; tick++) {
+            var sample = session.sampleMobility(JUMP, true, true, false);
+            assertTrue(sample.jump());
+            assertTrue(sample.mobility().held());
+            if (tick == 0) press = sample.mobility().pressId();
+            assertEquals(press, sample.mobility().pressId());
+        }
+        assertFalse(session.sampleMobility(JUMP, false, true, false).jump());
+        assertFalse(session.sampleMobility(JUMP, true, false, false).jump());
+    }
+    @Test void ordinaryHeldSpaceStillRequiresReleaseAfterCorrection() {
+        var session = session();
+        session.sampleMobility(JUMP, true, true, false);
+        session.nativeCorrection(7);
+        assertFalse(session.sampleMobility(JUMP, true, true, false).jump());
+        session.sampleMobility(JUMP, false, true, false);
+        assertTrue(session.sampleMobility(JUMP, true, true, false).jump());
+        assertTrue(session.sampleMobility(JUMP, true, true, false).jump());
+    }
     @Test void teleportCannotRemintStillHeldSpaceBeforeAnActualRelease() {
         var session = session();
         var before = session.sampleMobility(JUMP,true,true,true);

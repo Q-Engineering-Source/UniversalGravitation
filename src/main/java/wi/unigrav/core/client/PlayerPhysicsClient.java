@@ -1,6 +1,7 @@
 package wi.unigrav.core.client;
 
 import wi.unigrav.core.player.PlayerMobilityIntent;
+import wi.unigrav.core.player.LocomotionTransitionProbe;
 import org.apache.logging.log4j.message.StringMapMessage;
 
 import dev.crlhitbox.api.geometry.Vec3d;
@@ -82,6 +83,7 @@ public final class PlayerPhysicsClient {
     private ClientCardinalPredictionOwner prediction;
     private long lastEquipmentFlightProbeTick = Long.MIN_VALUE;
     private String lastEquipmentFlightProbeIdentity;
+    private final LocomotionTransitionProbe locomotionProbe = new LocomotionTransitionProbe();
     private CorrectionPredictionRearm correctionPredictionRearm;
     private record CorrectionPredictionRearm(AcceptedOfferContext owner, Object scope,
             PlayerPhysicsClientSession.CorrectionPredictionIdentity identity) {
@@ -2095,6 +2097,20 @@ public final class PlayerPhysicsClient {
                 if (session == viewSession && acceptedOfferContext == viewContext && nativeRestoreInput.current())
                     viewSession.inputSendSucceeded(packet);
             } else session.inputSendSucceeded(packet);
+            if (UnigravMod.LOGGER.isInfoEnabled() && locomotionProbe.shouldEmit(packet.scope(),
+                    nativeSubmissionTick, sampledControls, player.capabilities.isFlying, confirmedPersonalG)) {
+                var predicted = exactPrediction == null ? null : exactPrediction.state();
+                UnigravMod.LOGGER.info("ug-locomotion-transition stage=client-input-sent scope={} inputSeq={}"
+                                + " clientTick={} predictionInput={} jump={} held={} sneak={} flying={} personalG={}"
+                                + " translation={} authority={} predicted={} nativeSize={}x{} nativeGround={}"
+                                + " nativeMotionBlocksPerTick=({}, {}, {}) predictionActive={}",
+                        packet.scope(), packet.sequence(), nativeSubmissionTick, inputIdentity,
+                        sampledControls.jump(), sampledControls.mobility().held(), sampledControls.sneak(),
+                        player.capabilities.isFlying, confirmedPersonalG, sampledControls.translation(),
+                        inputPhysical, predicted, player.width, player.height, player.onGround,
+                        player.motionX, player.motionY, player.motionZ,
+                        exactPrediction != null && exactPrediction.active());
+            }
             if (inputIdentity.isPresent() && prediction == exactPrediction && exactPrediction.current(acceptedOfferContext, player)
                     && session.predictionEligible() && acceptedOwnerLifetimeCurrent(acceptedOfferContext, mc))
                 exactPrediction.inputSendSucceeded(packet);

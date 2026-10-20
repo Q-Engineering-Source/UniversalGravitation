@@ -5427,6 +5427,17 @@ public final class PlayerPhysicsServer {
         if (!UnigravMod.LOGGER.isInfoEnabled()) return;
 
         var mobility = owner.travel.mobility();
+        if (owner.locomotionProbe.shouldEmit(accepted.scope(), worldTick, controls, capabilityFlying, gActive)) {
+            UnigravMod.LOGGER.info("ug-locomotion-transition stage=server-step-result scope={} worldTick={}"
+                            + " admittedInputSeq={} predictionInputState={} jump={} held={} sneak={} flying={} personalG={}"
+                            + " freshInput={} translation={} before={} after={} disposition={} pendingPose={}",
+                    accepted.scope(), worldTick,
+                    owner.latestAdmittedInput == null ? -1 : owner.latestAdmittedInput.sequence(),
+                    owner.predictionTimeline.diagnostics(), controls.jump(), controls.mobility().held(), controls.sneak(),
+                    capabilityFlying, gActive, freshInput, controls.translation(), accepted,
+                    serverControlResultSnapshot(result, accepted), serverControlDisposition(result, stepFailure),
+                    owner.pendingCardinalPose != null);
+        }
         var mobilityState = owner.travel.mobilityState(accepted);
         var input = controls.mobility();
         long admittedSequence = owner.latestAdmittedInput == null ? -1 : owner.latestAdmittedInput.sequence();
@@ -6986,6 +6997,7 @@ public final class PlayerPhysicsServer {
         private long lastFreeAttitudeRejectionLogNanos;
         private long lastServerControlProbeTick = Long.MIN_VALUE;
         private ServerControlProbeKey lastObservedServerControlProbeKey;
+        private final LocomotionTransitionProbe locomotionProbe = new LocomotionTransitionProbe();
         private long suppressedServerControlProbeCount;
         private String suppressedServerControlProbeOutcome = "none";
         private long pendingServerControlProbeEventCount;

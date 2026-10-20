@@ -2477,11 +2477,13 @@ public final class PlayerPhysicsClient {
         // No authority/ACK quarantine: the just-proven canonical installation remains the physical owner.
         owner.session.predictedPoseRestoration(null);
         presentation.retirePredictedMotion(); prediction=null; predictionSuspension=suspended;
-        UnigravMod.LOGGER.warn("ugmotion1 prediction suspended scope {} proposal {} bootstrap {} epoch {} revision {} first {} last {} canonicalFrame {} canonicalGround {} refusalGround {} refusal {} support {}",
+        UnigravMod.LOGGER.warn("ugmotion1 prediction suspended scope {} proposal {} bootstrap {} epoch {} revision {} first {} last {} canonicalFrame {} canonicalGround {} refusalGround {} refusal {} support {} seedPersonalZeroG {} seedRevision {} seedWorldTick {} gObservationAtSuspension {}",
                 canonical.scope(),owner.offer.offerSequence(),exact.bootstrap(),predictionEpoch,canonical.revision(),exact.firstTick(),exact.lastTick(),
                 canonical.placement().shape() instanceof PlayerBodyShape.Cardinal cardinal ? cardinal.frame() : "not-cardinal",
                 canonical.contacts().map(PlayerPhysicalSnapshot.Contacts::onGround),
-                refusal==null ? "NOT_OBSERVED" : refusal.refusalGround().map(Object::toString).orElse("NOT_OBSERVED"),suspended.suspend.refusal(),refusal==null ? "not-applicable" : refusal.support());
+                refusal==null ? "NOT_OBSERVED" : refusal.refusalGround().map(Object::toString).orElse("NOT_OBSERVED"),suspended.suspend.refusal(),refusal==null ? "not-applicable" : refusal.support(),
+                exact.seed().personalZeroG(),exact.seed().snapshotRevision(),exact.seed().worldTick(),
+                ClientGIntent.acknowledgedObservation(owner.actor).map(Object::toString).orElse("NOT_OBSERVED"));
         return true;
     }
 
@@ -2498,8 +2500,9 @@ public final class PlayerPhysicsClient {
             if (suspended.checkpoint.snapshot().filter(snapshot::equals).isPresent()
                     && suspended.checkpoint.predictionSeed().orElse(null) instanceof wi.unigrav.core.player.CardinalPredictionSeed.Ready ready) {
                 var state=new CardinalPredictionStep.State(snapshot.placement(),snapshot.worldVelocity().multiply(.05),snapshot.contacts().orElseThrow(),0);
+                boolean sampledPersonalZeroG=ClientGravityTicker.isPersonalZeroGActive(owner.actor);
                 var sampled=CardinalPredictionEnvironmentSampler.sample(owner.actor,owner.world,state,controls,ready,
-                        ClientGravityTicker.isPersonalZeroGActive(owner.actor));
+                        sampledPersonalZeroG);
                 if (sampled instanceof CardinalPredictionEnvironmentSampler.Unavailable failure && failure.cause().isPresent()) {
                     var cause=failure.cause().orElseThrow();
                     if (predictionSuspension==suspended && acceptedOwnerLifetimeCurrent(owner,Minecraft.getMinecraft()))
@@ -2509,6 +2512,27 @@ public final class PlayerPhysicsClient {
                 if (predictionSuspension!=suspended || !acceptedOwnerLifetimeCurrent(owner,Minecraft.getMinecraft())
                         || owner.session.presentationSnapshot().orElse(null)!=snapshot) return Optional.empty();
                 if (sampled instanceof CardinalPredictionEnvironmentSampler.Sampled) suspended.rearmSent=true;
+                // This observes the existing once-per-20-tick check, not an extra sampling attempt.
+                UnigravMod.LOGGER.info(new StringMapMessage().with("event","ugmotion1_prediction_rearm_sample")
+                        .with("scope",snapshot.scope().toString()).with("requestId",Long.toString(suspended.suspend.requestId()))
+                        .with("bootstrap",suspended.suspend.bootstrap().toString()).with("clientTick",Long.toString(nativeSubmissionTick))
+                        .with("snapshotRevision",Long.toString(snapshot.revision())).with("seedRevision",Long.toString(ready.snapshotRevision()))
+                        .with("seedWorldTick",Long.toString(ready.worldTick())).with("seedPersonalZeroG",Boolean.toString(ready.personalZeroG()))
+                        .with("sampledPersonalZeroG",Boolean.toString(sampledPersonalZeroG))
+                        .with("gObservationAfterSample",ClientGIntent.acknowledgedObservation(owner.actor).map(Object::toString).orElse("NOT_OBSERVED"))
+                        .with("result",sampled.getClass().getSimpleName()).with("rearmSent",Boolean.toString(suspended.rearmSent))
+                        .with("reason",sampled instanceof CardinalPredictionEnvironmentSampler.Unsupported failure ? failure.reason().name()
+                                : sampled instanceof CardinalPredictionEnvironmentSampler.Unavailable failure ? failure.reason().name() : "NONE")
+                        .with("support",sampled instanceof CardinalPredictionEnvironmentSampler.Unsupported failure ? failure.support()
+                                : sampled instanceof CardinalPredictionEnvironmentSampler.Unavailable failure ? failure.support() : "not-applicable"));
+            } else {
+                UnigravMod.LOGGER.info(new StringMapMessage().with("event","ugmotion1_prediction_rearm_not_sampled")
+                        .with("scope",snapshot.scope().toString()).with("requestId",Long.toString(suspended.suspend.requestId()))
+                        .with("bootstrap",suspended.suspend.bootstrap().toString()).with("clientTick",Long.toString(nativeSubmissionTick))
+                        .with("snapshotRevision",Long.toString(snapshot.revision()))
+                        .with("checkpointMatchesSnapshot",Boolean.toString(suspended.checkpoint.snapshot().filter(snapshot::equals).isPresent()))
+                        .with("checkpointSeed",suspended.checkpoint.predictionSeed().map(Object::toString).orElse("NOT_OBSERVED"))
+                        .with("gObservationAtRearmCheck",ClientGIntent.acknowledgedObservation(owner.actor).map(Object::toString).orElse("NOT_OBSERVED")));
             }
         }
         return Optional.of(suspended.request());
@@ -2611,7 +2635,16 @@ public final class PlayerPhysicsClient {
                             .with("packetSequence",Long.toString(packet.sequence())).with("canonicalRevision",Long.toString(canonical.revision()))
                             .with("installationSerial",Long.toString(installedSerial));
                 }
+                boolean previouslyAcknowledged=suspended.acknowledged;
+                var previousRequest=suspended.suspend;
                 suspended.acceptReceipt(receipt);
+                if (previouslyAcknowledged!=suspended.acknowledged || previousRequest!=suspended.suspend)
+                    UnigravMod.LOGGER.info(new StringMapMessage().with("event","ugmotion1_prediction_suspension_receipt")
+                            .with("scope",packet.scope().toString()).with("clientTick",Long.toString(nativeSubmissionTick))
+                            .with("requestBefore",previousRequest.toString()).with("requestAfter",suspended.suspend.toString())
+                            .with("receipt",receipt.toString()).with("acknowledged",Boolean.toString(suspended.acknowledged))
+                            .with("rearmSent",Boolean.toString(suspended.rearmSent))
+                            .with("gObservationAtReceipt",ClientGIntent.acknowledgedObservation(context.actor).map(Object::toString).orElse("NOT_OBSERVED")));
             }
             suspended.checkpoint=packet;
             if(adoptionCommit!=null) UnigravMod.LOGGER.debug(adoptionCommit);
@@ -2623,6 +2656,13 @@ public final class PlayerPhysicsClient {
             var next=new ClientCardinalPredictionOwner(context,context.actor,Math.incrementExact(predictionEpoch),packet);
             suspended.previous.ifPresent(previous -> next.inheritSuspendedInput(previous,suspended.jumpHeld));
             predictionEpoch=Math.incrementExact(predictionEpoch); prediction=next; predictionSuspension=null;
+            UnigravMod.LOGGER.info(new StringMapMessage().with("event","ugmotion1_prediction_rearmed")
+                    .with("scope",packet.scope().toString()).with("requestId",Long.toString(suspended.suspend.requestId()))
+                    .with("previousBootstrap",suspended.suspend.bootstrap().toString()).with("bootstrap",next.bootstrap().toString())
+                    .with("predictionEpoch",Long.toString(predictionEpoch)).with("clientTick",Long.toString(nativeSubmissionTick))
+                    .with("seedRevision",Long.toString(next.seed().snapshotRevision())).with("seedWorldTick",Long.toString(next.seed().worldTick()))
+                    .with("seedPersonalZeroG",Boolean.toString(next.seed().personalZeroG()))
+                    .with("gObservationAtRearm",ClientGIntent.acknowledgedObservation(context.actor).map(Object::toString).orElse("NOT_OBSERVED")));
         }
         if (prediction == null) {
             boolean correctedState = packet.kind() == PlayerPhysicsProtocol.Kind.STATE

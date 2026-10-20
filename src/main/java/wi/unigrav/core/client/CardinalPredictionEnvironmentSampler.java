@@ -63,7 +63,10 @@ public final class CardinalPredictionEnvironmentSampler {
             if (actor.world != world || actor.isDead) return new Unavailable(Reason.ACTOR_CHANGED, Optional.empty());
             if (!(state.placement().shape() instanceof PlayerBodyShape.Cardinal cardinal)
                     || cardinal.frame() != seed.frame()) return new Unsupported(Reason.UNSUPPORTED_SHAPE);
-            if (currentPersonalZeroG != seed.personalZeroG()) return new Unsupported(Reason.PERSONAL_G_MISMATCH);
+            if (currentPersonalZeroG != seed.personalZeroG()) return new Unsupported(Reason.PERSONAL_G_MISMATCH,
+                    "sampledPersonalZeroG=" + currentPersonalZeroG + ",seedPersonalZeroG=" + seed.personalZeroG()
+                            + ",seedSnapshotRevision=" + seed.snapshotRevision() + ",seedWorldTick=" + seed.worldTick(),
+                    PlayerPhysicsProtocol.PredictionRefusalStage.SAMPLE);
             // Ready is issued only after the server excludes qualified magnetic boots and
             // their active contact memory. Ordinary armor in FEET is not a magnetic boot.
             var bounds = box(state.placement().bounds());

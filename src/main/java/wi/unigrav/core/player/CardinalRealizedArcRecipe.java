@@ -100,6 +100,13 @@ final class CardinalRealizedArcRecipe {
         if (!StoredRealizationLimits.sameRaw(dimensions.width(), (double) .6F)
                 || !StoredRealizationLimits.sameRaw(dimensions.height(), (double) 1.8F))
             return new NotApplicable(Reason.SOURCE_DOMAIN, "H1 requires the native float profile");
+        // Select only a recipe whose whole-orientation certificate covers this source center.
+        // NOMINAL fallback still requires its original source relation and exact endpoint bits;
+        // target containment, path proof and collision rejection never influence this choice.
+        if (!CardinalJointRnDomain.supportsCenterGrid(certificate.source().placement().center(), work))
+            return new NotApplicable(Reason.SOURCE_DOMAIN, "H1 whole-domain center grid is unsupported; center="
+                    + certificate.source().placement().center() + "; sourceRelation="
+                    + certificate.virtualPlacement().storedCapsuleGeometry().relation().kind());
         double scalar = Double.longBitsToDouble(0x3fe333331ffffffcL);
         var accepted = certificate.source();
         var limits = StoredRealizationLimits.derive(accepted.placement().center(), cardinal.frame().attitude(), dimensions, work);

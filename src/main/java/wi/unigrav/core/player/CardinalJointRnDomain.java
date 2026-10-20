@@ -10,6 +10,17 @@ final class CardinalJointRnDomain {
     record Certificate(double basisBound, int enumeratedValues, Object workIdentity) { }
     private CardinalJointRnDomain() { }
 
+    /** Source-only domain of this H1 certificate, not a target/path collision result. */
+    static boolean supportsCenterGrid(Vec3d center, StoredDyadic.Work work) {
+        StoredRealizationLimits.requirePoint(center, "joint RN center");
+        var minimumGap = StoredDyadic.of(0x1p-52, work);
+        for (int axis = 0; axis < 3; axis++) {
+            if (StoredDyadic.gap64(StoredRealizationLimits.component(center, axis), work)
+                    .compare(minimumGap, work) < 0) return false;
+        }
+        return true;
+    }
+
     static Certificate prove(Vec3d center, double h, double realized, StoredDyadic.Work work) {
         work.charge(1);
         if (Double.doubleToRawLongBits(h) != NOMINAL_BITS
@@ -22,11 +33,11 @@ final class CardinalJointRnDomain {
         var delta = StoredDyadic.of(h, work).subtract(StoredDyadic.of(realized, work), work);
         if (delta.compare(g.scalePow2(2, work), work) != 0 || !(realized >= .5 && h < 1))
             throw new CardinalRealizedArcRecipe.DomainException("joint RN grid profile does not match");
+        if (!supportsCenterGrid(center, work))
+            throw new CardinalRealizedArcRecipe.DomainException("joint RN coordinate grid is too fine");
         for (int axis = 0; axis < 3; axis++) {
             double c = StoredRealizationLimits.component(center, axis);
             StoredRealizationLimits.requirePoint(center, "joint RN center");
-            if (StoredDyadic.gap64(c, work).compare(g.scalePow2(1, work), work) < 0)
-                throw new CardinalRealizedArcRecipe.DomainException("joint RN coordinate grid is too fine");
             // |v| <= 1/2: the existing exact multiplication bound after cancellation
             // of u*|Hnom| is below the coordinate-only part of the original domain.
             var coefficient = delta.add(u.multiply(StoredDyadic.of(realized, work), work), work)

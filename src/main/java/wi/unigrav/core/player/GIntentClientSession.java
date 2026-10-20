@@ -52,4 +52,9 @@ public final class GIntentClientSession {
     public Optional<Boolean> acknowledgedIntent() {
         return state == GIntentProtocol.State.UNKNOWN ? Optional.empty() : Optional.of(state == GIntentProtocol.State.ON);
     }
+
+    /** Read-only identity of the actual acknowledged STATE, not the pending local request. */
+    public Optional<GIntentObservation> acknowledgedObservation(GIntentObservation.Source source) {
+        return acknowledgedIntent().map(on -> new GIntentObservation(key, source, 0, acknowledged, on));
+    }
 }

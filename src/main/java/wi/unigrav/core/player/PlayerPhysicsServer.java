@@ -178,6 +178,15 @@ public final class PlayerPhysicsServer {
         // That expected pause must preserve the owner's ledger for completeNativeCorrectionLifetime.
         if (current(session) && session.owner.teleportPending) return;
         var previous = nativeEnvironmentScope;
+        // Death may occur after START lifecycle retirement but before the native entity tick.
+        // With no enclosing operation or installed journal, this is normal owner retirement;
+        // a transaction already in flight still reaches its existing failure/finalization boundary.
+        if (previous == null && session.world.isCallingFromMinecraftThread()
+                && !player.isEntityAlive() && FreeOwnerTransaction.nativeInstallation(player) == null) {
+            retire(session.manager);
+            original.run();
+            return;
+        }
         if (previous != null && previous.session.player == player) {
             previous.check();
             original.run();
@@ -360,15 +369,29 @@ public final class PlayerPhysicsServer {
         private void requireCurrent() {
             if (current(session) && session.owner == owner && owner.teleportPending)
                 throw new PauseNativeEnvironment();
-            if (!session.world.isCallingFromMinecraftThread() || !current(session)
-                    || session.owner != owner || owner.snapshot != ownerSnapshot
-                    || session.connectionHandle != connection || session.scopeHandle != scope
-                    || owner.travel.correctionRevision() != correction || owner.teleportPending
-                    || owner.nativeDelegated || owner.recoveryPending || owner.recoveryAwaitingApply
-                    || owner.recoveryAwaitingMirror || owner.recoveryTerminal
-                    || session.world.captureBlockSnapshots || session.world.restoringBlockSnapshots
-                    || !session.player.isEntityAlive() || !matchesPlacement(session.player, accepted.placement()))
-                throw new IllegalStateException("Free native environment lost its exact owner or geometry");
+            String invalid = !session.world.isCallingFromMinecraftThread() ? "server-thread"
+                    : !current(session) ? "session-current"
+                    : session.owner != owner ? "owner-identity"
+                    : owner.snapshot != ownerSnapshot ? "snapshot-identity"
+                    : session.connectionHandle != connection ? "connection-identity"
+                    : session.scopeHandle != scope ? "scope-identity"
+                    : owner.travel.correctionRevision() != correction ? "correction-revision"
+                    : owner.teleportPending ? "teleport-pending"
+                    : owner.nativeDelegated ? "native-delegated"
+                    : owner.recoveryPending ? "recovery-pending"
+                    : owner.recoveryAwaitingApply ? "recovery-awaiting-apply"
+                    : owner.recoveryAwaitingMirror ? "recovery-awaiting-mirror"
+                    : owner.recoveryTerminal ? "recovery-terminal"
+                    : session.world.captureBlockSnapshots ? "world-capturing-snapshots"
+                    : session.world.restoringBlockSnapshots ? "world-restoring-snapshots"
+                    : !session.player.isEntityAlive() ? "actor-alive"
+                    : !matchesPlacement(session.player, accepted.placement()) ? "actor-placement" : null;
+            if (invalid != null)
+                throw new IllegalStateException("Free native environment lost its exact owner or geometry"
+                        + "; firstInvalid=" + invalid + "; acceptedRevision=" + accepted.revision()
+                        + "; ownerRevision=" + owner.snapshot.revision()
+                        + "; actorAlive=" + session.player.isEntityAlive() + "; actorDead=" + session.player.isDead
+                        + "; installedJournal=" + (installation != null));
             if (installation != null) {
                 if (FreeOwnerTransaction.nativeInstallation(session.player) != installation)
                     throw new IllegalStateException("Free native journal scope changed");
@@ -4443,13 +4466,23 @@ public final class PlayerPhysicsServer {
             owner.predictionTimeline.retire();
             return;
         }
-        owner.predictionTimeline.complete(predictionContext(session, owner), frozen.orElseThrow(), outcome,
+        var completedBoundary = owner.predictionTimeline.complete(predictionContext(session, owner), frozen.orElseThrow(), outcome,
                 // A committed move may defer its tail after the jump already happened.
                 owner.travel.predictionJumpCooldown(), outcome == PlayerPhysicsProtocol.StepOutcome.APPLIED
                         || snapshot.revision() > frozen.orElseThrow().preSnapshotRevision()
                         ? owner.travel.jumpOutcomeForRevision(frozen.orElseThrow().preSnapshotRevision())
                         : PlayerPhysicsProtocol.JumpOutcome.NONE);
         owner.predictionCheckpoint = snapshot;
+        if (UnigravMod.LOGGER.isInfoEnabled()
+                && owner.travel.jumpOutcomeForRevision(frozen.orElseThrow().preSnapshotRevision())
+                        == PlayerPhysicsProtocol.JumpOutcome.APPLIED) {
+            // Slot completion is not a network-send receipt. Keep callback and committed outcome distinct.
+            UnigravMod.LOGGER.info("ug-jump-slot scope={} worldTick={} preRevision={} completedRevision={}"
+                            + " callbackOutcome={} stepOutcome={} completedGround={} cooldown={} boundary={}",
+                    snapshot.scope(), session.world.getTotalWorldTime(), frozen.orElseThrow().preSnapshotRevision(),
+                    snapshot.revision(), PlayerPhysicsProtocol.JumpOutcome.APPLIED, outcome,
+                    serverControlGround(snapshot), owner.travel.predictionJumpCooldown(), completedBoundary);
+        }
     }
 
     private static void beginPredictionBootstrap(Session session, Owned owner) {
@@ -5414,7 +5447,8 @@ public final class PlayerPhysicsServer {
                 || result instanceof PlayerPhysicsStep.CommittedFailure
                 || result instanceof PlayerPhysicsStep.CommittedDeferred
                 || result instanceof PlayerPhysicsStep.CommittedTailStop;
-        updateServerControlJumpProbe(owner, accepted, worldTick, result, stepFailure, mobilityTick);
+        updateServerControlJumpProbe(session, owner, accepted, worldTick, controls, admittedSequence,
+                freshInput, result, stepFailure, mobilityTick);
         if (shortJumpOrDetach || unexpectedDisposition) {
             String disposition = serverControlDisposition(result, stepFailure);
             PlayerPhysicalSnapshot after = serverControlResultSnapshot(result, accepted);
@@ -5661,42 +5695,48 @@ public final class PlayerPhysicsServer {
 
     private record CardinalArcFailureKey(String category, String causeType) { }
 
-    private static void updateServerControlJumpProbe(Owned owner, PlayerPhysicalSnapshot accepted,
-            long worldTick, PlayerPhysicsStep.Result result, RuntimeException stepFailure,
+    private static void updateServerControlJumpProbe(Session session, Owned owner, PlayerPhysicalSnapshot accepted,
+            long worldTick, PlayerPhysicsProtocol.Controls controls, long admittedSequence, boolean freshInput,
+            PlayerPhysicsStep.Result result, RuntimeException stepFailure,
             PlayerMobilityIntent.Tick mobilityTick) {
+        PlayerPhysicalSnapshot after = serverControlResultSnapshot(result, accepted);
+        var callbackOutcome = owner.travel.jumpOutcomeForRevision(accepted.revision());
         JumpFollowUpProbe active = owner.jumpFollowUpProbe;
-        if (active != null && worldTick > active.startTick) {
+        if (active != null) {
             if (!active.scope.equals(accepted.scope())) {
                 finishServerControlJumpProbe(owner, active, "scope-changed");
-            } else if (worldTick - active.startTick > 10) {
-                finishServerControlJumpProbe(owner, active, "owner-tick-window-gap");
-            } else {
-                PlayerPhysicalSnapshot after = serverControlResultSnapshot(result, accepted);
-                active.samples.add(serverControlJumpSample(accepted, after, active, worldTick,
-                        serverControlDisposition(result, stepFailure), serverControlResultSnapshotSource(result)));
-                if (active.samples.size() >= 11)
-                    finishServerControlJumpProbe(owner, active, "10-follow-up-owner-ticks");
-                else if (stepFailure != null || result instanceof PlayerPhysicsStep.Unavailable
-                        || result instanceof PlayerPhysicsStep.CommittedFailure
-                        || result instanceof PlayerPhysicsStep.CommittedDeferred
-                        || result instanceof PlayerPhysicsStep.CommittedTailStop)
-                    finishServerControlJumpProbe(owner, active, "step-did-not-apply");
+            } else if (worldTick <= active.lastTick) {
+                return;
             }
         }
-        if (!mobilityTick.shortJump()) return;
-        if (owner.jumpFollowUpProbe != null)
-            finishServerControlJumpProbe(owner, owner.jumpFollowUpProbe, "superseded-by-next-jump-edge");
-        PlayerPhysicalSnapshot after = serverControlResultSnapshot(result, accepted);
-        var next = new JumpFollowUpProbe(accepted.scope(), worldTick, accepted.placement().center(),
-                accepted.placement().bodyUp());
-        next.samples.add(serverControlJumpSample(accepted, after, next, worldTick,
-                serverControlDisposition(result, stepFailure), serverControlResultSnapshotSource(result)));
-        owner.jumpFollowUpProbe = next;
+        if (owner.jumpFollowUpProbe == null) {
+            // Held auto-jumps have no new key edge. Observe the actual callback outcome as well.
+            if (!mobilityTick.shortJump() && callbackOutcome != PlayerPhysicsProtocol.JumpOutcome.APPLIED) return;
+            owner.jumpFollowUpProbe = new JumpFollowUpProbe(accepted.scope(), worldTick,
+                    accepted.placement().center(), accepted.placement().bodyUp());
+        }
+        active = owner.jumpFollowUpProbe;
+        active.samples.add(serverControlJumpSample(accepted, after, active, worldTick,
+                serverControlDisposition(result, stepFailure), serverControlResultSnapshotSource(result))
+                + ",inputSeq=" + admittedSequence + ",freshInput=" + freshInput + ",jumpHeld=" + controls.jump()
+                + ",callbackOutcome=" + callbackOutcome + ",completedCooldown=" + owner.travel.predictionJumpCooldown()
+                + ",nativeMotionBlocksPerTick=(" + session.player.motionX + "," + session.player.motionY
+                + "," + session.player.motionZ + ")");
+        active.lastTick = worldTick;
+        boolean grounded = after.contacts().map(contacts -> contacts.onGround()).orElse(false);
+        if (!grounded) active.observedAirborne = true;
         if (stepFailure != null || result instanceof PlayerPhysicsStep.Unavailable
                 || result instanceof PlayerPhysicsStep.CommittedFailure
                 || result instanceof PlayerPhysicsStep.CommittedDeferred
                 || result instanceof PlayerPhysicsStep.CommittedTailStop)
-            finishServerControlJumpProbe(owner, next, "jump-step-did-not-apply");
+            finishServerControlJumpProbe(owner, active, "step-did-not-apply");
+        else if (grounded && (active.observedAirborne || !controls.jump()))
+            finishServerControlJumpProbe(owner, active, active.observedAirborne ? "landed" : "released-before-launch");
+        else if (active.samples.size() >= 32) {
+            // Bound diagnostic storage, not physics or the duration of a held jump sequence.
+            logServerControlJumpProbe(active, "continued-next-chunk");
+            active.samples.clear();
+        }
     }
 
     private static String serverControlJumpSample(PlayerPhysicalSnapshot accepted, PlayerPhysicalSnapshot result,
@@ -5719,11 +5759,15 @@ public final class PlayerPhysicsServer {
 
     private static void finishServerControlJumpProbe(Owned owner, JumpFollowUpProbe probe, String reason) {
         if (owner.jumpFollowUpProbe != probe) return;
+        logServerControlJumpProbe(probe, reason);
+        owner.jumpFollowUpProbe = null;
+    }
+
+    private static void logServerControlJumpProbe(JumpFollowUpProbe probe, String reason) {
         UnigravMod.LOGGER.info("ug-control-jump-followup scope={} startTick={} startCenter={} sourceUp={}"
                         + " samples={} endReason={} trace={}",
                 probe.scope, probe.startTick, probe.startCenter, probe.sourceUp, probe.samples.size(), reason,
                 String.join(" || ", probe.samples));
-        owner.jumpFollowUpProbe = null;
     }
 
     private static final class JumpFollowUpProbe {
@@ -5731,7 +5775,9 @@ public final class PlayerPhysicsServer {
         private final long startTick;
         private final Vec3d startCenter;
         private final Vec3d sourceUp;
-        private final ArrayList<String> samples = new ArrayList<>(11);
+        private final ArrayList<String> samples = new ArrayList<>(32);
+        private long lastTick = Long.MIN_VALUE;
+        private boolean observedAirborne;
 
         private JumpFollowUpProbe(PlayerPhysicalSnapshot.Scope scope, long startTick,
                 Vec3d startCenter, Vec3d sourceUp) {

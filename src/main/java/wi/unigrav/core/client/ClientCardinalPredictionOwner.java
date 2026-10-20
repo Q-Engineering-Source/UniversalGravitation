@@ -12,6 +12,7 @@ import wi.unigrav.UnigravMod;
 
 import java.util.List;
 import java.util.LinkedHashMap;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Function;
 
@@ -76,6 +77,12 @@ final class ClientCardinalPredictionOwner {
     private long latestAwaitingRevision;
     private boolean anchored;
     private PlayerPhysicsProtocol.Packet lastReconciledPacket;
+    private boolean jumpTracePending;
+    private long lastJumpTraceTick = Long.MIN_VALUE;
+    private Boolean lastJumpTraceAuthorityGround, lastJumpTracePredictedGround;
+    private PlayerPhysicsProtocol.JumpDecision lastJumpTraceDecision;
+    private PlayerPhysicsProtocol.PredictionBoundary lastJumpTraceBoundary;
+    private long lastJumpTraceAckSequence = -1, lastJumpTraceAckTick = -1;
 
     ClientCardinalPredictionOwner(Object lifetime, EntityPlayer actor, long epoch,
                                   PlayerPhysicsProtocol.Packet initial) {
@@ -102,6 +109,7 @@ final class ClientCardinalPredictionOwner {
     void retire(String reason) {
         if (retiredReason == null) {
             traceReconciliation(reconciliationAttempt, state.placement().center(), "retire:" + reason, true);
+            traceJumpReconciliation(reconciliationAttempt, state.placement().center(), "retire:" + reason, true);
             retiredReason = reason;
         }
         if (history != null) history.retire();
@@ -129,6 +137,7 @@ final class ClientCardinalPredictionOwner {
         long nextJumpEdge = controls.jump() && !jumpHeld ? Math.incrementExact(jumpEdge) : jumpEdge;
         var identity = new PlayerPhysicsProtocol.PredictionInput(epoch, nextFirstTick, clientTick,
                 controls.jump() ? nextJumpEdge : 0, Optional.of(bootstrap));
+        if (controls.jump()) jumpTracePending = true;
         var next = calculate(state, controls, environment, collisions, clientTick);
         if (next == null) return Optional.empty();
         if (!validateEndpoint(endpoint, next)) return Optional.empty();
@@ -223,6 +232,7 @@ final class ClientCardinalPredictionOwner {
         else latestAwaitingRevision = Math.max(latestAwaitingRevision, accepted.revision());
         authority = accepted; seed = ready; state = scratch; lastReconciledPacket = packet;
         traceReconciliation(packet, predictedBefore, "reconciled", false);
+        traceJumpReconciliation(packet, predictedBefore, "reconciled", false);
         reconciliationAttempt = null;
         return true;
     }
@@ -250,6 +260,42 @@ final class ClientCardinalPredictionOwner {
             releaseCount = 0;
         }
     }
+    /** Observes real STATE/replay results even when no translation-release probe is active. */
+    private void traceJumpReconciliation(PlayerPhysicsProtocol.Packet packet, Vec3d predictedBefore,
+            String disposition, boolean terminal) {
+        if (!jumpTracePending || !UnigravMod.LOGGER.isInfoEnabled()) return;
+        var boundary = packet == null ? null : packet.predictionBoundary().orElse(null);
+        var canonical = packet == null ? authority : packet.snapshot().orElse(authority);
+        Boolean ground = canonical.contacts().map(contacts -> contacts.onGround()).orElse(null);
+        boolean predictedGround = state.contacts().onGround();
+        var decision = boundary == null ? null : boundary.jumpDecision();
+        boolean changed = !Objects.equals(ground, lastJumpTraceAuthorityGround)
+                || !Objects.equals(predictedGround, lastJumpTracePredictedGround)
+                || !Objects.equals(decision, lastJumpTraceDecision)
+                || !Objects.equals(boundary, lastJumpTraceBoundary)
+                || acknowledgedInputSequence != lastJumpTraceAckSequence
+                || acknowledgedInputTick != lastJumpTraceAckTick;
+        if (!terminal && !changed && lastJumpTraceTick != Long.MIN_VALUE && lastTick >= lastJumpTraceTick
+                && lastTick - lastJumpTraceTick < 10) return;
+        UnigravMod.LOGGER.info("ug-jump-reconcile scope={} bootstrap={} epoch={} clientHead={} revision={}"
+                        + " checkpointSeq={} boundary={} acknowledgedInputSeq={} acknowledgedInputTick={}"
+                        + " localJumpHeld={} localJumpEdge={} authorityGround={} predictedGround={}"
+                        + " authorityCenter={} authorityVelocityMps={} predictedBefore={} predictedAfter={}"
+                        + " predictedMotionBlocksPerTick={} predictedCooldown={} disposition={}",
+                canonical.scope(), bootstrap, epoch, lastTick, canonical.revision(),
+                packet == null ? -1 : packet.sequence(), boundary, acknowledgedInputSequence, acknowledgedInputTick,
+                jumpHeld, jumpEdge, ground, predictedGround, canonical.placement().center(), canonical.worldVelocity(),
+                predictedBefore, state.placement().center(), state.motionBlocksPerTick(), state.jumpTicks(), disposition);
+        lastJumpTraceTick = lastTick;
+        lastJumpTraceAuthorityGround = ground;
+        lastJumpTracePredictedGround = predictedGround;
+        lastJumpTraceDecision = decision;
+        lastJumpTraceBoundary = boundary;
+        lastJumpTraceAckSequence = acknowledgedInputSequence;
+        lastJumpTraceAckTick = acknowledgedInputTick;
+        if (!terminal && !jumpHeld && Boolean.TRUE.equals(ground) && predictedGround) jumpTracePending = false;
+    }
+
     private boolean validateEndpoint(Function<CardinalPredictionStep.State, EndpointValidation> endpoint,
                                      CardinalPredictionStep.State scratch) {
         var validation = java.util.Objects.requireNonNull(endpoint.apply(scratch), "endpoint validation");

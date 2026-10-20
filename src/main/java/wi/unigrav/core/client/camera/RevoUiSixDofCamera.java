@@ -40,6 +40,7 @@ import neofontrender.addons.api.flight.FlightEulerAngles;
 import neofontrender.addons.api.flight.FlightManeuverInput;
 import neofontrender.addons.api.flight.FlightRegistration;
 import neofontrender.addons.api.flight.FlightRenderPose;
+import neofontrender.addons.api.flight.FlightRenderDiagnostics;
 import neofontrender.addons.api.input.CameraMouseInputEvent;
 import neofontrender.addons.api.input.InputAction;
 import neofontrender.addons.api.input.InputApi;
@@ -58,6 +59,7 @@ import wi.unigrav.core.GravityEntityBinder;
 import wi.unigrav.core.TickDriver;
 import wi.unigrav.core.UnigravConfig;
 import wi.unigrav.core.client.ClientBoostRouting;
+import wi.unigrav.core.client.ClientGIntent;
 import wi.unigrav.core.client.BodyAttitudeInputPolicy;
 import wi.unigrav.core.client.PlayerRenderPoseMirror;
 import neofontrender.addons.api.camera.CameraEntityPickGeometryProvider;
@@ -627,6 +629,16 @@ public final class RevoUiSixDofCamera implements AutoCloseable {
         initializeFromPlayer(player);
         var view = currentAttitude();
         var accepted = PlayerPhysicsClient.currentProvenPresentation(player);
+        // Correlate the already-read physical presentation with the actual G acknowledgement.
+        // This optional channel never grants a pose, input, movement or render capability.
+        FlightRenderDiagnostics.publish(player, player.world, new FlightRenderDiagnostics.Observation(
+                accepted.map(value -> value.scope().toString()).orElse("NOT_OBSERVED"),
+                accepted.map(PlayerPhysicalSnapshot::revision).orElse(-1L), player.ticksExisted,
+                ClientGravityTicker.requestedPersonalZeroG(player),
+                ClientGravityTicker.acknowledgedPersonalZeroG(player).orElse(null),
+                ClientGravityTicker.isPersonalZeroGActive(player),
+                ClientGIntent.acknowledgedObservation(player)
+                        .map(Object::toString).orElse("NOT_OBSERVED")));
         SixDofBodyPresentation.FreePoseAttitudes pose;
         if (accepted.isPresent() && accepted.orElseThrow().placement().shape() instanceof PlayerBodyShape.Cardinal) {
             CardinalCameraCandidate cardinal = cardinalCameraCandidate(player);

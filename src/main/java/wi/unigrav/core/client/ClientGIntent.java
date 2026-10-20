@@ -12,6 +12,7 @@ import net.minecraftforge.fml.common.network.FMLNetworkEvent;
 import wi.unigrav.core.player.GIntentClientSession;
 import wi.unigrav.core.player.GIntentNetwork;
 import wi.unigrav.core.player.GIntentProtocol;
+import wi.unigrav.core.player.GIntentObservation;
 
 /** Explicit G synchronization for local and negotiated physics peers; never writes motion or camera state. */
 public final class ClientGIntent {
@@ -106,6 +107,18 @@ public final class ClientGIntent {
         if (actor != null && actor == INSTANCE.player && actor == mc.player && actor.world == INSTANCE.world
                 && INSTANCE.connection == mc.getConnection() && actor.dimension == INSTANCE.dimension
                 && INSTANCE.session != null) return INSTANCE.session.acknowledgedIntent();
+        return java.util.Optional.empty();
+    }
+
+    /** Exact existing client-session acknowledgement for diagnostic correlation only. */
+    public static java.util.Optional<GIntentObservation> acknowledgedObservation(EntityPlayerSP actor) {
+        Minecraft mc = Minecraft.getMinecraft();
+        if (actor != null && actor == INSTANCE.player && actor == mc.player && actor.world == INSTANCE.world
+                && INSTANCE.connection == mc.getConnection() && actor.dimension == INSTANCE.dimension
+                && INSTANCE.session != null) {
+            return INSTANCE.session.acknowledgedObservation(mc.isIntegratedServerRunning()
+                    ? GIntentObservation.Source.INTEGRATED_INTENT : GIntentObservation.Source.NEGOTIATED_INTENT);
+        }
         return java.util.Optional.empty();
     }
 

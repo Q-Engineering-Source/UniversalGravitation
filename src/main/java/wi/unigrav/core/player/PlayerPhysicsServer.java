@@ -2668,12 +2668,27 @@ public final class PlayerPhysicsServer {
         long worldTick = session.world.getTotalWorldTime();
         var source = intent.observe(session.player);
         Runnable requireCurrent = () -> {
-            if (!current(session) || session.owner != owner || owner.snapshot != snapshot
-                    || session.handler != handler || session.connectionHandle != connection || session.scopeHandle != scope
-                    || owner.travel.correctionRevision() != correction || owner.teleportPending
-                    || session.world.getTotalWorldTime() != worldTick || !source.equals(intent.observe(session.player))
-                    || !matchesPhysicalGeometry(session.player, snapshot))
-                throw new IllegalStateException("initial prediction observation lost its adopted owner context");
+            String invalid = !current(session) ? "session-current"
+                    : session.owner != owner ? "owner-identity"
+                    : owner.snapshot != snapshot ? "snapshot-identity"
+                    : session.handler != handler ? "handler-identity"
+                    : session.connectionHandle != connection ? "connection-identity"
+                    : session.scopeHandle != scope ? "scope-identity"
+                    : owner.travel.correctionRevision() != correction ? "correction-revision"
+                    : owner.teleportPending ? "teleport-pending"
+                    : session.world.getTotalWorldTime() != worldTick ? "world-tick"
+                    : !source.equals(intent.observe(session.player)) ? "intent-observation"
+                    : !matchesPhysicalGeometry(session.player, snapshot) ? "actor-physical-geometry" : null;
+            if (invalid != null)
+                throw new IllegalStateException("initial prediction observation lost its adopted owner context"
+                        + "; firstInvalid=" + invalid + "; acceptedRevision=" + snapshot.revision()
+                        + "; ownerRevision=" + owner.snapshot.revision()
+                        + "; expectedPlacement=" + snapshot.placement()
+                        + "; actorPosition=(" + session.player.posX + "," + session.player.posY + "," + session.player.posZ + ")"
+                        + "; nativeSize=" + session.player.width + "x" + session.player.height
+                        + "; rawEyeHeight=" + session.player.eyeHeight
+                        + "; recoveryAwaitingApply=" + owner.recoveryAwaitingApply
+                        + "; recoveryAwaitingMirror=" + owner.recoveryAwaitingMirror);
         };
         if (movement == null && UnigravMod.entityBinder != null) movement = createMovement();
         CardinalPredictionSeed seed = movement == null
@@ -4393,17 +4408,21 @@ public final class PlayerPhysicsServer {
             boolean initialOwned) {
         var context = predictionContext(session, owner);
         long correction = owner.travel.correctionRevision();
+        // Publication runs after actor installation but before the atomic owner commit. A Free
+        // predecessor cannot service native fluid hooks against that new Cardinal geometry.
+        // Defer capture until the next committed owner slot; never borrow the predecessor's scope.
         boolean stable = snapshot.placement().shape() instanceof PlayerBodyShape.Cardinal
+                && expectedOwnerSnapshot.placement().shape() instanceof PlayerBodyShape.Cardinal
                 && !owner.travel.retainedCardinal(snapshot)
                 && !owner.travel.mobility().blocksCapture()
                 && controls.mobility().request().map(request -> request.mode() == PlayerMobilityIntent.Mode.WALK).orElse(true)
-                && !session.player.isInWater() && !session.player.isInLava() && !session.player.isElytraFlying()
                 && controls.bodyReferenceIntent().action() == PlayerPhysicsProtocol.BodyReferenceAction.NONE
                 && controls.desiredBodyAttitude().isEmpty() && owner.pendingAttitudeRequest == null
                 && owner.pendingCardinalPose == null && !owner.teleportPending && !owner.nativeDelegated
                 && !owner.nativeRestorePending && !owner.nativeRestoreAwaitingAcknowledgement && !owner.nativeHandoffPrepared
                 && !owner.recoveryPending && !owner.recoveryAwaitingApply && (!owner.recoveryAwaitingMirror || initialOwned)
-                && !owner.recoveryTerminal && !owner.recoveryNativeResume;
+                && !owner.recoveryTerminal && !owner.recoveryNativeResume
+                && !session.player.isInWater() && !session.player.isInLava() && !session.player.isElytraFlying();
         if (!stable || !controls.boost()) return stable;
         // A sampled key is not propulsion permission. Read current G at this consumption
         // boundary; session.source describes admission and may predate a same-owner G change.

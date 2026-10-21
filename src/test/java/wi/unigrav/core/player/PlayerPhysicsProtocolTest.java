@@ -1084,7 +1084,7 @@ class PlayerPhysicsProtocolTest {
                 packet.predictionSeed(), Optional.of(phase), packet.predictionRequest(), packet.mobilityState());
     }
     @Test void referenceSuspensionUsesV20AndRetainsTheCanonicalCardinalEnvelope() {
-        assertEquals("0.1.8",Reference.VERSION);
+        assertEquals("0.1.9",Reference.VERSION);
         assertEquals(629,PlayerPhysicsProtocol.MAX_BYTES);
         var ready=new CardinalPredictionSeed.Ready(9,123,CardinalFrame.Y_POS,new Vec3d(0,-32,0),
                 Optional.empty(),false,false,true,true,80);

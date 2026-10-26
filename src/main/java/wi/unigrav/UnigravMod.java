@@ -62,7 +62,7 @@ import wi.unigrav.proxy.IProxy;
  */
 @Mod(modid = Reference.MOD_ID, name = Reference.MOD_NAME, version = Reference.VERSION,
      acceptableRemoteVersions = "*",
-     dependencies = "required-after:crlhitbox@[0.1.1];after:neofontrender_ui_enhancements@[0.8.9,)")
+     dependencies = "required-after:crlhitbox@[0.1.2];after:neofontrender_ui_enhancements@[0.8.9,)")
 public class UnigravMod {
 
     public static final Logger LOGGER = LogManager.getLogger(Reference.MOD_NAME);

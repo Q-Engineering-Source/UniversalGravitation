@@ -72,4 +72,8 @@ tile.unigrav.magnetic_floor.name=Magnetic Floor
 tile.unigrav.double_sided_gravity_floor.name=Double-Sided Gravity Floor
 
 gui.unigrav.pose_backpack.button.alignment=Horizon alignment (Ctrl+H): %s
+gui.unigrav.pose_backpack.button.shadow=Player shadows: %s
+gui.unigrav.pose_backpack.shadow.axial_disc=Axial disc (off in free attitude)
+gui.unigrav.pose_backpack.shadow.real_player_projection=Real player projection
+gui.unigrav.pose_backpack.shadow_save_failed=Could not save shadow mode; previous setting retained. Check the client log.
 gui.unigrav.pose_backpack.button.reference=Ground reference (Alt+H): select %s

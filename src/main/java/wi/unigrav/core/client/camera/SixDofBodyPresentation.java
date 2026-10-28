@@ -21,7 +21,7 @@ import wi.unigrav.core.player.PlayerPhysicalSnapshot;
 
 /** UIE contract boundary: gait turns the visual root, never the camera's authoritative attitude. */
 public final class SixDofBodyPresentation {
-    static final int MODEL_UP_BODY_POSE_FLIGHT_API = 12;
+    static final int MODEL_UP_BODY_POSE_FLIGHT_API = 13;
 
     private SixDofBodyPresentation() { }
 
@@ -30,14 +30,14 @@ public final class SixDofBodyPresentation {
 
     public static Sample sample(FlightAttitude view, float bodyYawOffsetDegrees) {
         FreePoseAttitudes attitudes = freePoseAttitudes(view, bodyYawOffsetDegrees);
-        return new Sample(FlightBodyPose.modelUpY(attitudes.body(), attitudes.head()), tracking(view));
+        return new Sample(FlightBodyPose.modelUpY(attitudes.body(), attitudes.head()).withFreeShadowReference(), tracking(view));
     }
 
     /** The accepted body follows physical Q; live UIE head/camera Q never replaces collision geometry. */
     public static Sample sampleFree(PlayerPhysicalSnapshot snapshot, FlightAttitude view) {
         FreePoseAttitudes attitudes = acceptedFreePoseAttitudes(snapshot, view);
         return new Sample(FlightBodyPose.modelUpY(attitudes.body(), attitudes.head(),
-                acceptedRootOffset(snapshot.placement())), tracking(view));
+                acceptedRootOffset(snapshot.placement())).withFreeShadowReference(), tracking(view));
     }
 
     /** Native rendering already interpolates transport; cancel that base before placing the physical root. */
@@ -45,7 +45,8 @@ public final class SixDofBodyPresentation {
         var q = render.attitude();
         return new Sample(FlightBodyPose.modelUpY(new FlightAttitude(q.x(), q.y(), q.z(), q.w()), view,
                 fromWorld(render.feet().subtract(nativeRenderOrigin))).withGeometry(new FlightBodyGeometry(
-                        fromWorld(render.capsuleStart()), fromWorld(render.capsuleEnd()), render.radius(), fromWorld(render.eye()))), tracking(view));
+                        fromWorld(render.capsuleStart()), fromWorld(render.capsuleEnd()), render.radius(), fromWorld(render.eye())))
+                .withFreeShadowReference(), tracking(view));
     }
 
     /** Shared local/remote Free presentation: accepted body Q and the same live UIE head sample. */
@@ -97,7 +98,8 @@ public final class SixDofBodyPresentation {
         // The collision-clamped eye may differ from the rigid body eye during a reference transition.
         return new Sample(FlightBodyPose.modelUpY(render.presentBody(basis.body()), render.attitude(), root)
                 .withGeometry(new FlightBodyGeometry(new FlightVector(rigidEye.x + first.x, rigidEye.y + first.y, rigidEye.z + first.z),
-                        new FlightVector(rigidEye.x + last.x, rigidEye.y + last.y, rigidEye.z + last.z), capsule.radius(), sampledWorldEye)),
+                        new FlightVector(rigidEye.x + last.x, rigidEye.y + last.y, rigidEye.z + last.z), capsule.radius(), sampledWorldEye))
+                .withAxialShadowReference(fromWorld(effectiveReference.frame().up())),
                 tracking(render.attitude()));
     }
 
@@ -134,7 +136,8 @@ public final class SixDofBodyPresentation {
 
     private static Sample sampleCardinalAttitudes(PlayerPhysicalSnapshot snapshot,
             FlightAttitude body, FlightAttitude view) {
-        return new Sample(FlightBodyPose.modelUpY(body, view, acceptedRootOffset(snapshot.placement())),
+        return new Sample(FlightBodyPose.modelUpY(body, view, acceptedRootOffset(snapshot.placement()))
+                        .withAxialShadowReference(fromWorld(((PlayerBodyShape.Cardinal) snapshot.placement().shape()).frame().up())),
                 tracking(view));
     }
 

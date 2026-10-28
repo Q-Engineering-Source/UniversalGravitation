@@ -120,6 +120,10 @@ class PlayerRenderPoseMirrorTest {
                     PlayerRenderPoseProtocol.Mode.CARDINAL, CardinalFrame.X_POS.ordinal(), body, body, geometry);
             assertTrue(cache.receive(first, world, local, 1));
             assertTrue(cache.geometry(subject, world, local, .5F, 1).isPresent());
+            var constrained = cache.presentation(subject, world, local, .5F, 1).orElseThrow();
+            assertEquals(1, constrained.geometry().axisUp().x);
+            assertEquals(0, constrained.geometry().axisUp().y);
+            assertEquals(0, constrained.geometry().axisUp().z);
             var absent = new PlayerRenderPoseProtocol.Packet(PlayerRenderPoseProtocol.Kind.POSE, token, 12, 0,
                     subject.getUniqueID(), subject.getEntityId(), 0, 9010, 1, 2, 2,
                     PlayerRenderPoseProtocol.Mode.CARDINAL, CardinalFrame.X_POS.ordinal(), body, body);
@@ -166,6 +170,8 @@ class PlayerRenderPoseMirrorTest {
             assertTrue(cache.pickGeometry(world, local, local, .5F, 46).isEmpty());
             assertTrue(cache.presentation(subject, world, local, .5F, 46).isPresent(),
                     "a valid Free report retains its established render pose without a stale Cardinal box");
+            assertNull(cache.presentation(subject, world, local, .5F, 46).orElseThrow().geometry(),
+                    "Free with identity Q must not retain the old accepted axis");
             var fresh = new PlayerRenderPoseProtocol.Packet(PlayerRenderPoseProtocol.Kind.POSE, token, 12, 0,
                     subject.getUniqueID(), subject.getEntityId(), 0, 9010, 3, 1, 1,
                     PlayerRenderPoseProtocol.Mode.CARDINAL, CardinalFrame.X_POS.ordinal(), body, body, geometry);

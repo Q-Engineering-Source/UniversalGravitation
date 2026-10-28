@@ -6,6 +6,7 @@ import neofontrender.addons.api.camera.CameraEyeAnchorProvider;
 import neofontrender.addons.api.camera.CameraRegistration;
 import neofontrender.addons.api.flight.FlightApi;
 import neofontrender.addons.api.flight.FlightAttitude;
+import neofontrender.addons.api.flight.FlightBodyPose;
 import neofontrender.addons.api.flight.FlightVector;
 import net.minecraft.util.ResourceLocation;
 import org.junit.jupiter.api.Test;
@@ -53,8 +54,10 @@ class UieFlightBodyPoseCompatibilityTest {
                 "API 10 lacks accepted model-root transport offsets and must not register this provider");
         assertFalse(SixDofBodyPresentation.supportsModelUpYBodyPose(11),
                 "API 11 lacks the sampled body geometry used by fade and light");
-        assertTrue(SixDofBodyPresentation.supportsModelUpYBodyPose(12),
-                "sampled physical display geometry requires Flight API 12+");
+        assertFalse(SixDofBodyPresentation.supportsModelUpYBodyPose(12),
+                "API 12 does not expose the owner's free versus axial shadow reference");
+        assertTrue(SixDofBodyPresentation.supportsModelUpYBodyPose(13),
+                "sampled shadow reference requires Flight API 13+");
         String expectedVersion = System.getenv("UG_EXPECTED_UIE_FLIGHT_API");
         if (expectedVersion != null && !expectedVersion.isBlank()) {
             assertEquals(Integer.parseInt(expectedVersion), runtimeVersion,
@@ -184,6 +187,9 @@ class UieFlightBodyPoseCompatibilityTest {
                     FlightAttitude.fromMinecraftDegrees(35, -20, 41)}) {
                 var reported = SixDofBodyPresentation.acceptedFreePoseAttitudes(snapshot, view);
                 var local = SixDofBodyPresentation.sampleFree(snapshot, view);
+                assertEquals(FlightBodyPose.ShadowReference.FREE, local.body().shadowReference,
+                        "Free remains Free even for the identity quaternion; G is irrelevant");
+                assertNull(local.body().shadowAxisUp);
                 assertAttitudeEquals(expectedBody, reported.body());
                 assertSame(view, reported.head());
                 assertAttitudeEquals(reported.body(), local.body().attitude);
@@ -203,6 +209,40 @@ class UieFlightBodyPoseCompatibilityTest {
         assertThrows(IllegalArgumentException.class,
                 () -> SixDofBodyPresentation.acceptedFreePoseAttitudes(cardinal, rolled));
         assertThrows(IllegalArgumentException.class, () -> SixDofBodyPresentation.sampleFree(cardinal, rolled));
+    }
+
+    /** Source regression only: NOT_RUN under user-owned validation. */
+    @Test void allAcceptedCardinalAxesRemainIndependentOfTheVisualTransition() {
+        for (var frame : CardinalFrame.values()) {
+            var snapshot = presentationSnapshot(frame.attitude(), new PlayerBodyShape.Cardinal(
+                    frame, new PlayerBodyShape.Dimensions(.6F, 1.8F, 1.62F)));
+            var tangent = frame.attitude().basisZ();
+            var effective = new PlayerBodyReference.Effective(PlayerBodyReference.Source.ENVIRONMENT,
+                    frame, tangent);
+            var sampled = SixDofBodyPresentation.sampleCardinal(snapshot, effective,
+                    new FlightVector(tangent.x(), tangent.y(), tangent.z()), null, 0, 0, .5F).body();
+            assertEquals(FlightBodyPose.ShadowReference.AXIAL, sampled.shadowReference);
+            assertEquals(frame.up().x(), sampled.shadowAxisUp.x);
+            assertEquals(frame.up().y(), sampled.shadowAxisUp.y);
+            assertEquals(frame.up().z(), sampled.shadowAxisUp.z);
+            var correction = FlightAttitude.fromMinecraftDegrees(0, 0, 25);
+            var render = new CardinalCameraTransition.RenderSample(new FlightAttitude(0, 0, 0, 1),
+                    new FlightVector(0, 0, 0), correction);
+            var physicalEye = snapshot.placement().eye();
+            var eye = new FlightVector(physicalEye.x(), physicalEye.y(), physicalEye.z());
+            var transitioning = SixDofBodyPresentation.sampleCardinalView(snapshot, effective, render,
+                    new FlightVector(0, 0, 0), eye, eye, null, 0, 0, .5F).body();
+            assertEquals(FlightBodyPose.ShadowReference.AXIAL, transitioning.shadowReference);
+            assertEquals(frame.up().x(), transitioning.shadowAxisUp.x);
+            assertEquals(frame.up().y(), transitioning.shadowAxisUp.y);
+            assertEquals(frame.up().z(), transitioning.shadowAxisUp.z);
+            double dot = sampled.attitude.x * transitioning.attitude.x
+                    + sampled.attitude.y * transitioning.attitude.y
+                    + sampled.attitude.z * transitioning.attitude.z
+                    + sampled.attitude.w * transitioning.attitude.w;
+            assertTrue(Math.abs(dot) < .999,
+                    "the actual visual reference correction must differ while the accepted shadow axis stays fixed");
+        }
     }
 
     private static PlayerPhysicalSnapshot presentationSnapshot(Rotation3d attitude, PlayerBodyShape shape) {

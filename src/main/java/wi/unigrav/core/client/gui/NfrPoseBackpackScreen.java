@@ -9,6 +9,9 @@ import com.cleanroommc.modularui.screen.viewport.ModularGuiContext;
 import com.cleanroommc.modularui.theme.WidgetThemeEntry;
 import com.cleanroommc.modularui.widget.ParentWidget;
 import net.minecraft.client.Minecraft;
+import net.minecraft.util.text.TextComponentString;
+import neofontrender.addons.api.flight.PlayerShadowApi;
+import neofontrender.addons.api.flight.PlayerShadowMode;
 import net.minecraft.client.entity.EntityPlayerSP;
 import net.minecraft.client.resources.I18n;
 import net.minecraftforge.fml.relauncher.Side;
@@ -76,6 +79,17 @@ public final class NfrPoseBackpackScreen {
                 RevoUiSixDofCamera::alignmentEnabled, RevoUiSixDofCamera::canConfigureAlignment,
                 RevoUiSixDofCamera::toggleAlignment);
         private final List<NfrTextButton> referenceButtons = new ArrayList<>();
+        private final NfrTextButton shadowButton = new NfrTextButton(
+                () -> tr("gui.unigrav.pose_backpack.button.shadow", shadowModeText()), false)
+                .onMousePressed(mouseButton -> {
+                    PlayerShadowMode next = PlayerShadowApi.mode() == PlayerShadowMode.AXIAL_DISC
+                            ? PlayerShadowMode.REAL_PLAYER_PROJECTION : PlayerShadowMode.AXIAL_DISC;
+                    if (!PlayerShadowApi.select(next) && Minecraft.getMinecraft().player != null) {
+                        Minecraft.getMinecraft().player.sendStatusMessage(new TextComponentString(
+                                tr("gui.unigrav.pose_backpack.shadow_save_failed")), true);
+                    }
+                    return true;
+                });
         private final NfrScrollablePane scroll;
         private final NfrTextButton closeButton = new NfrTextButton(
                 () -> tr("gui.unigrav.pose_backpack.close"), true)
@@ -90,6 +104,7 @@ public final class NfrPoseBackpackScreen {
             rows.child(modeButton);
             rows.child(hoverButton);
             rows.child(alignmentButton);
+            rows.child(shadowButton);
             for (CardinalFrame frame : CardinalFrame.values()) {
                 NfrTextButton button = new NfrTextButton(
                         () -> tr("gui.unigrav.pose_backpack.button.reference", frame.name().replace("_POS", "+").replace("_NEG", "-")), false)
@@ -133,7 +148,8 @@ public final class NfrPoseBackpackScreen {
             NfrLayout.place(modeButton, 0, infoHeight + gap + buttonHeight + gap, width, buttonHeight);
             NfrLayout.place(hoverButton, 0, infoHeight + gap + 2 * (buttonHeight + gap), width, buttonHeight);
             NfrLayout.place(alignmentButton, 0, infoHeight + gap + 3 * (buttonHeight + gap), width, buttonHeight);
-            int top = infoHeight + gap + 4 * (buttonHeight + gap);
+            NfrLayout.place(shadowButton, 0, infoHeight + gap + 4 * (buttonHeight + gap), width, buttonHeight);
+            int top = infoHeight + gap + 5 * (buttonHeight + gap);
             for (NfrTextButton button : referenceButtons) {
                 NfrLayout.place(button, 0, top, width, buttonHeight);
                 top += buttonHeight + gap;
@@ -162,6 +178,12 @@ public final class NfrPoseBackpackScreen {
             super.draw(context, widgetTheme);
             indicator.draw(this);
         }
+    }
+
+    private static String shadowModeText() {
+        return tr(PlayerShadowApi.mode() == PlayerShadowMode.AXIAL_DISC
+                ? "gui.unigrav.pose_backpack.shadow.axial_disc"
+                : "gui.unigrav.pose_backpack.shadow.real_player_projection");
     }
 
     private static String eligibilityText() {

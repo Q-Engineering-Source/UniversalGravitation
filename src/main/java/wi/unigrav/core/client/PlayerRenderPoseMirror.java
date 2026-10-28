@@ -33,6 +33,7 @@ import net.minecraftforge.fml.common.network.FMLNetworkEvent;
 import wi.unigrav.UnigravMod;
 import wi.unigrav.core.boost.RemoteBoostBoundedDispatcher;
 import wi.unigrav.core.player.PlayerKinematics;
+import wi.unigrav.core.player.CardinalFrame;
 import wi.unigrav.core.player.PlayerRenderPoseNetwork;
 import wi.unigrav.core.player.PlayerRenderPoseProtocol;
 
@@ -211,9 +212,10 @@ public final class PlayerRenderPoseMirror {
         if (presentation.geometry() != null) {
             var offset = presentation.geometry().rootOffset();
             return Optional.of(FlightBodyPose.modelUpY(attitude(pose.body()), attitude(pose.head()),
-                    new FlightVector(offset.x(), offset.y(), offset.z())));
+                    new FlightVector(offset.x(), offset.y(), offset.z()))
+                    .withAxialShadowReference(presentation.geometry().axisUp()));
         }
-        return Optional.of(FlightBodyPose.modelUpY(attitude(pose.body()), attitude(pose.head())));
+        return Optional.of(FlightBodyPose.modelUpY(attitude(pose.body()), attitude(pose.head())).withFreeShadowReference());
     }
 
     @SubscribeEvent
@@ -548,7 +550,7 @@ public final class PlayerRenderPoseMirror {
 
     record SampledPose(PlayerRenderPoseProtocol.Quaternion body,
                        PlayerRenderPoseProtocol.Quaternion head) { }
-    record SampledGeometry(AxisAlignedBB bounds, Vec3d rootOffset) { }
+    record SampledGeometry(AxisAlignedBB bounds, Vec3d rootOffset, FlightVector axisUp) { }
     record SampledPresentation(SampledPose pose, SampledGeometry geometry) { }
 
     /** Shared production cache seam; the outer mirror supplies the actual current client identities. */
@@ -763,7 +765,9 @@ public final class PlayerRenderPoseMirror {
             var min = geometry.bounds().min();
             var max = geometry.bounds().max();
             return new SampledGeometry(new AxisAlignedBB(min.x() + dx, min.y() + dy, min.z() + dz,
-                    max.x() + dx, max.y() + dy, max.z() + dz), geometry.rootOffset(frame));
+                    max.x() + dx, max.y() + dy, max.z() + dz), geometry.rootOffset(frame),
+                    new FlightVector(CardinalFrame.values()[frame].up().x(), CardinalFrame.values()[frame].up().y(),
+                            CardinalFrame.values()[frame].up().z()));
         }
 
         List<CameraEntityPickGeometry> pickGeometry(World actualWorld, EntityPlayer localPlayer,

@@ -72,4 +72,8 @@ tile.unigrav.magnetic_floor.name=磁性地板
 tile.unigrav.double_sided_gravity_floor.name=双面重力地板
 
 gui.unigrav.pose_backpack.button.alignment=地平面对齐（Ctrl+H）：%s
+gui.unigrav.pose_backpack.button.shadow=玩家阴影：%s
+gui.unigrav.pose_backpack.shadow.axial_disc=轴向圆盘（自由姿态时关闭）
+gui.unigrav.pose_backpack.shadow.real_player_projection=真实玩家投射
+gui.unigrav.pose_backpack.shadow_save_failed=阴影模式保存失败，已保留原设置。请查看客户端日志。
 gui.unigrav.pose_backpack.button.reference=地面朝向（Alt+H）：选择 %s

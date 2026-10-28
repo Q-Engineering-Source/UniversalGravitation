@@ -14,6 +14,24 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /** Behavior tests for pure six-DOF alignment command state. */
 class SixDofAlignmentInputTest {
 
+    @Test void guiAndHotkeyShareCommittedReferenceAndToggleState() {
+        SixDofAlignmentInput input = armedInput();
+        var selected = input.selectReference(SixDofAlignmentInput.Reference.X_POS);
+        assertTrue(selected.committed());
+        assertTrue(input.enabled());
+        assertEquals(SixDofAlignmentInput.Reference.X_POS, input.reference());
+        assertTrue(input.toggleEnabled().enabledChanged());
+        assertFalse(input.enabled());
+        input.update(false, false, null);
+        input.update(true, false, null);
+        assertTrue(input.enabled());
+        assertEquals(SixDofAlignmentInput.Reference.X_POS, input.reference());
+        input.update(false, false, null);
+        input.update(false, true, SixDofAlignmentInput.Reference.Z_NEG);
+        assertTrue(input.update(false, false, SixDofAlignmentInput.Reference.Z_NEG).committed());
+        assertEquals(SixDofAlignmentInput.Reference.Z_NEG, input.reference());
+    }
+
     @Test
     void defaultsToDisabledWithPositiveYAxisReference() {
         SixDofAlignmentInput input = new SixDofAlignmentInput();

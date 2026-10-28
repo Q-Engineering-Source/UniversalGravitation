@@ -8,6 +8,7 @@ import net.minecraft.entity.Entity;
 import net.minecraft.entity.player.EntityPlayerMP;
 import net.minecraft.util.math.AxisAlignedBB;
 import wi.unigrav.core.GravityEntityBinder;
+import wi.unigrav.UnigravMod;
 
 /** The sole installation and post-install consumer for a prepared mode transition. */
 final class ModeTransitionFinalizer {
@@ -139,6 +140,14 @@ final class ModeTransitionFinalizer {
             var snapshot = new PlayerPhysicalSnapshot(installedJournal.scope(), installedJournal.revision(), target,
                     velocity, Optional.of(new PlayerPhysicalSnapshot.Contacts(actor.onGround,
                             actor.collidedHorizontally, actor.collidedVertically, actor.fallDistance, false)));
+            if (prepared.recovery()) {
+                var recovery = (ModeTransitionPrepared.RecoveryPhase) prepared.phases().getFirst();
+                UnigravMod.LOGGER.info("ug-capsule-recovery stage=INSTALLED_TERMINAL_RESPONSE_PENDING"
+                                + " reason=ACTUAL_INITIAL_OVERLAP scope={} revision={} face={}"
+                                + " beforeCenter={} afterCenter={} centerPathUpper={}",
+                        snapshot.scope(), snapshot.revision(), recovery.proof().face(),
+                        prepared.source().placement().center(), target.center(), prepared.centerPathUpper());
+            }
             return new Applied(snapshot);
         } catch (FreeNativeTail.Stop stopped) {
             if (!stopped.belongsTo(transaction)) throw stopped;

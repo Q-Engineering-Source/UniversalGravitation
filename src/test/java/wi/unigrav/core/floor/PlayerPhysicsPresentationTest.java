@@ -26,6 +26,40 @@ import wi.unigrav.api.math.Vec3;
 import static org.junit.jupiter.api.Assertions.*;
 
 class PlayerPhysicsPresentationTest {
+    @Test void rotatingIndependentFreeEyeSharesTheBodyTickSpan(@TempDir Path directory) {
+        try (var fixture = BootWorldFixture.open(directory, new UUID(0, 930), true)) {
+            var player = fixture.serverPlayer(new UUID(0, 931));
+            var scope = new PlayerPhysicalSnapshot.Scope(player.getUniqueID(), new UUID(0, 932), player.dimension, 1);
+            var center = new Vec3d(8, 70, 12);
+            var q = Rotation3d.identity();
+            var dimensions = new PlayerBodyShape.Dimensions(.6F, 1.8F, 1.62F);
+            var shape = new PlayerBodyShape.FreeCapsule(dimensions,
+                    new PlayerBodyShape.CollisionProfile(dimensions.width(), dimensions.height()),
+                    Optional.of(new wi.unigrav.core.player.FreeEyeAnchor(
+                            wi.unigrav.core.player.FreeEyeAnchor.STORED_BASIS_V1, center,
+                            center.add(new Vec3d(.1, .35, .2)), q)));
+            var contacts = Optional.of(new PlayerPhysicalSnapshot.Contacts(false, false, false, 0));
+            var first = new PlayerPhysicalSnapshot(scope, 1, new PlayerBodyPlacement(center, q, shape), new Vec3d(0, 0, 0), contacts);
+            var next = new PlayerPhysicalSnapshot(scope, 2,
+                    new PlayerBodyPlacement(center, new Rotation3d(0, 0, .7071067811865475, .7071067811865476), shape),
+                    new Vec3d(0, 0, 0), contacts);
+            var presentation = new PlayerPhysicsClientPresentation();
+            presentation.beginClientTick(1); assertTrue(presentation.install(player, first));
+            presentation.beginClientTick(2); assertTrue(presentation.install(player, next));
+            var render = presentation.acceptedFreeRenderSample(player, next, .5F);
+            assertNotNull(render);
+            assertEquals(center, render.center());
+            assertEquals(render.eye(), presentation.acceptedFreeEyePosition(player, next, .5F));
+            var localEye = render.attitude().inverseRotate(render.eye().subtract(center));
+            assertEquals(.1, localEye.x(), 1e-10);
+            assertEquals(.35, localEye.y(), 1e-10);
+            assertEquals(.2, localEye.z(), 1e-10);
+            presentation.beginClientTick(3);
+            assertEquals(next.placement().eye(), presentation.acceptedFreeRenderSample(player, next, .2F).eye());
+            player.posX += 1;
+            assertNull(presentation.acceptedFreeRenderSample(player, next, .5F));
+        }
+    }
     @Test void freeEyeUsesAcceptedQuaternionAndOnlySameScopeShapeHistory(@TempDir Path directory) {
         try (var fixture = BootWorldFixture.open(directory, new UUID(0, 921), true)) {
             var player = fixture.serverPlayer(new UUID(0, 922));

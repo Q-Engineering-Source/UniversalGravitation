@@ -3,6 +3,7 @@ package wi.unigrav.core.client.camera;
 import neofontrender.addons.api.flight.FlightApi;
 import neofontrender.addons.api.flight.FlightAttitude;
 import neofontrender.addons.api.flight.FlightBodyPose;
+import neofontrender.addons.api.flight.FlightBodyGeometry;
 import neofontrender.addons.api.flight.FlightBodyPoseProvider;
 import neofontrender.addons.api.flight.FlightCameraTracking;
 import neofontrender.addons.api.flight.FlightRegistration;
@@ -11,6 +12,7 @@ import net.minecraft.util.ResourceLocation;
 import net.minecraft.util.math.MathHelper;
 import dev.crlhitbox.api.geometry.Vec3d;
 import wi.unigrav.UnigravMod;
+import wi.unigrav.core.client.FreeBodyRenderSample;
 import wi.unigrav.core.player.CardinalFrame;
 import wi.unigrav.core.player.PlayerBodyReference;
 import wi.unigrav.core.player.PlayerBodyPlacement;
@@ -19,7 +21,7 @@ import wi.unigrav.core.player.PlayerPhysicalSnapshot;
 
 /** UIE contract boundary: gait turns the visual root, never the camera's authoritative attitude. */
 public final class SixDofBodyPresentation {
-    static final int MODEL_UP_BODY_POSE_FLIGHT_API = 11;
+    static final int MODEL_UP_BODY_POSE_FLIGHT_API = 12;
 
     private SixDofBodyPresentation() { }
 
@@ -36,6 +38,14 @@ public final class SixDofBodyPresentation {
         FreePoseAttitudes attitudes = acceptedFreePoseAttitudes(snapshot, view);
         return new Sample(FlightBodyPose.modelUpY(attitudes.body(), attitudes.head(),
                 acceptedRootOffset(snapshot.placement())), tracking(view));
+    }
+
+    /** Native rendering already interpolates transport; cancel that base before placing the physical root. */
+    public static Sample sampleFree(FreeBodyRenderSample render, FlightAttitude view, Vec3d nativeRenderOrigin) {
+        var q = render.attitude();
+        return new Sample(FlightBodyPose.modelUpY(new FlightAttitude(q.x(), q.y(), q.z(), q.w()), view,
+                fromWorld(render.feet().subtract(nativeRenderOrigin))).withGeometry(new FlightBodyGeometry(
+                        fromWorld(render.capsuleStart()), fromWorld(render.capsuleEnd()), render.radius(), fromWorld(render.eye()))), tracking(view));
     }
 
     /** Shared local/remote Free presentation: accepted body Q and the same live UIE head sample. */
@@ -66,7 +76,7 @@ public final class SixDofBodyPresentation {
     /** Uses one complete render quaternion for both UIE tracking and the presented head pose. */
     static Sample sampleCardinalView(PlayerPhysicalSnapshot snapshot,
             PlayerBodyReference.Effective effectiveReference, CardinalCameraTransition.RenderSample render,
-            FlightVector renderedEyeFromTransport,
+            FlightVector renderedEyeFromTransport, FlightVector rigidEye, FlightVector sampledWorldEye,
             FlightVector viewRelativeBodyForward, float previousBodyYaw, float bodyYaw,
             float partialTicks) {
         if (render == null) throw new IllegalArgumentException("render sample is required");
@@ -80,7 +90,14 @@ public final class SixDofBodyPresentation {
         FlightVector root = new FlightVector(renderedEyeFromTransport.x - renderedEyeFromRoot.x,
                 renderedEyeFromTransport.y - renderedEyeFromRoot.y,
                 renderedEyeFromTransport.z - renderedEyeFromRoot.z);
-        return new Sample(FlightBodyPose.modelUpY(render.presentBody(basis.body()), render.attitude(), root),
+        var capsule = snapshot.placement().capsule();
+        Vec3d eye = snapshot.placement().eye();
+        FlightVector first = render.presentReferenceVector(fromWorld(capsule.centerline().start().subtract(eye)));
+        FlightVector last = render.presentReferenceVector(fromWorld(capsule.centerline().end().subtract(eye)));
+        // The collision-clamped eye may differ from the rigid body eye during a reference transition.
+        return new Sample(FlightBodyPose.modelUpY(render.presentBody(basis.body()), render.attitude(), root)
+                .withGeometry(new FlightBodyGeometry(new FlightVector(rigidEye.x + first.x, rigidEye.y + first.y, rigidEye.z + first.z),
+                        new FlightVector(rigidEye.x + last.x, rigidEye.y + last.y, rigidEye.z + last.z), capsule.radius(), sampledWorldEye)),
                 tracking(render.attitude()));
     }
 

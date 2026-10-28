@@ -1514,6 +1514,12 @@ public final class PlayerPhysicsClient {
                 INSTANCE.presentation.acceptedEyePosition(actor, snapshot, reference, partialTicks));
     }
 
+    public static Optional<FreeBodyRenderSample> currentProvenFreeRenderSample(EntityPlayer actor, float partialTicks) {
+        var accepted = acceptedPresentation(actor);
+        if (accepted.isEmpty() || INSTANCE.prediction != null) return Optional.empty();
+        return Optional.ofNullable(INSTANCE.presentation.acceptedFreeRenderSample(actor, accepted.orElseThrow(), partialTicks));
+    }
+
     /** One current proven placement for camera, quaternion, footprint and render providers; never ACK authority. */
     public static Optional<PlayerPhysicalSnapshot> currentProvenPresentation(EntityPlayer actor) {
         var exact = INSTANCE.prediction;

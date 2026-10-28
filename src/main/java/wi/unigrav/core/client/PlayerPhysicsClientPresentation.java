@@ -219,18 +219,22 @@ public final class PlayerPhysicsClientPresentation {
 
     /** Accepted Free eye history needs no invented cardinal reference or camera-desired geometry. */
     public Vec3d acceptedFreeEyePosition(EntityPlayer player, PlayerPhysicalSnapshot current, float partialTicks) {
+        var sample = acceptedFreeRenderSample(player, current, partialTicks);
+        return sample == null ? null : sample.eye();
+    }
+
+    /** Body and eye consume the same accepted centre/attitude span, independent of derived transport. */
+    public FreeBodyRenderSample acceptedFreeRenderSample(EntityPlayer player, PlayerPhysicalSnapshot current, float partialTicks) {
         if (player != actor || current != previous || current == null || !Float.isFinite(partialTicks)
                 || PlayerKinematics.requiresNative(player)
                 || !(current.placement().shape() instanceof PlayerBodyShape.FreeCapsule)
                 || !PlayerPhysicsClientMirror.matchesAcceptedPresentationGeometry(player, current)) return null;
-        Vec3d end = current.placement().eye();
         PlayerPhysicalSnapshot startSnapshot = eyePrevious;
         if (startSnapshot == null || !startSnapshot.scope().equals(current.scope())
-                || !sameAcceptedShape(startSnapshot, current) || startSnapshot.revision() > current.revision()) return end;
+                || !sameAcceptedShape(startSnapshot, current) || startSnapshot.revision() > current.revision())
+            startSnapshot = current;
         double alpha = Math.max(0.0, Math.min(1.0, partialTicks));
-        Vec3d start = startSnapshot.placement().eye();
-        return new Vec3d(start.x() + (end.x() - start.x()) * alpha,
-                start.y() + (end.y() - start.y()) * alpha, start.z() + (end.z() - start.z()) * alpha);
+        return FreeBodyRenderSample.between(startSnapshot.placement(), current.placement(), alpha);
     }
 
     private static boolean sameCardinalFrame(PlayerPhysicalSnapshot snapshot, CardinalFrame frame) {

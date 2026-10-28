@@ -70,3 +70,6 @@ message.unigrav.remote_boost.reason.invalid_input=输入无效
 tile.unigrav.gravity_floor.name=重力地板
 tile.unigrav.magnetic_floor.name=磁性地板
 tile.unigrav.double_sided_gravity_floor.name=双面重力地板
+
+gui.unigrav.pose_backpack.button.alignment=地平面对齐（Ctrl+H）：%s
+gui.unigrav.pose_backpack.button.reference=地面朝向（Alt+H）：选择 %s

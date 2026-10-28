@@ -87,7 +87,7 @@ import wi.unigrav.core.client.boost.RemoteBoostClient;
 /**
  * Direct client adapter from Universal Gravitation's accepted physical and
  * zero-G state to Revo UI Camera API v3+, Flight API v9+ and Input API v1.
- * Accepted model-up body roots require Flight API v11. Revo UI remains the sole owner of Minecraft
+ * Accepted model-up body roots require Flight API v12. Revo UI remains the sole owner of Minecraft
  * camera, input, picking, and rendering Mixins; this adapter owns one local
  * orientation and the player-anchored free-drift impulse derived from it.
  */
@@ -95,7 +95,7 @@ public final class RevoUiSixDofCamera implements AutoCloseable {
 
     public static final String UIE_MOD_ID = "neofontrender_ui_enhancements";
     private static final int REQUIRED_CAMERA_API = 4;
-    private static final int REQUIRED_FLIGHT_API = 11;
+    private static final int REQUIRED_FLIGHT_API = 12;
     private static final int REQUIRED_INPUT_API = 1;
     private static final int PRIORITY = 500;
     private static final long CAMERA_PROBE_MIN_INTERVAL_TICKS = 20L;
@@ -609,7 +609,14 @@ public final class RevoUiSixDofCamera implements AutoCloseable {
             var view = freePresentationView(localPlayer);
             if (closed || PlayerPhysicsClient.currentProvenPresentation(localPlayer).orElse(null) != accepted.orElseThrow()
                     || higherCameraRigActive()) return null;
-            return SixDofBodyPresentation.sampleFree(accepted.orElseThrow(), view).body();
+            var render = PlayerPhysicsClient.currentProvenFreeRenderSample(localPlayer, partialTicks);
+            if (render.isEmpty()) return null;
+            double alpha = Math.max(0, Math.min(1, partialTicks));
+            Vec3d nativeOrigin = new Vec3d(
+                    localPlayer.lastTickPosX + (localPlayer.posX - localPlayer.lastTickPosX) * alpha,
+                    localPlayer.lastTickPosY + (localPlayer.posY - localPlayer.lastTickPosY) * alpha,
+                    localPlayer.lastTickPosZ + (localPlayer.posZ - localPlayer.lastTickPosZ) * alpha);
+            return SixDofBodyPresentation.sampleFree(render.orElseThrow(), view, nativeOrigin).body();
         }
         CardinalCameraCandidate cardinal = cardinalCameraCandidate(localPlayer);
         if (cardinal != null) {
@@ -962,13 +969,15 @@ public final class RevoUiSixDofCamera implements AutoCloseable {
                 target, provenEye)) {
             return cardinalPresentationCache.sample;
         }
+        CameraEyeAnchor renderedEye = eyeAnchor(sampleWorld, provenEye, render.eyeReferenceCorrection());
         SixDofBodyPresentation.Sample sample = SixDofBodyPresentation.sampleCardinalView(
                 candidate.snapshot(), candidate.reference(), render,
                 cardinalRenderedEyeFromTransport(player, partialTicks, provenEye, render.eyeReferenceCorrection()),
+                new FlightVector(provenEye.x() + render.eyeReferenceCorrection().x,
+                        provenEye.y() + render.eyeReferenceCorrection().y, provenEye.z() + render.eyeReferenceCorrection().z),
+                new FlightVector(renderedEye.x, renderedEye.y, renderedEye.z),
                 cardinalBodyForward(player, partialTicks), player.prevRenderYawOffset,
                 player.renderYawOffset, partialTicks);
-        CameraEyeAnchor renderedEye = provenEye == null ? null : eyeAnchor(sampleWorld,
-                provenEye, render.eyeReferenceCorrection());
         if (provenEye != null && !cardinalPresentationStillCurrent(player, sampleWorld, candidate, partialTicks,
                 worldTick, target, provenEye)) {
             cardinalPresentationCache = null;
@@ -1265,8 +1274,39 @@ public final class RevoUiSixDofCamera implements AutoCloseable {
         SixDofAlignmentInput.Change change = finishSelection
                 ? alignmentInput.update(toggleHeld, selectHeld, candidate)
                 : alignmentInput.updateBeforePicking(toggleHeld, selectHeld);
+        applyAlignmentChange(change, statusPlayer);
+    }
+
+    /** Settings and hotkeys share one alignment state and the existing server reference request. */
+    public static boolean canConfigureAlignment() {
+        return installed != null && installed.isAcceptedPhysicalCameraLook(installed.minecraft.player);
+    }
+
+    public static boolean alignmentEnabled() {
+        return installed != null && installed.alignmentInput.enabled();
+    }
+
+    public static String alignmentReferenceLabel() {
+        return installed == null ? "?" : installed.alignmentInput.reference().label();
+    }
+
+    public static void selectAlignmentReference(CardinalFrame frame) {
+        if (!canConfigureAlignment()) return;
+        for (var reference : SixDofAlignmentInput.Reference.values()) {
+            if (reference.cardinalFrame() == frame) {
+                installed.applyAlignmentChange(installed.alignmentInput.selectReference(reference), installed.minecraft.player);
+                return;
+            }
+        }
+    }
+
+    public static void toggleAlignment() {
+        if (canConfigureAlignment()) installed.applyAlignmentChange(installed.alignmentInput.toggleEnabled(), installed.minecraft.player);
+    }
+
+    private void applyAlignmentChange(SixDofAlignmentInput.Change change, EntityPlayerSP statusPlayer) {
         movementFrameLock.apply(change, alignmentInput, orientation.current());
-        if (change.committed() && statusPlayer != null) {
+        if ((change.committed() || change.enabledChanged() && alignmentInput.enabled()) && statusPlayer != null) {
             SixDofMovementFrame committed = movementFrameLock.current(true, orientation.current());
             var request = PlayerPhysicsClient.requestBodyReferenceLock(
                     alignmentInput.reference().cardinalFrame(),

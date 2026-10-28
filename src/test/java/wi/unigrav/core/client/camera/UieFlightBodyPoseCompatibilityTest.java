@@ -51,8 +51,10 @@ class UieFlightBodyPoseCompatibilityTest {
         assertTrue(runtimeVersion >= 9, "the shared camera adapter still requires Flight API v9+");
         assertFalse(SixDofBodyPresentation.supportsModelUpYBodyPose(10),
                 "API 10 lacks accepted model-root transport offsets and must not register this provider");
-        assertTrue(SixDofBodyPresentation.supportsModelUpYBodyPose(11),
-                "accepted model-root transport offsets require Flight API 11+");
+        assertFalse(SixDofBodyPresentation.supportsModelUpYBodyPose(11),
+                "API 11 lacks the sampled body geometry used by fade and light");
+        assertTrue(SixDofBodyPresentation.supportsModelUpYBodyPose(12),
+                "sampled physical display geometry requires Flight API 12+");
         String expectedVersion = System.getenv("UG_EXPECTED_UIE_FLIGHT_API");
         if (expectedVersion != null && !expectedVersion.isBlank()) {
             assertEquals(Integer.parseInt(expectedVersion), runtimeVersion,

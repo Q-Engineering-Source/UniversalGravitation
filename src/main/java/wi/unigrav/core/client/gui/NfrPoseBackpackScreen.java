@@ -16,6 +16,8 @@ import net.minecraftforge.fml.relauncher.SideOnly;
 import wi.unigrav.core.client.ClientGravityTicker;
 import wi.unigrav.core.client.PlayerPhysicsClient;
 import wi.unigrav.core.player.PlayerMobilityIntent;
+import wi.unigrav.core.player.CardinalFrame;
+import wi.unigrav.core.client.camera.RevoUiSixDofCamera;
 import neofontrender.client.gui.component.base.NfrLayout;
 import neofontrender.client.gui.component.base.NfrScrollablePane;
 import neofontrender.client.gui.component.base.NfrTextButton;
@@ -23,6 +25,8 @@ import neofontrender.client.gui.component.base.NfrTextInfoPanel;
 import neofontrender.client.gui.component.base.NfrToggleIndicator;
 
 import java.util.Optional;
+import java.util.List;
+import java.util.ArrayList;
 import java.util.function.Supplier;
 
 /** NFR/ModularUI client-only debug controls; server state remains the authority. */
@@ -67,6 +71,11 @@ public final class NfrPoseBackpackScreen {
                 NfrPoseBackpackScreen::canRequestMobility,
                 NfrPoseBackpackScreen::toggleHover);
         private final ParentWidget<?> rows = new ParentWidget<>();
+        private final ToggleButton alignmentButton = new ToggleButton(
+                () -> tr("gui.unigrav.pose_backpack.button.alignment", RevoUiSixDofCamera.alignmentReferenceLabel()),
+                RevoUiSixDofCamera::alignmentEnabled, RevoUiSixDofCamera::canConfigureAlignment,
+                RevoUiSixDofCamera::toggleAlignment);
+        private final List<NfrTextButton> referenceButtons = new ArrayList<>();
         private final NfrScrollablePane scroll;
         private final NfrTextButton closeButton = new NfrTextButton(
                 () -> tr("gui.unigrav.pose_backpack.close"), true)
@@ -80,6 +89,18 @@ public final class NfrPoseBackpackScreen {
             rows.child(gravityButton);
             rows.child(modeButton);
             rows.child(hoverButton);
+            rows.child(alignmentButton);
+            for (CardinalFrame frame : CardinalFrame.values()) {
+                NfrTextButton button = new NfrTextButton(
+                        () -> tr("gui.unigrav.pose_backpack.button.reference", frame.name().replace("_POS", "+").replace("_NEG", "-")), false)
+                        .onMousePressed(mouseButton -> {
+                            RevoUiSixDofCamera.selectAlignmentReference(frame);
+                            return true;
+                        });
+                button.setEnabledIf(widget -> RevoUiSixDofCamera.canConfigureAlignment());
+                referenceButtons.add(button);
+                rows.child(button);
+            }
             scroll = new NfrScrollablePane(rows);
             child(scroll.widget());
             child(closeButton);
@@ -111,7 +132,13 @@ public final class NfrPoseBackpackScreen {
             NfrLayout.place(gravityButton, 0, infoHeight + gap, width, buttonHeight);
             NfrLayout.place(modeButton, 0, infoHeight + gap + buttonHeight + gap, width, buttonHeight);
             NfrLayout.place(hoverButton, 0, infoHeight + gap + 2 * (buttonHeight + gap), width, buttonHeight);
-            return infoHeight + 3 * buttonHeight + 3 * gap;
+            NfrLayout.place(alignmentButton, 0, infoHeight + gap + 3 * (buttonHeight + gap), width, buttonHeight);
+            int top = infoHeight + gap + 4 * (buttonHeight + gap);
+            for (NfrTextButton button : referenceButtons) {
+                NfrLayout.place(button, 0, top, width, buttonHeight);
+                top += buttonHeight + gap;
+            }
+            return top;
         }
     }
 

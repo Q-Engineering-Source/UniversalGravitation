@@ -70,3 +70,6 @@ message.unigrav.remote_boost.reason.invalid_input=invalid input
 tile.unigrav.gravity_floor.name=Gravity Floor
 tile.unigrav.magnetic_floor.name=Magnetic Floor
 tile.unigrav.double_sided_gravity_floor.name=Double-Sided Gravity Floor
+
+gui.unigrav.pose_backpack.button.alignment=Horizon alignment (Ctrl+H): %s
+gui.unigrav.pose_backpack.button.reference=Ground reference (Alt+H): select %s

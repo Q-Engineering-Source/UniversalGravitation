@@ -1,6 +1,7 @@
 package wi.unigrav.core.client.camera;
 
 import wi.unigrav.api.math.Vec3;
+import java.util.Objects;
 import wi.unigrav.core.player.CardinalFrame;
 
 /** Pure state for persistent alignment and temporary upright-reference selection. */
@@ -74,6 +75,27 @@ final class SixDofAlignmentInput {
         armed = false;
         selectionRequiresRelease = true;
         cancelSelection();
+    }
+
+    /** GUI face selection commits through the same state and downstream request as an Alt+H release. */
+    Change selectReference(Reference selected) {
+        boolean previousEnabled = enabled;
+        Reference previousReference = reference;
+        boolean wasSelecting = selecting;
+        Reference previousPreview = previewReference;
+        reference = Objects.requireNonNull(selected);
+        enabled = true;
+        cancelSelection();
+        return change(previousEnabled, previousReference, wasSelecting, previousPreview, true);
+    }
+
+    Change toggleEnabled() {
+        boolean previousEnabled = enabled;
+        boolean wasSelecting = selecting;
+        Reference previousPreview = previewReference;
+        enabled = !enabled;
+        cancelSelection();
+        return change(previousEnabled, reference, wasSelecting, previousPreview, enabled);
     }
 
     void disable() {

@@ -56,8 +56,10 @@ class UieFlightBodyPoseCompatibilityTest {
                 "API 11 lacks the sampled body geometry used by fade and light");
         assertFalse(SixDofBodyPresentation.supportsModelUpYBodyPose(12),
                 "API 12 does not expose the owner's free versus axial shadow reference");
-        assertTrue(SixDofBodyPresentation.supportsModelUpYBodyPose(13),
-                "sampled shadow reference requires Flight API 13+");
+        assertFalse(SixDofBodyPresentation.supportsModelUpYBodyPose(13),
+                "API 13 lacks accepted shadow bounds for remote cardinal players");
+        assertTrue(SixDofBodyPresentation.supportsModelUpYBodyPose(14),
+                "sampled accepted shadow bounds require Flight API 14+");
         String expectedVersion = System.getenv("UG_EXPECTED_UIE_FLIGHT_API");
         if (expectedVersion != null && !expectedVersion.isBlank()) {
             assertEquals(Integer.parseInt(expectedVersion), runtimeVersion,

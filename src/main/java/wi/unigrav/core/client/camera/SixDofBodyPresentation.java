@@ -4,6 +4,7 @@ import neofontrender.addons.api.flight.FlightApi;
 import neofontrender.addons.api.flight.FlightAttitude;
 import neofontrender.addons.api.flight.FlightBodyPose;
 import neofontrender.addons.api.flight.FlightBodyGeometry;
+import neofontrender.addons.api.flight.FlightBodyBounds;
 import neofontrender.addons.api.flight.FlightBodyPoseProvider;
 import neofontrender.addons.api.flight.FlightCameraTracking;
 import neofontrender.addons.api.flight.FlightRegistration;
@@ -21,7 +22,7 @@ import wi.unigrav.core.player.PlayerPhysicalSnapshot;
 
 /** UIE contract boundary: gait turns the visual root, never the camera's authoritative attitude. */
 public final class SixDofBodyPresentation {
-    static final int MODEL_UP_BODY_POSE_FLIGHT_API = 13;
+    static final int MODEL_UP_BODY_POSE_FLIGHT_API = 14;
 
     private SixDofBodyPresentation() { }
 
@@ -99,7 +100,9 @@ public final class SixDofBodyPresentation {
         return new Sample(FlightBodyPose.modelUpY(render.presentBody(basis.body()), render.attitude(), root)
                 .withGeometry(new FlightBodyGeometry(new FlightVector(rigidEye.x + first.x, rigidEye.y + first.y, rigidEye.z + first.z),
                         new FlightVector(rigidEye.x + last.x, rigidEye.y + last.y, rigidEye.z + last.z), capsule.radius(), sampledWorldEye))
-                .withAxialShadowReference(fromWorld(effectiveReference.frame().up())),
+                .withAxialShadowReference(fromWorld(effectiveReference.frame().up()))
+                .withShadowBounds(shadowBounds(snapshot.placement(), rigidEye.x - eye.x(),
+                        rigidEye.y - eye.y(), rigidEye.z - eye.z())),
                 tracking(render.attitude()));
     }
 
@@ -137,8 +140,15 @@ public final class SixDofBodyPresentation {
     private static Sample sampleCardinalAttitudes(PlayerPhysicalSnapshot snapshot,
             FlightAttitude body, FlightAttitude view) {
         return new Sample(FlightBodyPose.modelUpY(body, view, acceptedRootOffset(snapshot.placement()))
-                        .withAxialShadowReference(fromWorld(((PlayerBodyShape.Cardinal) snapshot.placement().shape()).frame().up())),
+                        .withAxialShadowReference(fromWorld(((PlayerBodyShape.Cardinal) snapshot.placement().shape()).frame().up()))
+                        .withShadowBounds(shadowBounds(snapshot.placement(), 0, 0, 0)),
                 tracking(view));
+    }
+
+    private static FlightBodyBounds shadowBounds(PlayerBodyPlacement placement, double dx, double dy, double dz) {
+        var bounds = placement.bounds();
+        return new FlightBodyBounds(bounds.min().x() + dx, bounds.min().y() + dy, bounds.min().z() + dz,
+                bounds.max().x() + dx, bounds.max().y() + dy, bounds.max().z() + dz);
     }
 
     private record CardinalBodyBasis(FlightVector up, FlightVector bodyHeading, FlightAttitude body) { }

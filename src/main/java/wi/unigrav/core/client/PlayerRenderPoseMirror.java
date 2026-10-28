@@ -14,6 +14,7 @@ import dev.crlhitbox.api.geometry.Vec3d;
 import neofontrender.addons.api.camera.CameraEntityPickGeometry;
 import neofontrender.addons.api.flight.FlightAttitude;
 import neofontrender.addons.api.flight.FlightBodyPose;
+import neofontrender.addons.api.flight.FlightBodyBounds;
 import neofontrender.addons.api.flight.FlightVector;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.entity.AbstractClientPlayer;
@@ -213,7 +214,11 @@ public final class PlayerRenderPoseMirror {
             var offset = presentation.geometry().rootOffset();
             return Optional.of(FlightBodyPose.modelUpY(attitude(pose.body()), attitude(pose.head()),
                     new FlightVector(offset.x(), offset.y(), offset.z()))
-                    .withAxialShadowReference(presentation.geometry().axisUp()));
+                    .withAxialShadowReference(presentation.geometry().axisUp())
+                    .withShadowBounds(new FlightBodyBounds(presentation.geometry().bounds().minX,
+                            presentation.geometry().bounds().minY, presentation.geometry().bounds().minZ,
+                            presentation.geometry().bounds().maxX, presentation.geometry().bounds().maxY,
+                            presentation.geometry().bounds().maxZ)));
         }
         return Optional.of(FlightBodyPose.modelUpY(attitude(pose.body()), attitude(pose.head())).withFreeShadowReference());
     }

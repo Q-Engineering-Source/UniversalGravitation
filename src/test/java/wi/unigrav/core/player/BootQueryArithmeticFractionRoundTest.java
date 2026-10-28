@@ -1,6 +1,8 @@
 package wi.unigrav.core.player;
 
 import java.util.concurrent.atomic.AtomicBoolean;
+import dev.crlhitbox.api.geometry.Rotation3d;
+import dev.crlhitbox.api.geometry.Vec3d;
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -98,17 +100,35 @@ class BootQueryArithmeticFractionRoundTest {
     }
 
     @Test void exhaustionDuringActualProbePreservesPartialSpentWorkWithoutRefund() {
-        var work = new StoredDyadic.Work(); var a = BootQueryArithmetic.fromSameWork(work);
+        var work = StoredDyadic.Work.boundedIngress(StoredDyadic.MAX_WORK_UNITS);
+        var a = BootQueryArithmetic.fromSameWork(work);
         var third = a.fraction(a.exact(1), a.exact(3));
-        work.charge(StoredDyadic.MAX_WORK_UNITS - work.units() - 100);
+        work.charge(StoredDyadic.MAX_WORK_UNITS - work.units() - 5);
         long before = work.units();
         var failure = assertThrows(NumericWorkExhaustedException.class, () -> a.roundNearest(third));
-        assertTrue(work.units() > before, "the actual finite-bit search must spend before its rejection");
+        assertTrue(work.units() > before, "the actual ratio operation must spend before its rejection");
         assertEquals(work.units(), failure.used());
         assertEquals(StoredDyadic.MAX_WORK_UNITS, failure.limit());
         assertTrue(failure.requested() > 0);
         assertNull(failure.getCause());
         assertThrows(NumericWorkExhaustedException.class, () -> a.roundNearest(third));
         assertTrue(work.units() >= failure.used());
+    }
+
+    // Regression source only: user owns runtime acceptance; this test has not been run for C44.
+    @Test void repeatedRotatedEyeMappingSharesOneUnchangedIngressWindow() {
+        var work = StoredDyadic.Work.boundedIngress(StoredDyadic.MAX_WORK_UNITS);
+        var arithmetic = BootQueryArithmetic.fromSameWork(work);
+        var center = new Vec3d(31.037567794136528, 132.20407477274063, 105.91834824733665);
+        var anchor = new FreeEyeAnchor(FreeEyeAnchor.STORED_BASIS_V1, center,
+                center.add(new Vec3d(0, .72, 0)), new Rotation3d(.15, .2, .3, .7));
+        for (int tick = 0; tick < 20; tick++) {
+            var attitude = new Rotation3d(.6, -.1, .2 + tick * .001, .7);
+            var mapped = anchor.at(center, attitude, arithmetic);
+            assertTrue(Double.isFinite(mapped.x()) && Double.isFinite(mapped.y()) && Double.isFinite(mapped.z()));
+        }
+        assertTrue(work.units() > 0);
+        assertTrue(work.units() < StoredDyadic.MAX_WORK_UNITS);
+        assertEquals(work.units(), arithmetic.usage().units());
     }
 }

@@ -277,6 +277,20 @@ final class CapsuleTranslationValidator {
         // Unexpected failures retain their original type, cause, and stack at the owner boundary.
     }
 
+    /** Reuses the ordinary whole-path proof for a box which did not overlap at the recovery start. */
+    static boolean clearRecoveryObstacle(CapsulePathSource source, Translation tube, Pose end,
+            Aabb box, int ordinal, ContactResult startContact, ContactResult endContact, List<Query> evidence) {
+        if (!nonpenetrating(startContact.relation()) || !nonpenetrating(endContact.relation())) return false;
+        var plane = CapsuleTranslationPlaneProof.certify(tube, box, source.work());
+        if (plane.isPresent()) {
+            evidence.add(new Query(Stage.PATH, ordinal, box, null, null, plane.orElseThrow()));
+            return true;
+        }
+        Capsule paddedEnd = paddedEndpointEnvelope(tube, end, source.work());
+        var boundary = refineFullPath(source, tube, end, paddedEnd, box, ordinal, evidence, source.work());
+        return fullPathReceiptMatches(boundary, tube, end, paddedEnd, startContact, endContact);
+    }
+
     private static ContactResult observe(CapsuleContactQueryBudget budget, Capsule capsule,
             Aabb box, ContactAccuracy accuracy, StoredDyadic.Work work) {
         // Observe dispatch, Query record plus append, contact append, and relation flags are prepaid

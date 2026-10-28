@@ -53,7 +53,8 @@ final class ModeTransitionPrepared {
             source.requireCurrent();
         }
     }
-    sealed interface PhaseProof permits ArcPhase, ResizePhase, TranslationPhase, MovementPhase { }
+    sealed interface PhaseProof permits ArcPhase, ResizePhase, TranslationPhase, MovementPhase, RecoveryPhase { }
+    record RecoveryPhase(CapsuleDepenetrationPrepared.Verified proof) implements PhaseProof { }
     record ArcPhase(CapsuleArcValidator.VerifiedArc proof) implements PhaseProof { }
     record ResizePhase(CapsuleResizeValidator.VerifiedResize proof) implements PhaseProof { }
     record MovementPhase(CapsuleMovementResolver.Resolved proof) implements PhaseProof { }
@@ -190,6 +191,7 @@ final class ModeTransitionPrepared {
         }
         Vec3d integratedVelocity() { return integratedVelocity; }
         boolean preReserved() { return movement() != null; }
+        boolean recovery() { return phases.size() == 1 && phases.getFirst() instanceof RecoveryPhase; }
         boolean referenceCurrentForInstall() {
             return referenceAbsence == null || referenceAbsence.recapture(transaction);
         }
@@ -206,7 +208,7 @@ final class ModeTransitionPrepared {
             transaction.requireCurrent();
             if (exactRequest != null && !isCurrentRequest(exactRequest)) return false;
             if (trustedNativeResize != null && !matchesTrustedNativeResize()) return false;
-            if (exactRequest == null && trustedNativeResize == null && !referenceSuccessor) return false;
+            if (exactRequest == null && trustedNativeResize == null && !referenceSuccessor && !recovery()) return false;
             if (referenceSuccessor && (request != null || !(source.placement().shape() instanceof PlayerBodyShape.FreeCapsule)
                     || phases.stream().anyMatch(p -> !(p instanceof ResizePhase) && !(p instanceof MovementPhase)))) return false;
             if (referenceAbsence != null && !referenceAbsence.current(transaction)) return false;
@@ -237,7 +239,11 @@ final class ModeTransitionPrepared {
             CapsulePathSource node = lineage;
             for (int index = phases.size() - 1; index >= 0; index--) {
                 PhaseProof phase = phases.get(index);
-                if (phase instanceof ArcPhase arc) {
+                if (phase instanceof RecoveryPhase recovery) {
+                    if (recovery.proof() == null || !recovery.proof().matchesBound(recovery.proof().source())
+                            || recovery.proof().end() != node.start()) return false;
+                    node = recovery.proof().source();
+                } else if (phase instanceof ArcPhase arc) {
                     if (arc.proof() == null || !arc.proof().matchesBound(arc.proof().source())
                             || arc.proof().target() != node.start().placement()) return false;
                     node = arc.proof().source();
@@ -476,6 +482,13 @@ final class ModeTransitionPrepared {
         } catch (RuntimeException failure) {
             return new Unavailable("Cardinal-to-Free preparation failed at its owner boundary", Optional.of(failure));
         }
+    }
+
+    static Prepared recovery(FreeOwnerTransaction tx, CapsuleDepenetrationPrepared.Verified proof,
+            CapsulePathSource lineage, CapsuleEnvironmentObservation.Prepared environment) {
+        return new Prepared(tx, null, null, tx.accepted(), proof.end().placement(), proof.end(),
+                proof.source().capture(), proof.source().window(), lineage, List.of(new RecoveryPhase(proof)),
+                environment, proof.pathUpper());
     }
 
     static Preparation prepareFreeTick(FreeOwnerTransaction transaction, Request request,

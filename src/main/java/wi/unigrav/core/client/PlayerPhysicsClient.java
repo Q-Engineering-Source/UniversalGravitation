@@ -19,6 +19,7 @@ import net.minecraft.network.play.client.CPacketConfirmTeleport;
 import net.minecraft.network.play.server.SPacketPlayerPosLook;
 import net.minecraft.world.World;
 import net.minecraft.util.math.AxisAlignedBB;
+import net.minecraft.util.text.TextComponentString;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.world.WorldEvent;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
@@ -33,6 +34,7 @@ import wi.unigrav.core.player.PlayerPhysicsNetwork;
 import wi.unigrav.core.player.PlayerPhysicsProtocol;
 import wi.unigrav.core.player.PlayerBoostEligibility;
 import wi.unigrav.core.player.FreeTickResources;
+import wi.unigrav.core.player.NumericWorkExhaustedException;
 import wi.unigrav.core.player.PlayerPhysicalSnapshot;
 import wi.unigrav.core.player.PlayerKinematics;
 import wi.unigrav.core.player.PlayerBodyShape;
@@ -448,7 +450,13 @@ public final class PlayerPhysicsClient {
                 Optional<PlayerPhysicsInboundConnections.DecodeHandle> next = facade.beginNextOrClose(exactDrain);
                 if (next.isEmpty()) return;
                 exactDecode = next.orElseThrow();
-                Optional<PlayerPhysicsProtocol.Packet> decoded = facade.materializePacket(exactDecode);
+                Optional<PlayerPhysicsProtocol.Packet> decoded;
+                try {
+                    decoded = facade.materializePacket(exactDecode);
+                } catch (NumericWorkExhaustedException exhausted) {
+                    failNumericDecode(exactDrain, exactDecode, exactHandler, exhausted);
+                    return;
+                }
                 if (decoded.isEmpty()) {
                     facade.finishDecode(exactDecode, PlayerPhysicsInboundConnections.DecodeOutcome.REJECTED);
                     continue;
@@ -499,6 +507,31 @@ public final class PlayerPhysicsClient {
                 return;
             }
         }
+    }
+
+    private void failNumericDecode(PlayerPhysicsInboundConnections.DrainHandle exactDrain,
+            PlayerPhysicsInboundConnections.DecodeHandle exactDecode, NetHandlerPlayClient exactHandler,
+            NumericWorkExhaustedException exhausted) {
+        // Only called before receiveMaterialized, so the failed absolute snapshot was never installed.
+        // Close this connection rather than continue driving an authority stream with a missing state.
+        try {
+            PlayerPhysicsInboundConnections.INSTANCE.ownerDrainFailed(exactDrain, exactDecode, exhausted);
+        } catch (Throwable cleanupFailure) {
+            if (cleanupFailure != exhausted) exhausted.addSuppressed(cleanupFailure);
+        }
+        NetworkManager failedManager = exactHandler.getNetworkManager();
+        try {
+            failedManager.closeChannel(new TextComponentString(
+                    "UG physics synchronization failed: numeric decode work exhausted. See client log."));
+        } catch (Throwable closeFailure) {
+            if (closeFailure != exhausted) exhausted.addSuppressed(closeFailure);
+            UnigravMod.LOGGER.error("ugmotion1 could not close the failed numeric decode connection", exhausted);
+            PlayerPhysicsClient.<RuntimeException>rethrow(exhausted);
+            return;
+        }
+        UnigravMod.LOGGER.error("ugmotion1 numeric decode window exhausted; failed packet was not installed; "
+                        + "captured connection closed (used={}, requested={}, limit={})",
+                exhausted.used(), exhausted.requested(), exhausted.limit(), exhausted);
     }
 
     private void receiveMaterialized(PlayerPhysicsInboundConnections.DecodeHandle exactDecode,

@@ -1239,6 +1239,38 @@ class ConnectionDecodeBudgetTest {
                 Optional.empty(), Optional.of(state), Optional.empty());
     }
 
+    // C44 regression source only, NOT_RUN: real codec and lease materialization at 20 snapshots/s.
+    @Test void twentyRotatedFreeSnapshotsMaterializeInTheSameNumericWindow() {
+        var clock = new AtomicLong(0);
+        var connection = connection(EnumPacketDirection.CLIENTBOUND, ConnectionDecodeBudget.Limits.defaults(), clock);
+        var scope = connection.budget.openScope(SCOPE);
+        var center = new Vec3d(31.037567794136528, 132.20407477274063, 105.91834824733665);
+        var anchor = new FreeEyeAnchor(FreeEyeAnchor.STORED_BASIS_V1, center,
+                center.add(new Vec3d(0, .72, 0)), new Rotation3d(.15, .2, .3, .7));
+        var shape = new PlayerBodyShape.FreeCapsule(SIZE,
+                new PlayerBodyShape.CollisionProfile(SIZE.width(), SIZE.height()), Optional.of(anchor));
+        var placement = new PlayerBodyPlacement(center, new Rotation3d(.6, -.1, .2, .7), shape);
+        var snapshot = new PlayerPhysicalSnapshot(SCOPE, 19, placement, new Vec3d(0, 0, 0));
+        var packet = new PlayerPhysicsProtocol.Packet(PlayerPhysicsProtocol.Kind.STATE, SCOPE, 20, 17,
+                Optional.empty(), Optional.of(snapshot), Optional.empty());
+        StoredDyadic.Work shared = null;
+        for (int tick = 0; tick < 20; tick++) {
+            clock.set(tick * 50_000_000L);
+            var reservation = queue(connection, scope, packet);
+            var drain = reservation.newDrainPermit().orElseThrow();
+            var lease = connection.budget.beginNext(drain).orElseThrow();
+            if (shared == null) shared = lease.numericWork();
+            assertSame(shared, lease.numericWork());
+            assertEquals(PlayerPhysicsProtocol.Kind.STATE, lease.materializePacket().kind());
+            connection.budget.finish(lease, ConnectionDecodeBudget.DecodeOutcome.PROOF_ACCEPTED);
+            connection.budget.finishDrain(drain);
+        }
+        assertTrue(shared.units() > 0 && shared.units() < StoredDyadic.MAX_WORK_UNITS);
+        assertEquals(0, connection.budget.snapshot().windowSequence());
+        assertEquals(0, connection.budget.snapshot().outstandingData());
+        assertFalse(connection.budget.snapshot().activeDecode());
+    }
+
     private static PlayerPhysicsProtocol.Packet freeStatePacket() {
         return freeStatePacket(SCOPE);
     }

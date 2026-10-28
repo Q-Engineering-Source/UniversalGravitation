@@ -19,6 +19,7 @@ final class CapsulePathSource {
     private final CapsuleTranslationValidator.VerifiedTranslation translation;
     private final CardinalCapsuleContainment.Contained containment;
     private final CapsuleMovementResolver.Resolved movement;
+    private final CapsuleDepenetrationPrepared.Verified recovery;
     private final int completedSegments;
     private final NativeCardinalBodyProfile.Fit nativeProfileFit;
 
@@ -39,6 +40,7 @@ final class CapsulePathSource {
             CapsuleResizeValidator.VerifiedResize resize, CapsuleTranslationValidator.VerifiedTranslation translation,
             CapsuleMovementResolver.Resolved movement, int completedSegments, NativeCardinalBodyProfile.Fit nativeProfileFit) {
         this.nativeProfileFit = nativeProfileFit;
+        this.recovery = null;
         this.movement = movement;
         this.context = context;
         this.pose = pose;
@@ -48,6 +50,20 @@ final class CapsulePathSource {
         this.resize = resize;
         this.translation = translation;
         this.completedSegments = completedSegments;
+    }
+
+    private CapsulePathSource(CapsulePathSource source, CapsuleDepenetrationPrepared.Verified proof) {
+        context = source.context; pose = proof.end(); previous = source; recovery = proof;
+        arc = null; resize = null; translation = null; movement = null; containment = null; nativeProfileFit = null;
+        completedSegments = source.completedSegments + 1;
+    }
+    static CapsulePathSource continueAfter(CapsuleDepenetrationPrepared.Verified proof, StoredDyadic.Work work) {
+        var source = Objects.requireNonNull(proof).source();
+        if (source.work() != work || !proof.matchesBound(source) || source.completedSegments >= MAX_SEGMENTS
+                || !contains(source.window(), proof.end().placement().bounds()))
+            throw new InvalidSourceException("depenetration proof/source context changed");
+        source.chargeMetadata();
+        return new CapsulePathSource(source, proof);
     }
 
     static CapsulePathSource actualFree(PlayerPhysicalSnapshot originalActual, Pose exactAcceptedPose,
@@ -148,7 +164,11 @@ final class CapsulePathSource {
             if (node.previous == null || node.context != node.previous.context
                     || node.completedSegments != node.previous.completedSegments + 1
                     || node.pose.capsule() != node.pose.placement().capsule()) return false;
-            if (node.movement != null) {
+            if (node.recovery != null) {
+                if (node.arc != null || node.resize != null || node.translation != null || node.movement != null
+                        || node.recovery.source() != node.previous || node.recovery.end() != node.pose
+                        || !node.recovery.matchesBound(node.previous)) return false;
+            } else if (node.movement != null) {
                 if (node.arc != null || node.resize != null || node.translation != null
                         || node.movement.source() != node.previous || node.movement.end() != node.pose
                         || !node.movement.matchesBound(node.previous)) return false;

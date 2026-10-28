@@ -493,6 +493,19 @@ public final class PlayerPhysicsStep {
             FreeOwnerTransaction transaction, Optional<PlayerAttitudeRequest> attitudeRequest,
             Optional<ModeTransitionPrepared.TrustedResizeObservation> trustedResize) {
 
+        budget.advance(budgetTick);
+        var recovery = CapsuleDepenetrationPrepared.prepare(transaction);
+        if (recovery.isPresent()) {
+            if (recovery.orElseThrow() instanceof ModeTransitionPrepared.Unavailable failed)
+                return new Unavailable(failed.reason(), failed.cause());
+            var installed = ModeTransitionFinalizer.install((ModeTransitionPrepared.Prepared) recovery.orElseThrow(), budgetTick);
+            if (installed instanceof ModeTransitionFinalizer.Unavailable failed)
+                return new Unavailable(failed.reason(), failed.cause());
+            if (installed instanceof CommittedTailStop stopped) return stopped;
+            if (installed instanceof ModeTransitionFinalizer.CommittedFailure failed)
+                return new CommittedFailure(failed.snapshot(), failed.cause(), failed.custody());
+            return new Applied(((ModeTransitionFinalizer.Applied) installed).snapshot());
+        }
         Optional<Boolean> zeroG = personalZeroG.isPresent() ? personalZeroG : Optional.of(false);
         var sampled = environment.sampleFree(transaction, zeroG, SCAN);
         if (sampled instanceof PlayerEnvironmentSampler.FreeUnavailable failure)

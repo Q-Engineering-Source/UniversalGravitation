@@ -207,6 +207,44 @@ final class StoredDyadic {
         return result == 0 ? signedZero() : result;
     }
 
+    /** Exact quotient/remainder rounding; null retains the existing bounded-width search fallback. */
+    Double roundRatioDirect(StoredDyadic denominator, Work work) {
+        if (denominator.signum() <= 0) throw new IllegalArgumentException("positive ratio denominator required");
+        work.charge(1);
+        BigInteger numerator = significand.abs();
+        if (numerator.signum() == 0) return 0.0;
+        BigInteger divisor = denominator.significand;
+        int bitDifference = numerator.bitLength() - divisor.bitLength();
+        // Align only the significands, so finding floor(log2(n/d)) never shifts by a wire exponent.
+        int alignmentBits = Math.max(numerator.bitLength(), divisor.bitLength());
+        work.charge(words(alignmentBits) * 2L, alignmentBits);
+        int side = bitDifference >= 0
+                ? numerator.compareTo(divisor.shiftLeft(bitDifference))
+                : numerator.shiftLeft(-bitDifference).compareTo(divisor);
+        int top = exponent - denominator.exponent + bitDifference - (side < 0 ? 1 : 0);
+        if (top < -1075) return signedZero();
+        if (top > 1023) throw new IllegalArgumentException("boot fraction is outside finite binary64");
+        int quantum = top >= -1022 ? top - 52 : -1074;
+        int shift = exponent - denominator.exponent - quantum;
+        long numeratorBits = (long) numerator.bitLength() + Math.max(shift, 0);
+        long divisorBits = (long) divisor.bitLength() + Math.max(-shift, 0);
+        if (numeratorBits > MAX_BITS || divisorBits > MAX_BITS) return null;
+        work.charge(words((int) numeratorBits) + words((int) divisorBits),
+                (int) numeratorBits, (int) divisorBits);
+        if (shift >= 0) numerator = numerator.shiftLeft(shift);
+        else divisor = divisor.shiftLeft(-shift);
+        // Charge before the actual bounded BigInteger division, on the same ingress ledger.
+        work.charge((long) words(numerator.bitLength()) * words(divisor.bitLength()));
+        BigInteger[] quotient = numerator.divideAndRemainder(divisor);
+        work.charge(words(divisor.bitLength()) * 3L);
+        // r versus d-r is exactly 2*r versus d, without allocating a wider intermediate.
+        int midpoint = quotient[1].compareTo(divisor.subtract(quotient[1]));
+        if (midpoint > 0 || midpoint == 0 && quotient[0].testBit(0)) quotient[0] = quotient[0].add(ONE);
+        double magnitude = Math.scalb(quotient[0].doubleValue(), quantum);
+        if (!Double.isFinite(magnitude)) throw new IllegalArgumentException("boot fraction is outside finite binary64");
+        return significand.signum() < 0 ? -magnitude : magnitude;
+    }
+
     double roundDown(Work work) {
         double nearest = roundNearest(work);
         StoredDyadic candidate = of(nearest, work);

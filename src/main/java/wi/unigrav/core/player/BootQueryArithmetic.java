@@ -83,6 +83,8 @@ public final class BootQueryArithmetic {
         Number denominator = fraction.denominator; // fraction() guarantees a positive denominator.
         if (compare(numerator, multiply(exact(Double.MAX_VALUE), denominator)) > 0)
             throw new IllegalArgumentException("boot fraction is outside finite binary64");
+        Double direct = require(fraction.numerator).roundRatioDirect(require(denominator), work);
+        if (direct != null) { current.run(); return direct; }
         // Positive finite raw encodings are ordered. Each probe compares c*d with |n| exactly;
         // the existing floor search takes at most 63 iterations and charges this same Work.
         long lowerBits = floor(MAX_FINITE_BITS,

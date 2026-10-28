@@ -549,6 +549,47 @@ class ModeMovementContinuationTest {
         endpoint.requireCurrent();
     }
 
+    // C44 regression source, NOT_RUN: recovery uses the real owner/collision capture seam.
+    @Test void realOverlapPreparesAnOutwardPhaseWithoutChangingTheActor() {
+        try (var s = scene()) {
+            s.put(8, 70, 8);
+            var before = WorldCollisionCandidates.ActorGeometry.read(s.actor);
+            var prepared = assertInstanceOf(ModeTransitionPrepared.Prepared.class,
+                    CapsuleDepenetrationPrepared.prepare(s.tx).orElseThrow());
+            assertTrue(prepared.recovery());
+            assertTrue(prepared.matches(s.tx, null));
+            assertNotEquals(s.accepted.placement().center(), prepared.target().center());
+            assertEquals(s.accepted.placement().attitude(), prepared.target().attitude());
+            assertEquals(before, WorldCollisionCandidates.ActorGeometry.read(s.actor));
+            assertEquals(FreeOwnerTransaction.InstallationStage.NONE, s.tx.installationStage());
+        }
+    }
+
+    @Test void multipleInitialObstaclesMustShareOneCertifiedOutwardDirection() {
+        try (var s = scene(8.875)) {
+            s.put(8, 70, 8); s.put(9, 70, 8);
+            var prepared = assertInstanceOf(ModeTransitionPrepared.Prepared.class,
+                    CapsuleDepenetrationPrepared.prepare(s.tx).orElseThrow());
+            // Opposite x half-spaces forbid crossing either block: use a common z exit.
+            assertEquals(s.accepted.placement().center().x(), prepared.target().center().x());
+            assertNotEquals(s.accepted.placement().center().z(), prepared.target().center().z());
+            assertTrue(prepared.matches(s.tx, null));
+        }
+    }
+
+    @Test void obstructedConservativeExitsReturnExplicitFailureWithoutNativeMutation() {
+        try (var s = scene()) {
+            for (int x = 7; x <= 9; x++) for (int y = 69; y <= 71; y++)
+                for (int z = 7; z <= 9; z++) s.put(x, y, z);
+            var before = WorldCollisionCandidates.ActorGeometry.read(s.actor);
+            var failed = assertInstanceOf(ModeTransitionPrepared.Unavailable.class,
+                    CapsuleDepenetrationPrepared.prepare(s.tx).orElseThrow());
+            assertTrue(failed.reason().contains("depenetration"));
+            assertEquals(before, WorldCollisionCandidates.ActorGeometry.read(s.actor));
+            assertEquals(FreeOwnerTransaction.InstallationStage.NONE, s.tx.installationStage());
+        }
+    }
+
     private Scene scene() { return scene(8.5); }
     private Scene scene(double centerX) { return scene(centerX, false); }
     private Scene scene(double centerX, boolean cardinal) {

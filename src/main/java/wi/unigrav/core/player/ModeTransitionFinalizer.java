@@ -66,7 +66,7 @@ final class ModeTransitionFinalizer {
                     ? prepared.movement().sealForInstallation(transaction, journal) : null;
             transaction.beginInstallation(journal);
             try {
-                if (request instanceof MobilityTransitionRequest) {
+                if (request instanceof MobilityTransitionRequest || prepared.recovery()) {
                     // Mobility changes shape, not accepted momentum. Native motion may still lag
                     // an adopted snapshot, so bind this write to the journal and its owner fence.
                     var velocity = prepared.integratedVelocity() == null

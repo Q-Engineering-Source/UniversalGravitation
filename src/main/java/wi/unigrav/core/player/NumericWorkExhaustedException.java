@@ -1,7 +1,7 @@
 package wi.unigrav.core.player;
 
 /** Positive numeric work requested after a shared decode ledger is exhausted. */
-final class NumericWorkExhaustedException extends IllegalArgumentException {
+public final class NumericWorkExhaustedException extends IllegalArgumentException {
     private final long used;
     private final long requested;
     private final long limit;
@@ -17,8 +17,8 @@ final class NumericWorkExhaustedException extends IllegalArgumentException {
         this.limit = limit;
     }
 
-    long used() { return used; }
-    long requested() { return requested; }
-    long limit() { return limit; }
+    public long used() { return used; }
+    public long requested() { return requested; }
+    public long limit() { return limit; }
 }
 

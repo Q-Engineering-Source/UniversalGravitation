@@ -24,7 +24,7 @@ import java.util.Optional;
  * No result here authorizes world movement or ownership.
  */
 final class CapsuleContactQueryBudget {
-    enum Operation { CONTACT, TRANSLATION_BOUNDARY, ORIGINAL_PREFIX, ELONGATED_ORIGINAL_PREFIX }
+    enum Operation { CONTACT, TRANSLATION_BOUNDARY, ORIGINAL_PREFIX, ELONGATED_ORIGINAL_PREFIX, AXIS_EXIT_CANDIDATES, AXIS_EXIT_CHECK }
     record Observation(long call, Operation operation, String context, Capsule capsule, Aabb obstacle,
                        String outcome, String reason, Optional<Work> executedWork, boolean cacheHit) { }
     record Diagnostics(String mode, Map<Operation, Long> invocations, long geometryCacheHits,
@@ -116,6 +116,29 @@ final class CapsuleContactQueryBudget {
             terminal = true;
             throw failure;
         }
+    }
+
+    CapsuleAabbContact3d.AxisExitResult axisExitCandidates(Capsule capsule, Aabb obstacle, ContactAccuracy accuracy) {
+        QueryLimits remaining = enter(Operation.AXIS_EXIT_CANDIDATES);
+        try {
+            var result = CapsuleAabbContact3d.axisExitCandidates(capsule, obstacle, accuracy, remaining);
+            charge(result.work());
+            observe(Operation.AXIS_EXIT_CANDIDATES, "initial-overlap", capsule, obstacle,
+                    result.kind().name(), result.reason().map(Enum::name).orElse("none"), result.work(), false);
+            return result;
+        } catch (RuntimeException | Error failure) { terminal = true; throw failure; }
+    }
+
+    CapsuleAabbContact3d.AxisExitCheck checkAxisExit(Capsule capsule, Aabb obstacle,
+            CapsuleAabbContact3d.Face face, Capsule actualEnd, ContactAccuracy accuracy) {
+        QueryLimits remaining = enter(Operation.AXIS_EXIT_CHECK);
+        try {
+            var result = CapsuleAabbContact3d.checkAxisExit(capsule, obstacle, face, actualEnd, accuracy, remaining);
+            charge(result.work());
+            observe(Operation.AXIS_EXIT_CHECK, "face=" + face, capsule, obstacle,
+                    result.kind().name(), result.reason().map(Enum::name).orElse("none"), result.work(), false);
+            return result;
+        } catch (RuntimeException | Error failure) { terminal = true; throw failure; }
     }
 
     BoundaryResult refineTranslationBoundary(Capsule capsule, Vec3d delta, Aabb obstacle,

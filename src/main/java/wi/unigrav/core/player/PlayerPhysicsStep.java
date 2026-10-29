@@ -134,6 +134,8 @@ public final class PlayerPhysicsStep {
     public record CommittedDeferred(PlayerPhysicalSnapshot snapshot, Unavailable tail) implements Result { }
     /** Per-owner native jump cooldown and correction fence, never shared between players or sides. */
     public static final class TravelState {
+        private String proneTransitionRejection;
+        String proneTransitionRejection() { return proneTransitionRejection; }
         private NativeFlightParameters equipmentFlight;
         private PlayerPhysicalSnapshot equipmentFlightSource;
         private long equipmentFlightTick;
@@ -1166,6 +1168,7 @@ public final class PlayerPhysicsStep {
         boolean nativeGravity = !sample.personalZeroG() && !travel.nativeNoGravity
                 && sample.bindingMode().filter(mode -> mode == GravityMode.REPLACE).isEmpty() && !flying;
         if (nativeGravity) acceleration = acceleration.add(new Vec3(0, fluid ? -8 : -32, 0));
+        travel.proneTransitionRejection = null;
         if (free != null) {
             var prone = ProneLocomotion.choose(free, travel, controls, water);
             if (prone.request().isPresent()) {
@@ -1176,22 +1179,32 @@ public final class PlayerPhysicsStep {
                 velocity = cappedConversionVelocity(velocity, budget.ceilingMps());
                 var prepared = ModeTransitionPrepared.prepareCardinalToFree(free, prone.request().orElseThrow(),
                         new Vec3d(velocity.x(), velocity.y(), velocity.z()), budgetTick);
-                if (prepared instanceof ModeTransitionPrepared.Unavailable failure)
-                    return new Unavailable(failure.reason(), failure.cause());
-                var installed = ModeTransitionFinalizer.install((ModeTransitionPrepared.Prepared) prepared, budgetTick);
-                if (installed instanceof ModeTransitionFinalizer.Unavailable failure)
-                    return new Unavailable(failure.reason(), failure.cause());
-                if (installed instanceof CommittedTailStop stopped) return stopped;
-                if (installed instanceof ModeTransitionFinalizer.CommittedFailure failure)
-                    return new CommittedFailure(failure.snapshot(), failure.cause(), failure.custody());
-                var applied = (ModeTransitionFinalizer.Applied) installed;
-                travel.ownerReference(new PlayerBodyReference.FreeReference(referenceState.manualIntent(),
-                        Optional.empty(), Optional.of(referenceState.effective())));
-                travel.standingState(StandingConstraints.State.initial());
-                try {
-                    return new Applied(waterMotion == null ? applied.snapshot() : finishWater(free, applied.snapshot(), waterMotion));
-                } catch (RuntimeException failure) {
-                    return new CommittedFailure(applied.snapshot(), failure, free.installationCustody());
+                if (prepared instanceof ModeTransitionPrepared.RejectedCrawl rejected) {
+                    rejected.requireCurrent();
+                    sample.requireCurrent();
+                    free.requireCurrent();
+                    travel.proneTransitionRejection = rejected.reason();
+                    // No installation or reservation happened. The ordinary Cardinal solver
+                    // below still proves this tick's real displacement and step, including a
+                    // low ceiling that may block it; rejecting the turn cannot freeze that move.
+                } else {
+                    if (prepared instanceof ModeTransitionPrepared.Unavailable failure)
+                        return new Unavailable(failure.reason(), failure.cause());
+                    var installed = ModeTransitionFinalizer.install((ModeTransitionPrepared.Prepared) prepared, budgetTick);
+                    if (installed instanceof ModeTransitionFinalizer.Unavailable failure)
+                        return new Unavailable(failure.reason(), failure.cause());
+                    if (installed instanceof CommittedTailStop stopped) return stopped;
+                    if (installed instanceof ModeTransitionFinalizer.CommittedFailure failure)
+                        return new CommittedFailure(failure.snapshot(), failure.cause(), failure.custody());
+                    var applied = (ModeTransitionFinalizer.Applied) installed;
+                    travel.ownerReference(new PlayerBodyReference.FreeReference(referenceState.manualIntent(),
+                            Optional.empty(), Optional.of(referenceState.effective())));
+                    travel.standingState(StandingConstraints.State.initial());
+                    try {
+                        return new Applied(waterMotion == null ? applied.snapshot() : finishWater(free, applied.snapshot(), waterMotion));
+                    } catch (RuntimeException failure) {
+                        return new CommittedFailure(applied.snapshot(), failure, free.installationCustody());
+                    }
                 }
             }
         }

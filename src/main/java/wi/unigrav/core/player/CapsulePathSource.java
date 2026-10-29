@@ -159,11 +159,22 @@ final class CapsulePathSource {
     }
     void chargeMetadata() { context.work.charge(completedSegments + 1); }
     boolean valid() {
+        if (completedSegments < 0 || completedSegments > MAX_SEGMENTS) return false;
+        var lineage = new CapsulePathSource[completedSegments];
         CapsulePathSource node = this;
         for (int left = completedSegments; left > 0; left--) {
             if (node.previous == null || node.context != node.previous.context
                     || node.completedSegments != node.previous.completedSegments + 1
                     || node.pose.capsule() != node.pose.placement().capsule()) return false;
+            lineage[left - 1] = node;
+            node = node.previous;
+        }
+        if (!node.validRoot()) return false;
+        // The immutable predecessor chain is validated once, root first. Movement receipt
+        // checks retain their live transaction/world fences, but must not recursively walk
+        // the same already-checked chain again for every descendant and arc obstacle.
+        for (var descendant : lineage) {
+            node = descendant;
             if (node.recovery != null) {
                 if (node.arc != null || node.resize != null || node.translation != null || node.movement != null
                         || node.recovery.source() != node.previous || node.recovery.end() != node.pose
@@ -171,7 +182,7 @@ final class CapsulePathSource {
             } else if (node.movement != null) {
                 if (node.arc != null || node.resize != null || node.translation != null
                         || node.movement.source() != node.previous || node.movement.end() != node.pose
-                        || !node.movement.matchesBound(node.previous)) return false;
+                        || !node.movement.matchesBoundAfterSourceValidation(node.previous)) return false;
             } else if (node.arc != null) {
                 if (node.resize != null || node.translation != null || node.arc.source() != node.previous
                         || node.arc.target() != node.pose.placement()) return false;
@@ -180,8 +191,11 @@ final class CapsulePathSource {
                         || node.resize.target() != node.pose.placement()) return false;
             } else if (node.translation == null || node.translation.source() != node.previous
                     || node.translation.target() != node.pose.placement()) return false;
-            node = node.previous;
         }
+        return true;
+    }
+    private boolean validRoot() {
+        var node = this;
         if (node.previous != null || node.completedSegments != 0
                 || node.pose.capsule() != node.pose.placement().capsule()) return false;
         if (node.nativeProfileFit != null)

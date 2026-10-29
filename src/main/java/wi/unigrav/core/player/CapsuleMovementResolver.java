@@ -21,6 +21,8 @@ import java.util.Set;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.IdentityHashMap;
+import java.util.Map;
+import java.util.HashMap;
 
 /** Fixed-attitude padded paths. Initial-contact inheritance is a separate mathematical prerequisite. */
 final class CapsuleMovementResolver {
@@ -533,6 +535,35 @@ final class CapsuleMovementResolver {
     }
     sealed interface Result permits Resolved, Inconclusive { List<Query> queries(); List<Plane> planes(); }
     static final class Resolved implements Result {
+        /** Identity-scoped lookup only: every retrieved receipt is still checked on use. */
+        private record SegmentEvidence(List<Query> originalQueries, Map<Integer, List<Query>> queries,
+                Map<Integer, List<Plane>> planes, Map<Integer, List<SupportReceipt>> supports) {
+            private static <T> Map<Integer, List<T>> freeze(Map<Integer, List<T>> buckets) {
+                buckets.replaceAll((ordinal, values) -> List.copyOf(values));
+                return Map.copyOf(buckets);
+            }
+            static SegmentEvidence index(Segment segment, List<Query> queries, List<Plane> planes,
+                    List<SupportReceipt> supports) {
+                var originals = new ArrayList<Query>();
+                var queryBuckets = new HashMap<Integer, List<Query>>();
+                var planeBuckets = new HashMap<Integer, List<Plane>>();
+                var supportBuckets = new HashMap<Integer, List<SupportReceipt>>();
+                for (var query : queries) {
+                    if (query.tube() != segment.tube()) continue;
+                    if (query.bodyPrefix().isPresent()) originals.add(query);
+                    if (query.capture() == segment.capture())
+                        queryBuckets.computeIfAbsent(query.ordinal(), unused -> new ArrayList<>()).add(query);
+                }
+                for (var plane : planes)
+                    planeBuckets.computeIfAbsent(plane.ordinal(), unused -> new ArrayList<>()).add(plane);
+                for (var receipt : supports)
+                    if (receipt.segment() == segment)
+                        supportBuckets.computeIfAbsent(receipt.ordinal(), unused -> new ArrayList<>()).add(receipt);
+                return new SegmentEvidence(List.copyOf(originals), freeze(queryBuckets), freeze(planeBuckets),
+                        freeze(supportBuckets));
+            }
+        }
+        private final IdentityHashMap<Segment, SegmentEvidence> evidenceBySegment;
         private final CapsulePlacementMath.Pose end;
         private final double fraction;
         private final List<Query> queries;
@@ -590,6 +621,9 @@ final class CapsuleMovementResolver {
             this.blockedAxes = Set.copyOf(blockedAxes);
             this.clipEvents = List.copyOf(clipEvents);
             this.stop = Objects.requireNonNull(stop, "stop");
+            evidenceBySegment = new IdentityHashMap<>();
+            for (var segment : this.segments)
+                evidenceBySegment.put(segment, SegmentEvidence.index(segment, this.queries, this.planes, this.supportReceipts));
         }
         CapsulePlacementMath.Pose end() { return end; }
         double fraction() { return fraction; }
@@ -826,6 +860,10 @@ final class CapsuleMovementResolver {
         boolean matchesBound(CapsulePathSource exactSource) {
             return source != null && source == exactSource && matches(transaction);
         }
+        /** Called only by the root-to-leaf lineage walk after it has checked this exact predecessor. */
+        boolean matchesBoundAfterSourceValidation(CapsulePathSource exactSource) {
+            return source != null && source == exactSource && matches(transaction, true);
+        }
         double pathUpper() {
             double total = 0;
             for (Segment segment : segments) {
@@ -835,6 +873,9 @@ final class CapsuleMovementResolver {
             return total;
         }
         boolean matches(FreeOwnerTransaction exactTransaction) {
+            return matches(exactTransaction, false);
+        }
+        private boolean matches(FreeOwnerTransaction exactTransaction, boolean predecessorValidated) {
             if (transaction != exactTransaction) return false;
             transaction.requireCurrent();
             if (segments.isEmpty() || segments.size() > MAX_SEGMENTS) return false;
@@ -853,17 +894,17 @@ final class CapsuleMovementResolver {
             CapsulePlacementMath.Pose previous = source == null ? segments.getFirst().tube().start() : source.start();
             if (source == null) {
                 if (previous.placement() != transaction.accepted().placement()) return false;
-            } else if (source.actualSource() != transaction.accepted() || !source.valid() || !source.current()
+            } else if (source.actualSource() != transaction.accepted() || (!predecessorValidated && !source.valid()) || !source.current()
                     || source.work() != transaction.numeric() || source.queries() != transaction.queries()) return false;
             for (SweepFacet facet : sweepFacets)
                 if (!facet.matches(transaction, segments, queries, clipEvents, end)) return false;
             for (Segment segment : segments) {
+                var evidence = evidenceBySegment.get(segment);
                 if (segment.tube().start() != previous
                         || segment.capture().capsuleContextFailure(transaction.accepted(),
                                 segment.capture().footprint().requestedBounds()).isPresent()) return false;
                 var originalProofs = new HashSet<Integer>();
-                for (Query query : queries) {
-                    if (query.tube() != segment.tube() || query.bodyPrefix().isEmpty()) continue;
+                for (Query query : evidence.originalQueries()) {
                     if (query.ordinal() < 0 || query.ordinal() >= segment.capture().boxes().size()
                             || segment.capture().boxes().get(query.ordinal()) != query.obstacle()
                             || !originalProofs.add(query.ordinal())) return false;
@@ -893,27 +934,30 @@ final class CapsuleMovementResolver {
                 for (int ordinal = 0; ordinal < segment.capture().boxes().size(); ordinal++) {
                     final int exactOrdinal = ordinal;
                     Aabb obstacle = segment.capture().boxes().get(ordinal);
-                    boolean axis = planes.stream().anyMatch(plane -> plane.ordinal() == exactOrdinal
-                            && plane.obstacle() == obstacle && plane.certificate().matches(segment.tube(), obstacle));
-                    long supportCount = supportReceipts.stream().filter(receipt -> receipt.segment() == segment
-                            && receipt.ordinal() == exactOrdinal && receipt.matches(transaction, segment, exactOrdinal, obstacle)).count();
-                    boolean actualFit = queries.stream().anyMatch(query -> query.tube() == segment.tube()
-                            && query.capture() == segment.capture() && query.ordinal() == exactOrdinal
-                            && query.obstacle() == obstacle && query.actualFinal().isPresent()
+                    var obstacleQueries = evidence.queries().getOrDefault(ordinal, List.of());
+                    boolean actualFit = obstacleQueries.stream().anyMatch(query -> query.obstacle() == obstacle
+                            && query.actualFinal().isPresent()
                             && query.actualFinal().orElseThrow().relation() != Relation.OVERLAPPING
                             && query.actualFinal().orElseThrow().relation() != Relation.UNRESOLVED);
-                    boolean boundaryPathCertified = queries.stream().anyMatch(query ->
+                    if (!actualFit) return false;
+                    boolean pathCertified = originalPathCertified
+                            || evidence.planes().getOrDefault(ordinal, List.of()).stream().anyMatch(plane -> plane.ordinal() == exactOrdinal
+                            && plane.obstacle() == obstacle && plane.certificate().matches(segment.tube(), obstacle));
+                    pathCertified = pathCertified
+                            || evidence.supports().getOrDefault(ordinal, List.of()).stream().anyMatch(receipt ->
+                                receipt.matches(transaction, segment, exactOrdinal, obstacle))
+                            || obstacleQueries.stream().anyMatch(query ->
                             boundaryCoversSegment(transaction, query, segment.capture(), segment.tube(),
-                                    segment.fraction(), exactOrdinal, obstacle));
-                    boolean pathCertified = originalPathCertified || axis || supportCount > 0
-                            || boundaryPathCertified
-                            || segment.fraction() == 0 && segment.end() == segment.tube().start() && actualFit;
-                    if (!pathCertified || !actualFit) return false;
+                                    segment.fraction(), exactOrdinal, obstacle))
+                            || segment.fraction() == 0 && segment.end() == segment.tube().start();
+                    if (!pathCertified) return false;
                 }
                 previous = segment.end();
             }
             if (previous != end) return false;
             transaction.requireReservedPath(totalPath(priorPathUpper, pathUpper(), transaction.numeric()));
+            transaction.requireCurrent();
+            if (source != null && !source.current()) return false;
             return true;
         }
         Optional<WorldCollisionCandidates.Unavailable> recaptureFailure(FreeOwnerTransaction exactTransaction) {

@@ -32,7 +32,17 @@ final class ModeTransitionPrepared {
         Rotation3d rawDesiredQ();
     }
 
-    sealed interface Preparation permits Prepared, Unavailable, Occupied, RetainedAttitude { }
+    sealed interface Preparation permits Prepared, Unavailable, Occupied, RetainedAttitude, RejectedCrawl { }
+    /** A geometric turn refusal is not a refusal of the separately proved Cardinal move. */
+    record RejectedCrawl(CardinalSource source, String reason) implements Preparation {
+        RejectedCrawl {
+            Objects.requireNonNull(source); Objects.requireNonNull(reason);
+            if (!(source.request instanceof ProneTransitionRequest prone)
+                    || prone.requestedPose().filter(pose -> pose.kind() == PlayerBodyShape.PronePose.Kind.CRAWLING).isEmpty())
+                throw new IllegalArgumentException("retained Cardinal movement requires a crawling proposal");
+        }
+        void requireCurrent() { source.requireCurrent(); }
+    }
     /** A rejected input rotation remains pending; only the separately proved motion can commit. */
     record RetainedAttitude(Prepared prepared, String rejection) implements Preparation {
         RetainedAttitude {
@@ -443,9 +453,18 @@ final class ModeTransitionPrepared {
             var arcResult = CapsuleArcValidator.validate(source, targetPlacement, cardinal.frame().up());
             if (!(arcResult instanceof CapsuleArcValidator.VerifiedArc arc)) {
                 var failed = (CapsuleArcValidator.Failed) arcResult;
-                return new Unavailable("Cardinal-to-Free arc proof failed: " + failed.failure() + "; "
+                String detail = "Cardinal-to-Free arc proof failed: " + failed.failure() + "; "
                         + cardinalFailureContext(accepted, geometry.actorGeometry(), request.rawDesiredQ(), initialPlacement)
-                        + "; arc=" + arcDiagnostic(failed, transaction.queries()),
+                        + "; arc=" + arcDiagnostic(failed, transaction.queries());
+                if (failed.budgetCause() == null && request instanceof ProneTransitionRequest prone
+                        && prone.requestedPose().filter(pose -> pose.kind() == PlayerBodyShape.PronePose.Kind.CRAWLING).isPresent()
+                        && (failed.failure() == CapsuleArcValidator.Failure.ARC_OVERLAP
+                            || failed.failure() == CapsuleArcValidator.Failure.SUBDIVISION_LIMIT
+                            || failed.failure() == CapsuleArcValidator.Failure.UNRESOLVED)) {
+                    prelude.requireCurrent();
+                    return new RejectedCrawl(prelude, detail);
+                }
+                return new Unavailable(detail,
                         failed.budgetCause() instanceof RuntimeException runtime ? Optional.of(runtime) : Optional.empty());
             }
             var finalLineage = CapsulePathSource.continueAfter(arc, transaction.numeric());

@@ -1,6 +1,5 @@
 package wi.unigrav.core.player;
 
-import dev.crlhitbox.api.geometry.Aabb;
 import dev.crlhitbox.api.geometry.Rotation3d;
 import dev.crlhitbox.api.geometry.Vec3d;
 import dev.crlhitbox.api.geometry.contact.CapsuleAabbContact3d.Relation;
@@ -85,11 +84,7 @@ final class ProneLocomotion {
             if (current.isEmpty()) return Choice.NONE;
             selected = Optional.empty();
         } else {
-            selected = selectPose(actor, input.orElseThrow(), current, frame, false, water, controls.sprint(), false);
-            if (selected.isEmpty() && frame.isPresent() && (placement.shape() instanceof PlayerBodyShape.Cardinal || current.isPresent())
-                    && !standingRoom(tx, body.orElseThrow().physical(), input.orElseThrow().standingEyeHeight(),
-                            frame.orElseThrow(), placement.shape() instanceof PlayerBodyShape.Cardinal ? controls.translation() : new Vec3d(0, 0, 0)))
-                selected = selectPose(actor, input.orElseThrow(), current, frame, false, water, controls.sprint(), true);
+            selected = selectPose(actor, input.orElseThrow(), current, frame, false, water, controls.sprint());
             // With a reference, retain the direct full-body standing path. Without one there is
             // no standing target: retire swim/crawl semantics in the ordinary Free transaction.
             if (selected.isEmpty() && (current.isEmpty() || frame.isPresent())) return Choice.NONE;
@@ -104,57 +99,21 @@ final class ProneLocomotion {
     /** Shared current-mode selection; a saved pose is never an already-swimming permission. */
     static Optional<PlayerBodyShape.PronePose> selectPose(EntityPlayerMP actor, ProneBodyProducer.Input input,
             Optional<PlayerBodyShape.PronePose> current, CardinalFrame frame,
-            boolean flight, boolean water, boolean sprint, boolean standingBlocked) {
-        return selectPose(actor, input, current, Optional.of(frame), flight, water, sprint, standingBlocked);
+            boolean flight, boolean water, boolean sprint) {
+        return selectPose(actor, input, current, Optional.of(frame), flight, water, sprint);
     }
 
     static Optional<PlayerBodyShape.PronePose> selectPose(EntityPlayerMP actor, ProneBodyProducer.Input input,
             Optional<PlayerBodyShape.PronePose> current, Optional<CardinalFrame> frame,
-            boolean flight, boolean water, boolean sprint, boolean standingBlocked) {
+            boolean flight, boolean water, boolean sprint) {
         if (flight) return Optional.empty();
         boolean swimming = water && sprint
                 && (actor.capabilities.isCreativeMode || actor.getFoodStats().getFoodLevel() > 6)
                 && (input.eyesInWater() || current.filter(pose ->
                         pose.kind() == PlayerBodyShape.PronePose.Kind.SWIMMING).isPresent());
         if (swimming) return Optional.of(new PlayerBodyShape.PronePose(PlayerBodyShape.PronePose.Kind.SWIMMING, frame));
-        return input.forcedCrawl() || standingBlocked
+        return input.forcedCrawl()
                 ? Optional.of(new PlayerBodyShape.PronePose(PlayerBodyShape.PronePose.Kind.CRAWLING, frame)) : Optional.empty();
-    }
-
-    /** Full-height query for intent selection only; a clear result never grants standing installation. */
-    static boolean standingRoom(FreeOwnerTransaction tx, PlayerBodyShape.CollisionProfile profile,
-            double eye, CardinalFrame frame, Vec3d approach) {
-        tx.requireCurrent();
-        var placement = tx.accepted().placement();
-        var dimensions = new PlayerBodyShape.Dimensions(profile.diameter(), profile.length(), eye);
-        PlayerBodyPlacement standing;
-        if (placement.shape() instanceof PlayerBodyShape.Cardinal) standing = placement.proposeDimensionsAtFeet(dimensions);
-        else {
-            var foot = PlayerBodyPlacement.proneSupportFoot(placement, frame, tx.numeric());
-            var center = foot.add(frame.up().multiply(profile.length() / 2));
-            tx.numeric().charge(7);
-            standing = new PlayerBodyPlacement(center, frame.attitude(), new PlayerBodyShape.Cardinal(frame, dimensions));
-        }
-        if (!clear(tx, standing.bounds())) return false;
-        Vec3d tangent = approach.subtract(frame.up().multiply(approach.dot(frame.up())));
-        tx.numeric().charge(10);
-        double magnitude = Math.sqrt(tangent.lengthSquared());
-        if (!(magnitude > 0)) return true;
-        // Begin lowering before the native standing box reaches a low opening. The full prone
-        // body and its complete turn still have to fit; an ordinary wall cannot authorize clipping.
-        var delta = tangent.multiply(profile.diameter() / magnitude);
-        tx.numeric().charge(10);
-        return clear(tx, new Aabb(standing.bounds().min().add(delta), standing.bounds().max().add(delta)));
-    }
-
-    private static boolean clear(FreeOwnerTransaction tx, Aabb box) {
-        var result = WorldCollisionCandidates.capture(tx, box, CollisionQueryFootprint.QueryPolicy.NATIVE_STRICT,
-                ModeTransitionPrepared.SCAN, tx.resources().environmentObservationWork());
-        tx.requireCurrent();
-        if (result instanceof WorldCollisionCandidates.Unavailable failure)
-            throw new IllegalStateException("Prone standing-space observation unavailable: "
-                    + failure.reason() + "; " + failure.detail(), failure.cause().orElse(null));
-        return ((WorldCollisionCandidates.Snapshot) result).boxes().isEmpty();
     }
 
     static Rotation3d attitude(Vec3d look, Rotation3d accepted, PlayerBodyShape.PronePose pose, boolean previouslyProne) {

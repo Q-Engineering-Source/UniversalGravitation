@@ -145,7 +145,12 @@ abstract class AquaPlayerGeometryMixin implements NativePoseEyeProducer.OwnedSta
 
     @WrapMethod(method = "setPose(Lcom/fuzs/aquaacrobatics/entity/Pose;)V", remap = false, require = 1, allow = 1)
     private void unigrav$admitSwimMirrorOnly(Pose pose, Operation<Void> original) {
-        if (pose == Pose.SWIMMING && unigrav$ownedBody().isPresent() && unigrav$ownedProneBody().isEmpty()) return;
+        if (pose == Pose.SWIMMING && unigrav$ownedProneBody().isEmpty()) {
+            var aqua = (IPlayerResizeable) this;
+            // Land crawling is Aqua's explicit toggle intent, never its low-ceiling fallback.
+            // Once owned, only an accepted full-capsule pose may install the native mirror.
+            if (unigrav$ownedBody().isPresent() || !aqua.isForcingCrawling() && !aqua.isSwimming()) return;
+        }
         original.call(pose);
     }
 

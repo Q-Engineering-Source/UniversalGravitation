@@ -2642,7 +2642,6 @@ public final class PlayerPhysicsServer {
         private Vec3 initializationReferencePoint;
         private CardinalFrame selectionFrame;
         private Optional<CardinalFrame> selectionReference;
-        private boolean standingBlocked;
         private Optional<PlayerBodyShape.PronePose> selectedPose;
         private boolean mutating, installed, published;
 
@@ -2733,7 +2732,7 @@ public final class PlayerPhysicsServer {
         private Optional<PlayerBodyShape.PronePose> selectPose(boolean water) {
             // No currently accepted swim state exists at first ownership. Historical SWIMMING is not permission.
             return ProneLocomotion.selectPose(session.player, input, Optional.empty(), selectionReference,
-                    flightSelected(), water, session.player.isSprinting(), standingBlocked);
+                    flightSelected(), water, session.player.isSprinting());
         }
 
         private void selectTarget() {
@@ -2803,7 +2802,6 @@ public final class PlayerPhysicsServer {
         }
 
         private PlayerBodyPlacement prepareStanding(Optional<CardinalFrame> reference, Vec3d look) {
-            standingBlocked = false;
             if (reference.isEmpty() || flightSelected()) return null;
             var saved = history.saved();
             Rotation3d standingQ = saved.attitude();
@@ -2817,7 +2815,6 @@ public final class PlayerPhysicsServer {
             }
             var dimensions = new PlayerBodyShape.Dimensions(body.physical().diameter(), body.physical().length(), input.standingEyeHeight());
             target = fromTransport(standingQ, new PlayerBodyShape.Cardinal(selectionFrame, dimensions));
-            standingBlocked = !fit();
             return target;
         }
 
@@ -5949,13 +5946,13 @@ public final class PlayerPhysicsServer {
         if (owner.locomotionProbe.shouldEmit(accepted.scope(), worldTick, controls, capabilityFlying, gActive)) {
             UnigravMod.LOGGER.info("ug-locomotion-transition stage=server-step-result scope={} worldTick={}"
                             + " admittedInputSeq={} predictionInputState={} jump={} held={} sneak={} flying={} personalG={}"
-                            + " freshInput={} translation={} before={} after={} disposition={} pendingPose={}",
+                            + " freshInput={} translation={} before={} after={} disposition={} pendingPose={} proneTurnRejected={}",
                     accepted.scope(), worldTick,
                     owner.latestAdmittedInput == null ? -1 : owner.latestAdmittedInput.sequence(),
                     owner.predictionTimeline.diagnostics(), controls.jump(), controls.mobility().held(), controls.sneak(),
                     capabilityFlying, gActive, freshInput, controls.translation(), accepted,
                     serverControlResultSnapshot(result, accepted), serverControlDisposition(result, stepFailure),
-                    owner.pendingCardinalPose != null);
+                    owner.pendingCardinalPose != null, owner.travel.proneTransitionRejection());
         }
         var mobilityState = owner.travel.mobilityState(accepted);
         var input = controls.mobility();

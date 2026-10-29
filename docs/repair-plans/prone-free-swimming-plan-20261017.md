@@ -1,5 +1,29 @@
 # 趴卧与自由方向游泳：方法级规划草案
 
+## C49露天地毯运行NG修复（2026-10-29，用户授权持续至新安装候选）
+
+**C50修复源码定点复核（Docs，2026-10-29，构建终态待回执）：**已实读本轮低顶选择/RejectedCrawl/Resolved索引/root-to-leaf谱系及后补潜行高度4文件。上下盒同一次capture、同feet/footprint/frame、严格边界；实际Aqua getSize(CROUCHING).height沿既有Artemis规则排除泳姿UUID取得，Input finite positive及转姿/初始化record equals涵盖该输入，潜行可容纳的1.6高空间不提自动爬。完整路径/目标fit仍独立授权；低顶+脚部障碍交合法Cardinal跨步后再判，不未验证抬身体。索引保tube/capture/ordinal/obstacle身份、prefix重复序号检查、support全体及actualFit；谱系省重复不可变predecessor结构，动态current不缓存。RejectedCrawl仅限定无cause几何拒绝，reserve在arc通过后，prelude/sample/free重验后正常Cardinal独立证明，未把异常改成功。失败转姿资源不得重置，正常Cardinal仍共享原tick约束；运行是否消除拉回/卡死未验证。有限SOURCE未发现新增确定阻断，不是独立运行验收。ProneClearanceTest含六frame/地毯/台阶/整墙/低顶/接触/潜行空间回归源码，NOT_RUN；94193 no-test exit0/48.7019602s/19warnings仅覆盖潜行高度增量前，新增后最终构建待Root回执，不借旧结果。计划候选C50，UG0.1.17，UIE/CHB沿配套既有身份不无据重构建；产品提交/最终静态ABI/候选保存由Root继续。C49冻结、运行NG全部OPEN，完成新候选才WAIT_USER_TEST。
+
+
+本节为当前执行增量，覆盖下文“仅诊断/无新Goal/等待C49首次实测”的阶段状态，不取消原完整游泳/爬行合同。Root唯一源码writer；Docs维护现有方案/账本。用户已明确要求Root进入目标模式持续修复到需要用户测试，不重问三档、不设预算/死线。
+
+### 证据与修复步骤
+
+1. **场景与因果边界。** 周边空旷露天，只有平地地毯；正常前进后拉回、原地疾跑、Shift错误爬行。不是正常低顶起身。C49 scope5f26c248-311a-44cd-8c3f-329092776e99/d0w2，60条Cardinal→Free SUBDIVISION_LIMIT，rev2081位置冻结，tick19443243转rev2083完整爬行成功，随后Free→Cardinal watchdog。Docs实读standingRoom前探完整盒任意碰撞即blocked的选择机制；地毯具体箱身份和卡死全部因果尚需Root核。完成条件：实际输入、选择、accepted与失败责任串联，明确已证/待证，不把栈采样当耗时证明。
+2. **选择与合法移动。** 保留当前fit和lookahead低顶识别，区分reference局部脚部薄障碍/合法台阶、整墙与真正上部低顶。复用实际Cardinal跨步/潜行能力，不能地毯ID特判或删前探；整墙应阻挡而非自动爬，地毯应合法跨越而非提案爬行。核Shift与forcedCrawl来源，避免错误输入绕过空间判断。完成条件：空旷走/疾跑/Shift不自动爬，真实一格缝完整长胶囊可行才爬，不偷改体长/碰撞/中心。
+3. **拒绝与拉回。** 查失败转姿是否遮蔽合法Cardinal运动，修选择/调度责任；保留失败状态与cause，不伪APPLIED或在未验证路径移动。完成条件：源码说明合法运动如何避免同失败提案长期冻结，并保留真实障碍拒绝。
+4. **弧线耗时独立修复。** Root只读补证：GenericArcPlaneReceipt eligible/matches反复source.valid，validator region×obstacle issue/matches重复；movement source.valid→matchesBound→Resolved.matches再递归source.valid且segments×boxes扫描queries/support/planes。存在重复谱系结构校验机制，规模及主导耗时待核，不能凭单个stream定首因。优先采用更窄修复：Root核Resolved构造已List.copyOf，可按tube/capture/ordinal/obstacle严格身份建不可变证据索引，消除每box遍历全queries，仍核原始证书与current；PathCertified/axis/support已满足时按原OR语义短路boundary分支，actualFit仍必需。先索引与等价短路并核重复源链，再必要时分离单次调用不可变proof结构验证与callback后current/world围栏；requireCurrent含可重入虚getter，绝不缓存valid=true或owner/current结论。；复用严格限定原transaction/lifetime/代次及真实依赖，回调失效必须重验，不能跨代缓存。完成条件：说明原重复工作的触发/增长机制和修后工作边界，完整路径/目标/世界有效性仍成立；不能加预算拒移、扩大上限、关watchdog或吞异常。入口修好不能替代此链闭合。
+5. **定向静态验证。** 露天地毯走/疾跑/Shift、整墙/合法台阶、真低顶进入/受阻起身/开阔起身与受影响非Y路径为必要检查集；复用有效证据，不扩测试矩阵。稳定seam回归源码可补但NOT_RUN。Free沿既有服务端权威输入/呈现、Cardinal Ready rearm，不新增完整Free predictor门槛。完成条件：每个修改机制有源码/结构依据，Java25 no-test构建及所影响ABI/refmap/协议静态检查完成，未执行不写passed。
+6. **保存与用户验收。** 保存必要源码增量/配置依赖/未跟踪输入、提交push与回读、实际配套版本/安装JAR SHA及恢复验证，冻结C49不改。完成到可安装新候选和最小复测步骤即WAIT_USER_TEST，用户运行NG未实测不关闭。用户先原露天地毯路线，再实际低顶/非Y相邻回归；原GL诊断NG保留，不扩阴影重做。不得只交诊断或计划。
+
+### 可直接用于Root create_goal的完整objective
+
+继续本项目已确认范围，Root唯一产品源码writer，立即在本会话调用create_goal建立本轮修复目标，不设token/time预算或死线、不重问三档。修复C49露天地毯场景的反复拉回、错误自动爬行及随后Free→Cardinal弧线验证服务端卡死，持续到新的、可恢复且可安装的配套候选和最小用户复测步骤；候选保存完成可WAIT_USER_TEST，不能标运行OK。用户权威场景是周边空旷露天、平地只有地毯：正常前进后被拉回地毯前、原地疾跑、按Shift错误进入爬行；没有低顶或狭缝，不应自动爬行。真实一格高裂缝在完整长胶囊可容纳时仍须自动爬行，低顶不得强站，非Y/游泳/模型/眼点/远端既有合同保留。
+以既有docs/repair-plans/prone-free-swimming-plan-20261017.md最上方“C49露天地毯运行NG修复”及原推进账本为权威增量，C49冻结不改。证据：UG0.1.16提交76465d32baa11e2ba4ab36e4c5d004f7b578dbe8，UIE0.8.17提交6931bf7d8b7d23eb23459435a7b46411bd4615ed；scope5f26c248-311a-44cd-8c3f-329092776e99/d0w2累计60条Cardinal→Free SUBDIVISION_LIMIT，rev2081在(-0.7382374054,129,-7.3151999279)冻结；tick19443243 Shift后rev2083完整D约0.6/L约1.8 CRAWLING/APPLIED，随后Free→Cardinal弧线链watchdog超过60秒。报告crash-2026-10-29_09.43.39-server.txt，SHA256 967CAE148802A6B86ED512563FC0CA6A0D6E85915BC44523C6F8734FD5C39C42。栈Resolved.matches→CapsulePathSource.valid→GenericArcPlaneReceipt.matches→CapsuleArcValidator.validate→FreeReferenceModePrepared.prepare；实际地毯碰撞箱身份及完整耗时首因尚未单独证明。
+按顺序闭合：1复用原日志与当前源码，将实际选择输入/碰撞证据、失败提案和accepted revision串起来，必要时只加服务本故障的限频聚合诊断。2修ProneLocomotion.standingRoom/choose：前方完整站盒碰撞不能等同低顶；复用现有真实站立/潜行、支撑与合法跨步能力，依据当前reference局部几何区分脚下薄障碍/可跨台阶、普通墙体和真实低顶；不能仅按地毯ID特判、删前探、关自动爬行或未证明位移抬高身体。Shift在空旷平地应按既有正常潜行处理，核forcedCrawl输入来源不能绕过修正。真正低顶且完整爬行路径/目标可行才自动转姿。3查反复失败提案为何遮蔽合法Cardinal行走/跨步和长期冻结accepted；修责任选择/调度，在既有路径证明和真实碰撞下推进，不伪APPLIED、不忽略障碍、不盲目重试同一失效证明。4独立定位恢复弧线算法耗时：跟踪actual candidate数量、验证层次/调用次数、source/proof当前性检查的循环/重复遍历/回调/失效机制，区分瞬时栈与首因；仅在严格相同scope/tick/source/geometry依赖下复用可复用证据，保留失效重验与完整路径证明。不得凭stream栈直接优化定案，不以加预算拒移、扩大上限、关闭watchdog、跳过校验、吞异常、关功能掩盖。修入口不能替代这一链的闭合。5做修改范围内源码与静态验证，覆盖露天地毯正常走/疾跑/Shift、普通墙/合法台阶、真实低顶入爬/受阻起身/开阔起身及受影响非Y参考；稳定seam可补真实回归源码但NOT_RUN，禁止自动执行测试。复用仍有效证据，不重跑无关矩阵、不新增完整Free predictor。6按实际变更执行现有Java25 no-test构建、最终ABI/refmap/协议/配套版本与产物静态核验，保存提交并push/readback、必要dirty/untracked输入、依赖配置、源码增量恢复验证、安装包及SHA与限制。只打包实际改动所需配套，上一C49保留。
+复用现有canonical环境；所有构建产物只到D:/WI - Dev Workspace/UniversalGravitation-src/UniversalGravitation/build，缓存沿C:/GradleCaches。无新副本/实例/缓存/管理台账，不新派源码writer，只有现有原方案/账本增量。用户负责运行验收：不得自动unit/native/check测试、游戏/专服/JVM或GL探针、模拟输入、安装重启；授权Java25 no-test构建例外保持。GL原NG仍OPEN且诊断证据保留，本轮不另扩阴影方案。若缺少必须由用户提供的运行事实，先完成不依赖该事实的修复/静态工作并具体说明缺口，不编造通过。最终报告确切候选路径/版本/SHA、已修机制及证据层级、未执行运行项，并让用户先原露天地毯路线再真实低顶/非Y相邻路径复测；持续至此，不止于计划或仅诊断。
+
+
 ## 当前权威范围：AQUA_RETAINED_MIXIN_TAKEOVER_SWIM_CRAWL（2026-10-29，ACTIVE）
 
 **scope时序后续闭合（Root提供精确SOURCE/静态证据）：**UIE MixinRenderPlayerFlightRoll.nfrUi$renderWithSampledBodyPose以withSampledPose先activate后包住整个RenderPlayer.doRender original.call；nativePreview提前返回保持不介入。实际Cleanroom0.6.8 patched RenderPlayer.doRender offset85进入RenderLivingBase.doRender，后者offset3构造Pre/19 post，处于该scope内。local SixDofBodyPresentation.sampleFree及remote sampleOnRenderThread均withGeometry，Cardinal既有box geometry。Root已用UG重写后的实际0.6.8 classpath复核，早先临时0.6.13不作为installed基线。该必要时序gate按Root精确证据闭合，Docs未独立重复解析；当前不再保留它为未解项。剩余最终版本配对/静态核验及候选恢复保存按Root推进，40107构建运行中，运行验收仍OPEN。

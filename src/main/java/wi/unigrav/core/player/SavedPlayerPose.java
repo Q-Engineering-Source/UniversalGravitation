@@ -30,7 +30,7 @@ record SavedPlayerPose(UUID player, UUID world, int dimension, Kind kind, Option
         if (tag.getString("kind").length() > 8) throw new IllegalArgumentException("Oversized pose history kind");
         Kind kind = Kind.valueOf(tag.getString("kind"));
         Optional<CardinalFrame> reference = Optional.empty();
-        if (kind != Kind.FREE) {
+        if (kind != Kind.FREE && (kind == Kind.CARDINAL || tag.hasKey("reference"))) {
             require(tag, "reference", 8);
             if (tag.getString("reference").length() > 5) throw new IllegalArgumentException("Oversized pose history reference");
             reference = Optional.of(CardinalFrame.valueOf(tag.getString("reference")));

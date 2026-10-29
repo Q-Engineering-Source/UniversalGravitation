@@ -2641,6 +2641,7 @@ public final class PlayerPhysicsServer {
         private PlayerEnvironmentSampler.InitializationReference initializationReference;
         private Vec3 initializationReferencePoint;
         private CardinalFrame selectionFrame;
+        private Optional<CardinalFrame> selectionReference;
         private boolean standingBlocked;
         private Optional<PlayerBodyShape.PronePose> selectedPose;
         private boolean mutating, installed, published;
@@ -2731,7 +2732,7 @@ public final class PlayerPhysicsServer {
 
         private Optional<PlayerBodyShape.PronePose> selectPose(boolean water) {
             // No currently accepted swim state exists at first ownership. Historical SWIMMING is not permission.
-            return ProneLocomotion.selectPose(session.player, input, Optional.empty(), selectionFrame,
+            return ProneLocomotion.selectPose(session.player, input, Optional.empty(), selectionReference,
                     flightSelected(), water, session.player.isSprinting(), standingBlocked);
         }
 
@@ -2743,6 +2744,7 @@ public final class PlayerPhysicsServer {
                 reference = observeInitializationReference(free);
             }
             // This placeholder is never published as reference when the current field has none.
+            selectionReference = reference;
             selectionFrame = reference.orElse(CardinalFrame.Y_POS);
             var look = saved.kind() == SavedPlayerPose.Kind.CRAWLING || saved.kind() == SavedPlayerPose.Kind.SWIMMING
                     ? saved.attitude().basisY() : saved.attitude().basisZ().multiply(-1);
@@ -2753,11 +2755,10 @@ public final class PlayerPhysicsServer {
             // Finite mode fixed point: each distinct current candidate gets its own full fit and actual-fluid scan.
             while (visited.add(new Selection(reference, selectedPose))) {
                 if (selectedPose.isPresent()) {
-                    if (reference.isEmpty())
-                        throw new InitializationDeferred("current-prone-mode-needs-a-proven-reference");
                     var pose = selectedPose.orElseThrow();
                     boolean sameMode = saved.kind().name().equals(pose.kind().name());
-                    var q = sameMode ? saved.attitude() : ProneLocomotion.attitude(look, saved.attitude(), pose);
+                    var q = sameMode ? saved.attitude() : ProneLocomotion.attitude(look, saved.attitude(), pose,
+                            saved.kind() == SavedPlayerPose.Kind.CRAWLING || saved.kind() == SavedPlayerPose.Kind.SWIMMING);
                     target = freeTarget(q, selectedPose);
                 } else target = standing == null ? freeTarget(saved.attitude(), Optional.empty()) : standing;
                 environmentPose = CapsulePlacementMath.pose(target, resources.numeric());
@@ -2772,6 +2773,7 @@ public final class PlayerPhysicsServer {
                     var targetReference = observeInitializationReference(target);
                     if (!targetReference.equals(reference)) {
                         reference = targetReference;
+                        selectionReference = reference;
                         selectionFrame = reference.orElse(CardinalFrame.Y_POS);
                         standing = prepareStanding(reference, look);
                         selectedPose = selectPose(environment.inWater());

@@ -406,7 +406,8 @@ public final class PlayerPosePersistence {
             tag.setString("reference", cardinal.frame().name());
         } else if (placement.shape() instanceof PlayerBodyShape.FreeCapsule free) {
             tag.setString("kind", free.pronePose().map(p -> p.kind().name()).orElse("FREE"));
-            free.pronePose().ifPresent(p -> tag.setString("reference", p.referenceFrame().name()));
+            free.pronePose().flatMap(PlayerBodyShape.PronePose::referenceFrame)
+                    .ifPresent(frame -> tag.setString("reference", frame.name()));
             tag.setDouble("diameter", free.collisionProfile().diameter());
             tag.setDouble("length", free.collisionProfile().length());
             putVector(tag, "storedHalfLine", placement.storedCapsuleGeometry().storedHalfLine());

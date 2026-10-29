@@ -1267,7 +1267,7 @@ public final class PlayerPhysicsProtocol {
                 putRawVector(out, body.eyeCenter()); putRawVector(out, body.worldEye());
                 putRawQuaternion(out, body.eyeAttitude());
                 body.pronePose().ifPresent(pose -> out.put((byte) pose.kind().ordinal())
-                        .put((byte) pose.referenceFrame().ordinal()));
+                        .put((byte) pose.referenceFrame().map(Enum::ordinal).orElse(255).intValue()));
             });
         } else {
             throw new IllegalArgumentException("Unsupported physical-state placement shape");
@@ -1337,10 +1337,10 @@ public final class PlayerPhysicsProtocol {
             Optional<PlayerBodyShape.PronePose> prone = Optional.empty();
             if (placementTag == PRONE_FREE_CAPSULE_PLACEMENT_TAG) {
                 int kind = Byte.toUnsignedInt(in.get()), frame = Byte.toUnsignedInt(in.get());
-                if (kind >= PlayerBodyShape.PronePose.Kind.values().length || frame >= CardinalFrame.values().length)
+                if (kind >= PlayerBodyShape.PronePose.Kind.values().length || frame != 255 && frame >= CardinalFrame.values().length)
                     throw new IllegalArgumentException("Unknown prone body kind/reference frame");
                 prone = Optional.of(new PlayerBodyShape.PronePose(PlayerBodyShape.PronePose.Kind.values()[kind],
-                        CardinalFrame.values()[frame]));
+                        frame == 255 ? Optional.empty() : Optional.of(CardinalFrame.values()[frame])));
             }
             body = Optional.of(new FreeCapsulePlacementV1.BodyProfile(diameter, length, recipe,
                     eyeCenter, worldEye, eyeAttitude, prone));

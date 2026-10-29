@@ -547,7 +547,7 @@ public final class PlayerPhysicsStep {
         ProneLocomotion.WaterMotion waterMotion = water && !propulsion && !flying
                 && !travel.mobility.blocksCapture()
                 ? ProneLocomotion.waterMotion(transaction, controls, velocity,
-                        pronePose.map(PlayerBodyShape.PronePose::referenceFrame).orElse(CardinalFrame.Y_POS)) : null;
+                        ProneLocomotion.waterUp(accepted.placement())) : null;
         if (waterMotion != null) velocity = waterMotion.velocity();
         // Unattached Survival has no propulsion authority. Translation input cannot create thrust;
         // equipment-backed propulsion remains deferred, independently of raw force or personal G.
@@ -571,11 +571,11 @@ public final class PlayerPhysicsStep {
             transaction.requireCurrent();
             try {
                 if (pronePose.isPresent()) {
-                    var referenceFrame = pronePose.orElseThrow().referenceFrame();
-                    if (ProneLocomotion.bellySupported(transaction, sample.observation(), referenceFrame)) {
+                    var supportUp = ProneLocomotion.supportUp(accepted.placement());
+                    if (ProneLocomotion.bellySupported(transaction, sample.observation(), supportUp)) {
                         double target = actor.getAIMoveSpeed() / dt * .3;
                         transaction.requireCurrent();
-                        var gait = FreeNearFootDrive.gait(velocity, controls.translation(), referenceFrame.up(),
+                        var gait = FreeNearFootDrive.gait(velocity, controls.translation(), supportUp,
                                 target, ZERO_G_WALK_ACCELERATION * dt);
                         velocity = gait.velocity();
                         nearFootActiveDrive = gait.activeDrive();

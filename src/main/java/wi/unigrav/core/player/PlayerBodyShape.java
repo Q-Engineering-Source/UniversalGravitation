@@ -69,8 +69,11 @@ public sealed interface PlayerBodyShape {
 
     /** A capsule whose long axis follows the independently accepted body attitude. */
     /** Locomotion semantics are independent of FREE geometry and the backpack's flight capability. */
-    record PronePose(Kind kind, CardinalFrame referenceFrame) {
+    record PronePose(Kind kind, Optional<CardinalFrame> referenceFrame) {
         public enum Kind { CRAWLING, SWIMMING }
+        public PronePose(Kind kind, CardinalFrame referenceFrame) {
+            this(kind, Optional.of(referenceFrame));
+        }
         public PronePose {
             Objects.requireNonNull(kind, "kind");
             Objects.requireNonNull(referenceFrame, "referenceFrame");

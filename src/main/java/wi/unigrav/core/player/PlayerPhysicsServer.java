@@ -2907,7 +2907,7 @@ public final class PlayerPhysicsServer {
             for (NetworkManager manager : capabilities.keySet().toArray(NetworkManager[]::new)) {
                 var capability = capabilities.get(manager);
                 if (capability.retired || !manager.isChannelOpen()) {
-                    retire(manager);
+                    retire(manager, !manager.isChannelOpen());
                     capabilities.remove(manager);
                     continue;
                 }
@@ -6600,21 +6600,26 @@ public final class PlayerPhysicsServer {
     @SubscribeEvent
     public void onLogin(PlayerEvent.PlayerLoggedInEvent event) {
         retirePlayer(event);
+        if (event.player instanceof EntityPlayerMP player) PlayerPosePersistence.retain(player, null);
     }
 
     @SubscribeEvent
     public void onRespawn(PlayerEvent.PlayerRespawnEvent event) {
         retirePlayer(event);
+        if (event.player instanceof EntityPlayerMP player) PlayerPosePersistence.retain(player, null);
     }
 
     @SubscribeEvent
     public void onDimensionChange(PlayerEvent.PlayerChangedDimensionEvent event) {
         retirePlayer(event);
+        if (event.player instanceof EntityPlayerMP player) PlayerPosePersistence.retain(player, null);
     }
 
     @SubscribeEvent
-    public void onLogout(PlayerEvent.PlayerLoggedOutEvent event) {
-        retirePlayer(event);
+    public synchronized void onLogout(PlayerEvent.PlayerLoggedOutEvent event) {
+        for (Session session : sessions.values().toArray(Session[]::new)) {
+            if (session.player == event.player) retire(session.manager, true);
+        }
     }
 
     private synchronized void retirePlayer(PlayerEvent event) {
@@ -6625,10 +6630,25 @@ public final class PlayerPhysicsServer {
     }
 
     @SubscribeEvent
+    public void onWorldLoad(WorldEvent.Load event) {
+        if (event.getWorld() instanceof WorldServer world) initializePoseWorldIdentity(world);
+    }
+
+    private static void initializePoseWorldIdentity(WorldServer world) {
+        try {
+            PlayerPoseWorldIdentity.initialize(world);
+        } catch (RuntimeException failure) {
+            UnigravMod.LOGGER.error("UG pose history unavailable: world identity initialization failed, dimension={}",
+                    world.provider.getDimension(), failure);
+        }
+    }
+
+    @SubscribeEvent
     public synchronized void onWorldUnload(WorldEvent.Unload event) {
         for (Session session : sessions.values().toArray(Session[]::new)) {
             if (session.world == event.getWorld()) retire(session.manager);
         }
+        if (event.getWorld() instanceof WorldServer world) PlayerPoseWorldIdentity.forget(world);
     }
 
     public synchronized void stop() {
@@ -6636,7 +6656,49 @@ public final class PlayerPhysicsServer {
         capabilities.clear();
     }
 
+    /** Save observation only; disconnected channels may still have an exact final committed actor. */
+    synchronized PlayerPosePersistence.RetainedPose poseForSave(EntityPlayerMP player) {
+        if (player.connection == null || !(player.world instanceof WorldServer world)) return null;
+        if (!world.isCallingFromMinecraftThread())
+            throw new IllegalStateException("Player pose save observation requires the world thread");
+        if (NativePlayerMovement.INSTANCE.forceMutationActive(player)) return null;
+        Session session = sessions.get(player.connection.netManager);
+        if (session == null)
+            return player instanceof PlayerPosePersistence.Carrier carrier ? carrier.unigrav$retainedSavePose() : null;
+        if (session.player != player || session.handler != player.connection
+                || session.world != world || session.scope.dimension() != player.dimension
+                || !session.scope.playerId().equals(player.getUniqueID()) || player.isDead) return null;
+        Owned owner = session.owner;
+        if (owner == null || owner.nativeDelegated || owner.teleportPending || owner.nativeRestorePending
+                || owner.recoveryPending || owner.recoveryAwaitingApply || owner.recoveryAwaitingMirror
+                || owner.recoveryTerminal || owner.nativeEnvironmentFailure != null || owner.poseDepth != 0
+                || nativeEnvironmentScope != null
+                || owner.pendingCardinalPose != null || FreeOwnerTransaction.nativeInstallation(player) != null) return null;
+        var snapshot = owner.snapshot;
+        long correction = owner.travel.correctionRevision();
+        if (!matchesPhysicalGeometry(player, snapshot) || sessions.get(session.manager) != session
+                || session.owner != owner || owner.snapshot != snapshot
+                || owner.travel.correctionRevision() != correction || owner.teleportPending
+                || owner.pendingCardinalPose != null || owner.poseDepth != 0) return null;
+        return new PlayerPosePersistence.RetainedPose(player.connection, world, snapshot);
+    }
+
     private void retire(NetworkManager manager) {
+        retire(manager, false);
+    }
+
+    private void retire(NetworkManager manager, boolean logoutSave) {
+        Session retiring = sessions.get(manager);
+        if (retiring != null) {
+            PlayerPosePersistence.RetainedPose retained = null;
+            try {
+                if (logoutSave) retained = poseForSave(retiring.player);
+            } catch (RuntimeException failure) {
+                UnigravMod.LOGGER.error("UG pose-save observation failed before retirement: player={}, scope={}",
+                        retiring.player.getUniqueID(), retiring.scope, failure);
+            }
+            PlayerPosePersistence.retain(retiring.player, retained);
+        }
         Session old = sessions.remove(manager);
         if (old != null) {
             if (old.scopeHandle != null) {

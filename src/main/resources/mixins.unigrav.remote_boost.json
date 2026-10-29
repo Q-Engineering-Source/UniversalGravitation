@@ -14,6 +14,7 @@
     "BlockSlimePhysicsMixin",
     "EntityVelocityPhysicsMixin",
     "EntityBodyProfileMixin",
+    "PlayerPosePersistenceMixin",
     "ExplosionPhysicsMixin",
     "EntityLivingBasePhysicsMixin",
     "EntityNativeEnvironmentMixin",

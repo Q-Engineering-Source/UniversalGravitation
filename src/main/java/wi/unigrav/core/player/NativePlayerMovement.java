@@ -114,6 +114,11 @@ public final class NativePlayerMovement {
         return new ForceMutation(player);
     }
 
+    /** A save cannot observe a retired pose halfway through a binder mutation. */
+    synchronized boolean forceMutationActive(EntityPlayerMP player) {
+        return forceMutations.containsKey(player);
+    }
+
     /** Thread-confined mutation marker, not a movement lease or a callback executor. */
     public final class ForceMutation implements AutoCloseable {
         private final EntityPlayerMP player;
@@ -145,6 +150,8 @@ public final class NativePlayerMovement {
                 if (remaining == 0) forceMutations.remove(player);
                 else forceMutations.put(player, remaining);
                 if (changed) {
+                    // Only the volatile historical-save carrier is invalidated; no native geometry/world access.
+                    PlayerPosePersistence.retain(player, null);
                     for (Lifetime lifetime : lifetimes.values()) {
                         if (lifetime.player != player) continue;
                         lifetime.centers.clear();

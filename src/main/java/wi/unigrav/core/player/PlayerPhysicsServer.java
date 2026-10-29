@@ -577,6 +577,16 @@ public final class PlayerPhysicsServer {
         return player.connection != null && player.connection.player == player && accepted(player.connection).isPresent();
     }
 
+    public synchronized Optional<PlayerPhysicalSnapshot> ownedPhysicalBody(EntityPlayerMP player) {
+        if (!drivesMotion(player) || PlayerKinematics.requiresNative(player)) return Optional.empty();
+        var installed = FreeOwnerTransaction.nativeInstallation(player);
+        if (installed != null) {
+            installed.transaction().requireOwnerFence();
+            return Optional.of(installed.journal());
+        }
+        return accepted(player.connection);
+    }
+
     public synchronized boolean drivesMotion(EntityPlayerMP player) {
         if (player == null || player.connection == null || player.connection.player != player) return false;
         Session session = sessions.get(player.connection.netManager);
@@ -1551,7 +1561,7 @@ public final class PlayerPhysicsServer {
         private final long proposal;
         private final PlayerBodyShape.Dimensions retained;
         private final PlayerBodyShape.Dimensions desired;
-        private final NativePoseProfile profile;
+        private NativePoseProfile profile;
         private RuntimeException failure;
 
         private PendingCardinalPose(Session session, Owned owner, PlayerBodyShape.Dimensions retained,
@@ -1579,12 +1589,56 @@ public final class PlayerPhysicsServer {
             return matches && current() && Float.floatToIntBits(session.player.eyeHeight) == profile.rawEye();
         }
 
+        /**
+         * Movement owns these two flags. Advancing them does not re-author a blocked resize:
+         * its retained/desired geometry, eye producer, scale and lifecycle must stay exact.
+         * Aqua's subsequent pose callback still has to produce and admit any new dimensions.
+         */
+        void applyOwnedFlags(EntityPlayerMP actor, boolean sneaking, boolean clearGliding) {
+            if (actor != session.player || !nativeProfileCurrent())
+                throw new IllegalStateException("Pending pose is stale before owned flag update: " + diagnostic(actor));
+            NativePoseProfile expected = new NativePoseProfile(profile.rawEye(), sneaking,
+                    profile.sleeping(), clearGliding ? false : profile.gliding(),
+                    profile.widthScale(), profile.heightScale());
+            actor.setSneaking(sneaking);
+            if (clearGliding) actor.clearElytraFlying();
+            NativePoseProfile observed = NativePoseProfile.read(actor);
+            if (!current() || !expected.equals(observed))
+                throw new IllegalStateException("Owned pose flag update changed another native producer: expected="
+                        + expected + "; " + diagnostic(actor));
+            profile = expected;
+        }
+
+        String diagnostic(EntityPlayerMP actor) {
+            return "scope=" + scope + "; ownerRevision=" + owner.snapshot.revision()
+                    + "; current=" + current() + "; expectedProfile=" + profile
+                    + "; observedProfile=" + NativePoseProfile.read(actor)
+                    + "; retained=" + retained + "; desired=" + desired
+                    + "; observedWidth=" + actor.width + "; observedHeight=" + actor.height
+                    + "; observedEffectiveEye=" + actor.getEyeHeight();
+        }
+
         boolean allowsInstallationEye(EntityPlayerMP actor, PlayerPhysicalSnapshot.Scope candidateScope,
                 PlayerBodyPlacement placement, int observedEye) {
             return actor == session.player && scope.equals(candidateScope)
                     && placement.shape() instanceof PlayerBodyShape.Cardinal
                     && (placement.shape().dimensions().equals(retained) || placement.shape().dimensions().equals(desired))
                     && observedEye == Float.floatToIntBits((float) desired.eyeHeight()) && nativeProfileCurrent();
+        }
+
+        /** Only the exact retained Cardinal source can hand its pending native eye to a proved prone body. */
+        boolean allowsProneSuccessor(EntityPlayerMP actor, PlayerPhysicalSnapshot source,
+                PlayerBodyPlacement target, int observedEye) {
+            if (actor != session.player || source != owner.snapshot || !scope.equals(source.scope())
+                    || !(source.placement().shape() instanceof PlayerBodyShape.Cardinal)
+                    || !source.placement().shape().dimensions().equals(retained)
+                    || !(target.shape() instanceof PlayerBodyShape.FreeCapsule free) || free.pronePose().isEmpty()) return false;
+            var dimensions = free.dimensions();
+            return Float.floatToIntBits((float) dimensions.width()) == Float.floatToIntBits((float) retained.width())
+                    && Float.floatToIntBits((float) dimensions.height()) == Float.floatToIntBits((float) retained.height())
+                    && observedEye == Float.floatToIntBits((float) desired.eyeHeight())
+                    && observedEye == Float.floatToIntBits((float) dimensions.eyeHeight())
+                    && nativeProfileCurrent();
         }
 
         boolean allowsEye(EntityPlayerMP actor, PlayerPhysicalSnapshot.Scope candidateScope,
@@ -5380,6 +5434,8 @@ public final class PlayerPhysicsServer {
                 return;
             }
             owner.snapshot = installed;
+            if (installed.placement().shape() instanceof PlayerBodyShape.FreeCapsule
+                    && owner.pendingCardinalPose == pendingBefore) owner.pendingCardinalPose = null;
             owner.nativeCardinalMotion = continueMotion ? predecessorMotion.withSnapshot(installed) : null;
             if (eyeCompletion.isPresent()) {
                 rebaseInstalledPhysicalResizeIntent(owner, before, installed, eyeCompletion.orElseThrow(),

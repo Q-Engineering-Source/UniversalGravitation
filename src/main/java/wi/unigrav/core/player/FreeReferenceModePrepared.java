@@ -128,6 +128,7 @@ final class FreeReferenceModePrepared {
         private final double centerPathUpper;
         private final CapsuleMovementResolver.Resolved movement;
         private final ReferenceEvaluation endpointReference;
+        private final ProneLocomotion.StandingProfile standingProfile;
 
         private Prepared(FreeOwnerTransaction transaction, SourceObservation sourceObservation,
                 PlayerBodyReference.FreeReference sourceReference, PlayerBodyReference.ManualIntent pendingManual,
@@ -135,7 +136,8 @@ final class FreeReferenceModePrepared {
                 PlayerPhysicalSnapshot source, PlayerBodyPlacement targetCapsule,
                 PlayerBodyPlacement targetCardinal, WorldCollisionCandidates.Snapshot capture, Aabb globalWindow,
                 CapsulePathSource lineage, List<PhaseProof> phases, NativeTargetFit.Observed nativeFit,
-                double centerPathUpper, CapsuleMovementResolver.Resolved movement, ReferenceEvaluation endpointReference) {
+                double centerPathUpper, CapsuleMovementResolver.Resolved movement, ReferenceEvaluation endpointReference,
+                ProneLocomotion.StandingProfile standingProfile) {
             this.transaction = transaction;
             this.sourceObservation = sourceObservation;
             this.sourceReference = sourceReference;
@@ -153,6 +155,7 @@ final class FreeReferenceModePrepared {
             this.centerPathUpper = centerPathUpper;
             this.movement = movement;
             this.endpointReference = endpointReference;
+            this.standingProfile = standingProfile;
         }
 
         FreeOwnerTransaction transaction() { return transaction; }
@@ -168,6 +171,8 @@ final class FreeReferenceModePrepared {
             return endpointReference == null ? null : endpointReference.proposal();
         }
         void requireReferenceSourcesAfterInstall() {
+            if (standingProfile != null && !standingProfile.current())
+                throw new IllegalStateException("Installed prone standing profile changed during callbacks");
             if (trustedResize != null && !trustedResize.bodyProfileCurrent())
                 throw new IllegalStateException("installed reference resize physical profile changed during callbacks");
             transaction.requireCurrent();
@@ -233,6 +238,8 @@ final class FreeReferenceModePrepared {
                     || travel.pendingManualIntent().orElse(null) != pendingManual) return false;
             transaction.requireCurrent();
             boolean matches = (trustedResize == null || transaction.authorizesTrustedResize(trustedResize))
+                    && (standingProfile == null || standingProfile.current()
+                        && targetCardinal.shape().dimensions().equals(standingProfile.dimensions()))
                     && sourceObservation.matches(transaction) && lineage.valid() && lineage.current()
                     && (endpointReference == null || endpointReference.proposal().current()
                         && endpointReference.observation().matches(transaction))
@@ -321,8 +328,10 @@ final class FreeReferenceModePrepared {
                     return unavailable("native restore profile changed accepted Free collider dimensions",
                             BodyReferenceReason.NATIVE_CORRECTION_UNCLASSIFIED);
             }
+            var standingProfile = trustedResize == null && nativeProfile == null
+                    ? ProneLocomotion.standingProfile(transaction) : null;
             CapturePlanning planning = previewCapture(accepted, trustedResize, frame, translationDelta,
-                    nativeProfile, numeric);
+                    nativeProfile, standingProfile, numeric);
             if (planning instanceof Unavailable failure) return failure;
             CapturePlan plan = (CapturePlan) planning;
             Pose startPose = plan.startPose();
@@ -478,7 +487,7 @@ final class FreeReferenceModePrepared {
             return new Prepared(transaction, sourceObservation, sourceReference, pendingManual, trustedResize,
                     selection, accepted,
                     terminal, targetCardinal, capture, globalWindow, lineage, phases, observed, centerPathUpper, movement,
-                    endpointReference);
+                    endpointReference, standingProfile);
         } catch (RuntimeException failure) {
             return new Unavailable("Free-to-Cardinal preparation failed at the owner boundary",
                     BodyReferenceReason.WORLD_UNAVAILABLE, Optional.of(failure));
@@ -488,12 +497,13 @@ final class FreeReferenceModePrepared {
     static CapturePlanning previewCapture(PlayerPhysicalSnapshot accepted,
             ModeTransitionPrepared.TrustedResizeObservation trustedResize, CardinalFrame frame,
             Vec3d translationDelta, StoredDyadic.Work numeric) {
-        return previewCapture(accepted, trustedResize, frame, translationDelta, null, numeric);
+        return previewCapture(accepted, trustedResize, frame, translationDelta, null, null, numeric);
     }
 
     private static CapturePlanning previewCapture(PlayerPhysicalSnapshot accepted,
             ModeTransitionPrepared.TrustedResizeObservation trustedResize, CardinalFrame frame,
             Vec3d translationDelta, PlayerBodyShape.Dimensions nativeProfile,
+            ProneLocomotion.StandingProfile standingProfile,
             StoredDyadic.Work numeric) {
         Objects.requireNonNull(accepted, "accepted");
         Objects.requireNonNull(frame, "frame");
@@ -527,7 +537,8 @@ final class FreeReferenceModePrepared {
             windows.add(resized.bounds());
         }
         PlayerBodyShape.Dimensions targetDimensions = trustedResize != null
-                ? trustedResize.dimensions() : nativeProfile != null ? nativeProfile : freeShape.dimensions();
+                ? trustedResize.dimensions() : nativeProfile != null ? nativeProfile
+                : standingProfile != null ? standingProfile.dimensions() : freeShape.dimensions();
         if (nativeProfile != null
                 && (!nativeProfile.supportsCapsule()
                     || Float.floatToIntBits((float) nativeProfile.width())

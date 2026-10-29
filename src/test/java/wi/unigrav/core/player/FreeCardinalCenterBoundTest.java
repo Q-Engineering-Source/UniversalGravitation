@@ -6,6 +6,29 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
 class FreeCardinalCenterBoundTest {
+    @Test void proneBellyAnchorAndNativeCenterCorrectionUseTheSameSupportPlane() {
+        var dimensions = new PlayerBodyShape.Dimensions(.5, 2, 1.75);
+        var center = new Vec3d(16, 4, -.0625);
+        var q = CardinalFrame.Z_POS.attitude();
+        for (var frame : CardinalFrame.values()) {
+            var work = new StoredDyadic.Work();
+            var shape = new PlayerBodyShape.FreeCapsule(dimensions,
+                    new PlayerBodyShape.CollisionProfile(.5, 2), java.util.Optional.of(
+                        new FreeEyeAnchor(FreeEyeAnchor.STORED_BASIS_V1, center, center, q)),
+                    java.util.Optional.of(new PlayerBodyShape.PronePose(PlayerBodyShape.PronePose.Kind.CRAWLING, frame)));
+            var start = new PlayerBodyPlacement(center, q, shape);
+            var bound = FreeCardinalCenterBound.prepare(start, frame, dimensions, .125, work);
+            for (var offset : new Vec3d[] {new Vec3d(0, 0, 0), new Vec3d(.125, 0, 0),
+                    new Vec3d(0, -.125, 0), new Vec3d(0, 0, .125)}) {
+                var moved = start.withTranslatedCenter(center.add(offset));
+                var foot = PlayerBodyPlacement.proneSupportFoot(moved, frame, work);
+                var target = PlayerBodyPlacement.cardinalFromAcceptedFreeDesiredFoot(moved, frame, dimensions, work);
+                assertEquals(foot, target.physicalFeet().orElseThrow());
+                assertTrue(CapsulePlacementMath.monotoneCenterTravelUpper(moved.center(), target.center(), work)
+                        <= bound.correctionUpper(), () -> frame + " -> " + bound);
+            }
+        }
+    }
     @Test void boundContainsActualDesiredFootRecipeForAllSignedFramesAndTranslatedStoredGeometry() {
         var dimensions = new PlayerBodyShape.Dimensions((double) .6F, (double) 1.8F, (double) 1.62F);
         for (CardinalFrame sourceFrame : CardinalFrame.values()) {

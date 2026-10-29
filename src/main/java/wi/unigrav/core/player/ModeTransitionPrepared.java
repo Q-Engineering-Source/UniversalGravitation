@@ -28,7 +28,7 @@ final class ModeTransitionPrepared {
     private static final int ARC_CAPTURE_WINDOW_WORK = 256;
     private static final int RESIZE_CAPTURE_WINDOW_WORK = 256;
 
-    sealed interface Request permits PlayerAttitudeRequest, MobilityTransitionRequest {
+    sealed interface Request permits PlayerAttitudeRequest, MobilityTransitionRequest, ProneTransitionRequest {
         Rotation3d rawDesiredQ();
     }
 
@@ -37,7 +37,7 @@ final class ModeTransitionPrepared {
     record RetainedAttitude(Prepared prepared, String rejection) implements Preparation {
         RetainedAttitude {
             Objects.requireNonNull(prepared); Objects.requireNonNull(rejection);
-            if (!(prepared.request() instanceof PlayerAttitudeRequest)
+            if (!(prepared.request() instanceof PlayerAttitudeRequest || prepared.request() instanceof ProneTransitionRequest)
                     || !sameRawAttitude(prepared.source().placement().attitude(), prepared.target().attitude())
                     || prepared.phases().stream().anyMatch(phase -> phase instanceof ArcPhase))
                 throw new IllegalArgumentException("retained attitude must preserve its exact accepted orientation");
@@ -95,8 +95,10 @@ final class ModeTransitionPrepared {
         if (!(transaction.accepted().placement().shape() instanceof PlayerBodyShape.Cardinal cardinal))
             throw new IllegalArgumentException("Cardinal-to-Free prelude requires actual accepted Cardinal geometry");
         if (!isCurrentRequest(request)) throw new IllegalStateException("Cardinal-to-Free prelude request is stale");
-        var geometry = cardinalToFreeGeometry(transaction.accepted(), transaction.actor(), cardinal,
-                request.rawDesiredQ(), transaction.numeric());
+        var geometry = request instanceof ProneTransitionRequest prone
+                ? proneCardinalGeometry(transaction, cardinal, prone)
+                : cardinalToFreeGeometry(transaction.accepted(), transaction.actor(), cardinal,
+                        request.rawDesiredQ(), transaction.numeric());
         transaction.requireCurrent();
         var source = new CardinalSource(transaction, request, geometry, budgetTick);
         source.requireCurrent();
@@ -540,7 +542,7 @@ final class ModeTransitionPrepared {
                 if (!(arcResult instanceof CapsuleArcValidator.VerifiedArc arc)) {
                     var failed = (CapsuleArcValidator.Failed) arcResult;
                     String detail = arcFailureDetail(accepted, request, plan.arcTarget(), failed);
-                    if (rejectedAttitude == null && request instanceof PlayerAttitudeRequest
+                    if (rejectedAttitude == null && (request instanceof PlayerAttitudeRequest || request instanceof ProneTransitionRequest)
                             && rejectsOnlyRequestedRotation(failed)) {
                         // No path has been reserved or installed. Discard the rejected target's
                         // capture/proofs and build a complete plan at the accepted orientation.
@@ -653,9 +655,12 @@ final class ModeTransitionPrepared {
         windows.add(accepted.placement().bounds());
         // A current input can repeat the exact raw attitude. Keep its request fences, but retain
         // the accepted stored realization instead of making a new, redundant rotation proof.
-        if (request != null && !sameRawAttitude(current.attitude(), request.rawDesiredQ())) {
+        if (request != null && (!sameRawAttitude(current.attitude(), request.rawDesiredQ())
+                || request instanceof ProneTransitionRequest prone
+                    && !prone.requestedPose().equals(((PlayerBodyShape.FreeCapsule) current.shape()).pronePose()))) {
             PlayerBodyPlacement target = new PlayerBodyPlacement(current.center(), request.rawDesiredQ(),
-                    current.shape(), numeric);
+                    request instanceof ProneTransitionRequest prone
+                            ? prone.shape(current) : current.shape(), numeric);
             var path = CapsuleArcEnclosure.prepare(currentPose, target, current.bodyUp(), numeric);
             windows.add(path.allChildCaptureBounds(numeric));
             windows.add(target.bounds());
@@ -737,7 +742,7 @@ final class ModeTransitionPrepared {
         var anchor = new FreeEyeAnchor(FreeEyeAnchor.STORED_BASIS_V1, source.center(), source.eye(), source.attitude());
         return new PlayerBodyPlacement(source.center(), source.attitude(),
                 new PlayerBodyShape.FreeCapsule(dimensions, observation.bodyProfile().orElseThrow().physical(),
-                        Optional.of(anchor)), numeric);
+                        Optional.of(anchor), ((PlayerBodyShape.FreeCapsule) source.shape()).pronePose()), numeric);
     }
 
     /** Same-owner Free profile target shared by phase plans; its foot drift is bounded and then path-proved. */
@@ -842,6 +847,50 @@ final class ModeTransitionPrepared {
         return cardinalToFreeGeometry(accepted, actor, cardinal, desired, numeric).globalWindow();
     }
 
+    private static CardinalToFreeGeometry proneCardinalGeometry(FreeOwnerTransaction transaction,
+            PlayerBodyShape.Cardinal cardinal, ProneTransitionRequest request) {
+        if (request.requestedPose().isEmpty() || !request.current())
+            throw new IllegalArgumentException("Cardinal prone admission requires a current selected pose");
+        var accepted = transaction.accepted();
+        var actor = transaction.actor();
+        var numeric = transaction.numeric();
+        var observation = NativeCardinalBodyProfile.observe(transaction);
+        var physical = observation.physical();
+        if (!physical.equals(request.body().physical()))
+            throw new IllegalStateException("Prone admission changed its trusted full body profile");
+        var actual = WorldCollisionCandidates.ActorGeometry.read(actor);
+        var raw = new PlayerBodyShape.Dimensions(actual.width(), actual.height(), actor.getEyeHeight());
+        boolean shortNativeSource = raw.height() < physical.length();
+        // A pre-existing native short box carries no accepted long-axis orientation. Its first
+        // full-body representation must fit in the requested prone orientation. An existing
+        // standing long body instead starts at its accepted orientation and proves the whole arc.
+        var initialQ = shortNativeSource ? request.rawDesiredQ() : accepted.placement().attitude();
+        FreeEyeAnchor anchor;
+        if (shortNativeSource) {
+            var arithmetic = BootQueryArithmetic.fromSameWork(numeric);
+            var offset = arithmetic.subtract(arithmetic.exact(request.input().standingEyeHeight()),
+                    arithmetic.multiply(arithmetic.exact(physical.length()), arithmetic.exact(.5)));
+            var up = initialQ.basisY();
+            var center = accepted.placement().center();
+            var eye = new Vec3d(
+                    arithmetic.roundNearest(arithmetic.add(arithmetic.exact(center.x()), arithmetic.multiply(arithmetic.exact(up.x()), offset))),
+                    arithmetic.roundNearest(arithmetic.add(arithmetic.exact(center.y()), arithmetic.multiply(arithmetic.exact(up.y()), offset))),
+                    arithmetic.roundNearest(arithmetic.add(arithmetic.exact(center.z()), arithmetic.multiply(arithmetic.exact(up.z()), offset))));
+            anchor = new FreeEyeAnchor(FreeEyeAnchor.STORED_BASIS_V1, center, eye, initialQ);
+        } else anchor = new FreeEyeAnchor(FreeEyeAnchor.STORED_BASIS_V1, accepted.placement().center(),
+                accepted.placement().eye(), initialQ);
+        var shape = new PlayerBodyShape.FreeCapsule(raw, physical, Optional.of(anchor), request.requestedPose());
+        var initial = new PlayerBodyPlacement(accepted.placement().center(), initialQ, shape, numeric);
+        var target = sameRawAttitude(initialQ, request.rawDesiredQ()) ? initial
+                : new PlayerBodyPlacement(initial.center(), request.rawDesiredQ(), shape, numeric);
+        var initialPose = CapsulePlacementMath.pose(initial, numeric);
+        var targetPose = target == initial ? initialPose : CapsulePlacementMath.pose(target, numeric);
+        var arc = CapsuleArcEnclosure.prepare(initialPose, target, cardinal.frame().up(), numeric);
+        return new CardinalToFreeGeometry(initial, target, initialPose, targetPose,
+                union(accepted.placement().bounds(), initial.bounds(), arc.allChildCaptureBounds(numeric), target.bounds()),
+                actual, null, observation);
+    }
+
     private static CardinalToFreeGeometry cardinalToFreeGeometry(PlayerPhysicalSnapshot accepted,
             EntityPlayerMP actor, PlayerBodyShape.Cardinal cardinal, Rotation3d desired,
             StoredDyadic.Work numeric) {
@@ -934,7 +983,8 @@ final class ModeTransitionPrepared {
     private static boolean isCurrentRequest(Request request) {
         // The owning server closure checks exact Session/connection/scope/proposal/correction/TTL on every call.
         return request != null && request.rawDesiredQ() != null
-                && (!(request instanceof MobilityTransitionRequest mobility) || mobility.current());
+                && (!(request instanceof MobilityTransitionRequest mobility) || mobility.current())
+                && (!(request instanceof ProneTransitionRequest prone) || prone.current());
     }
 
     private static Unavailable captureUnavailable(WorldCollisionCandidates.Unavailable unavailable) {

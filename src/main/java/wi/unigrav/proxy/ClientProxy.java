@@ -13,6 +13,7 @@ import net.minecraft.entity.Entity;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.util.math.AxisAlignedBB;
 import java.util.function.BooleanSupplier;
+import wi.unigrav.core.player.PlayerPhysicalSnapshot;
 import net.minecraft.network.INetHandler;
 
 import wi.unigrav.UnigravMod;
@@ -32,6 +33,10 @@ import wi.unigrav.core.boost.BoostProtocol;
 import wi.unigrav.core.client.boost.RemoteBoostClient;
 
 public class ClientProxy extends CommonProxy {
+
+    @Override public java.util.Optional<PlayerPhysicalSnapshot> ownedPhysicalBody(EntityPlayer actor) {
+        return actor.world.isRemote ? PlayerPhysicsClient.acceptedPresentation(actor) : super.ownedPhysicalBody(actor);
+    }
 
     @Override public void runNativeEnvironment(Entity actor, Runnable original) {
         if (actor.world.isRemote && actor instanceof EntityPlayerSP player)

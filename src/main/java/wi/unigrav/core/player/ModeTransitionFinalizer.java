@@ -67,7 +67,7 @@ final class ModeTransitionFinalizer {
                     ? prepared.movement().sealForInstallation(transaction, journal) : null;
             transaction.beginInstallation(journal);
             try {
-                if (request instanceof MobilityTransitionRequest || prepared.recovery()) {
+                if (request instanceof MobilityTransitionRequest || request instanceof ProneTransitionRequest || prepared.recovery()) {
                     // Mobility changes shape, not accepted momentum. Native motion may still lag
                     // an adopted snapshot, so bind this write to the journal and its owner fence.
                     var velocity = prepared.integratedVelocity() == null
@@ -81,7 +81,7 @@ final class ModeTransitionFinalizer {
                 }
                 actor.width = (float) dimensions.width();
                 actor.height = (float) dimensions.height();
-                FreeOwnerTransaction.installEffectiveEyeHeight(actor, dimensions.eyeHeight());
+                transaction.installEffectiveEyeHeight(dimensions.eyeHeight());
                 actor.setEntityBoundingBox(new AxisAlignedBB(bounds.min().x(), bounds.min().y(), bounds.min().z(),
                         bounds.max().x(), bounds.max().y(), bounds.max().z()));
                 actor.posX = transport.x(); actor.posY = transport.y(); actor.posZ = transport.z();

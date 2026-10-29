@@ -513,6 +513,12 @@ public final class PlayerPhysicsStep {
         var sample = (PlayerEnvironmentSampler.FreeSample) sampled;
         transaction.requireCurrent();
         sample.observation().requireForceCurrent();
+        boolean water = sample.observation().environment().inWater();
+        var proneChoice = trustedResize.isPresent() ? ProneLocomotion.Choice.NONE
+                : ProneLocomotion.choose(transaction, travel, controls, water);
+        ModeTransitionPrepared.Request movementRequest = proneChoice.request()
+                .<ModeTransitionPrepared.Request>map(request -> request).orElse(attitudeRequest.orElse(null));
+        var pronePose = ((PlayerBodyShape.FreeCapsule) accepted.placement().shape()).pronePose();
         budget.advance(budgetTick);
         if (boostCarrier) applyCorridor(budget, budgetTick, accepted.placement().transport().y());
         boolean propulsion = PlayerBoostEligibility.propulsionAllowed(sample.personalZeroG(),
@@ -523,7 +529,7 @@ public final class PlayerPhysicsStep {
         boolean nativeGravity = !sample.personalZeroG() && !travel.nativeNoGravity
                 && sample.bindingMode().filter(mode -> mode == GravityMode.REPLACE).isEmpty() && !flying;
         Vec3 acceleration = travel.mobility.blocksCapture() ? sample.detachedAcceleration() : sample.environmentAcceleration();
-        if (nativeGravity) acceleration = acceleration.add(new Vec3(0, -32, 0));
+        if (nativeGravity) acceleration = acceleration.add(new Vec3(0, water ? -8 : -32, 0));
         Vec3d acceptedVelocity = accepted.worldVelocity();
         Vec3 velocity = new Vec3(acceptedVelocity.x(), acceptedVelocity.y(), acceptedVelocity.z());
         double dt = GravityEntityBinder.TICK_SECONDS;
@@ -538,6 +544,11 @@ public final class PlayerPhysicsStep {
         if (rawNativeGravity) rawAcceleration = rawAcceleration.add(new Vec3(0, -32, 0));
         PropulsionMotion propulsionMotion = propulsion ? freePropulsionMotion(velocity, controls, budget, actor.posY, dt) : null;
         if (propulsionMotion != null) velocity = propulsionMotion.velocity();
+        ProneLocomotion.WaterMotion waterMotion = water && !propulsion && !flying
+                && !travel.mobility.blocksCapture()
+                ? ProneLocomotion.waterMotion(transaction, controls, velocity,
+                        pronePose.map(PlayerBodyShape.PronePose::referenceFrame).orElse(CardinalFrame.Y_POS)) : null;
+        if (waterMotion != null) velocity = waterMotion.velocity();
         // Unattached Survival has no propulsion authority. Translation input cannot create thrust;
         // equipment-backed propulsion remains deferred, independently of raw force or personal G.
 
@@ -554,12 +565,22 @@ public final class PlayerPhysicsStep {
                 || referenceEvidence.bootCandidates().stream().anyMatch(StandingConstraints.BootCandidate::isEffective);
         boolean nearFootActiveDrive = false;
         boolean nearFootPermitted = false;
-        if (!propulsion && !flying && !travel.mobility.blocksCapture()) {
+        if (!propulsion && !flying && !travel.mobility.blocksCapture() && !water) {
             boolean sprinting = controls.sprint() && !controls.sneak()
                     && (actor.capabilities.isCreativeMode || actor.getFoodStats().getFoodLevel() > 6);
             transaction.requireCurrent();
             try {
-                if (FreeNearFootDrive.permitted(transaction, sample.observation())) {
+                if (pronePose.isPresent()) {
+                    var referenceFrame = pronePose.orElseThrow().referenceFrame();
+                    if (ProneLocomotion.bellySupported(transaction, sample.observation(), referenceFrame)) {
+                        double target = actor.getAIMoveSpeed() / dt * .3;
+                        transaction.requireCurrent();
+                        var gait = FreeNearFootDrive.gait(velocity, controls.translation(), referenceFrame.up(),
+                                target, ZERO_G_WALK_ACCELERATION * dt);
+                        velocity = gait.velocity();
+                        nearFootActiveDrive = gait.activeDrive();
+                    }
+                } else if (FreeNearFootDrive.permitted(transaction, sample.observation())) {
                     nearFootPermitted = true;
                     double target = (sprinting ? ZERO_G_SPRINT_SPEED : ZERO_G_WALK_SPEED)
                             * (controls.sneak() ? .3 : 1);
@@ -588,7 +609,7 @@ public final class PlayerPhysicsStep {
         Optional<FreeReferenceModePrepared.Selection> reverseSelection;
         FreeStandingProposal standingProposal;
         try {
-            standingProposal = travel.mobility.blocksCapture() ? null
+            standingProposal = travel.mobility.blocksCapture() || proneChoice.blocksStanding() ? null
                     : prepareFreeStanding(freeReference, travel, referenceEvidence, attitudeRequest, actor, transaction.tick());
             reverseSelection = standingProposal == null ? Optional.empty() : standingProposal.selection();
         } catch (RuntimeException failure) {
@@ -723,7 +744,7 @@ public final class PlayerPhysicsStep {
             return new Applied(endpoint);
         }
 
-        if (attitudeRequest.isPresent() || trustedResize.isPresent()) {
+        if (movementRequest != null || trustedResize.isPresent()) {
             double oldMotionX = actor.motionX, oldMotionY = actor.motionY, oldMotionZ = actor.motionZ;
             boolean oldOnGround = actor.onGround;
             boolean oldCollidedHorizontally = actor.collidedHorizontally;
@@ -735,7 +756,7 @@ public final class PlayerPhysicsStep {
             actor.collidedHorizontally = false;
             actor.collidedVertically = false;
             var prepared = ModeTransitionPrepared.prepareFreeTick(transaction,
-                    attitudeRequest.orElse(null), trustedResize.orElse(null), delta, budgetTick);
+                    movementRequest, trustedResize.orElse(null), delta, budgetTick);
             if (prepared instanceof ModeTransitionPrepared.Unavailable failure) {
                 restoreFreePreinstallActorState(actor, oldMotionX, oldMotionY, oldMotionZ,
                         oldOnGround, oldCollidedHorizontally, oldCollidedVertically);
@@ -760,8 +781,10 @@ public final class PlayerPhysicsStep {
                 }
             }
             try {
-                return new Applied(flightMotion == null ? applied.snapshot()
-                        : finishNativeFlight(transaction, applied.snapshot(), flightMotion, acceleration),
+                var completed = flightMotion == null ? applied.snapshot()
+                        : finishNativeFlight(transaction, applied.snapshot(), flightMotion, acceleration);
+                if (waterMotion != null) completed = finishWater(transaction, completed, waterMotion);
+                return new Applied(completed,
                         Optional.empty(), retained == null ? Optional.empty() : Optional.of(retained.rejection()));
             } catch (RuntimeException failure) {
                 return new CommittedFailure(applied.snapshot(), failure, transaction.installationCustody());
@@ -869,6 +892,7 @@ public final class PlayerPhysicsStep {
             if (!travel.ownerCurrent.getAsBoolean() || PlayerKinematics.requiresNative(actor))
                 throw new IllegalStateException("Free movement owner changed after installation");
             if (flightMotion != null) installed = finishNativeFlight(transaction, installed, flightMotion, acceleration);
+            if (waterMotion != null) installed = finishWater(transaction, installed, waterMotion);
             if (standingProposal != null) standingProposal.publish(transaction);
             Optional<FreeMovementStopDiagnostic> movementStopDiagnostic =
                     resolved.stop().map(PlayerPhysicsStep::movementStopDiagnostic);
@@ -1007,6 +1031,21 @@ public final class PlayerPhysicsStep {
                         actor.collidedVertically, actor.fallDistance, false)));
     }
 
+    private static PlayerPhysicalSnapshot finishWater(FreeOwnerTransaction transaction,
+            PlayerPhysicalSnapshot installed, ProneLocomotion.WaterMotion water) {
+        transaction.requireCurrent();
+        if (transaction.installedPlacement().orElse(null) != installed.placement())
+            throw new IllegalStateException("Free water drag lost its exact installed journal");
+        var actor = transaction.actor();
+        double dt = GravityEntityBinder.TICK_SECONDS;
+        var post = ProneLocomotion.dampWater(new Vec3(actor.motionX / dt, actor.motionY / dt, actor.motionZ / dt), water);
+        transaction.numeric().charge(30);
+        actor.motionX = post.x() * dt; actor.motionY = post.y() * dt; actor.motionZ = post.z() * dt;
+        transaction.requireCurrent();
+        return new PlayerPhysicalSnapshot(installed.scope(), installed.revision(), installed.placement(),
+                new Vec3d(post.x(), post.y(), post.z()), installed.contacts());
+    }
+
     private static void restoreFreePreinstallActorState(EntityPlayerMP actor,
             double motionX, double motionY, double motionZ, boolean onGround,
             boolean collidedHorizontally, boolean collidedVertically) {
@@ -1127,6 +1166,35 @@ public final class PlayerPhysicsStep {
         boolean nativeGravity = !sample.personalZeroG() && !travel.nativeNoGravity
                 && sample.bindingMode().filter(mode -> mode == GravityMode.REPLACE).isEmpty() && !flying;
         if (nativeGravity) acceleration = acceleration.add(new Vec3(0, fluid ? -8 : -32, 0));
+        if (free != null) {
+            var prone = ProneLocomotion.choose(free, travel, controls, water);
+            if (prone.request().isPresent()) {
+                sample.requireCurrent();
+                var velocity = new Vec3(v.x(), v.y(), v.z()).add(acceleration.scale(dt));
+                var waterMotion = water ? ProneLocomotion.waterMotion(free, controls, velocity, frame) : null;
+                if (waterMotion != null) velocity = waterMotion.velocity();
+                velocity = cappedConversionVelocity(velocity, budget.ceilingMps());
+                var prepared = ModeTransitionPrepared.prepareCardinalToFree(free, prone.request().orElseThrow(),
+                        new Vec3d(velocity.x(), velocity.y(), velocity.z()), budgetTick);
+                if (prepared instanceof ModeTransitionPrepared.Unavailable failure)
+                    return new Unavailable(failure.reason(), failure.cause());
+                var installed = ModeTransitionFinalizer.install((ModeTransitionPrepared.Prepared) prepared, budgetTick);
+                if (installed instanceof ModeTransitionFinalizer.Unavailable failure)
+                    return new Unavailable(failure.reason(), failure.cause());
+                if (installed instanceof CommittedTailStop stopped) return stopped;
+                if (installed instanceof ModeTransitionFinalizer.CommittedFailure failure)
+                    return new CommittedFailure(failure.snapshot(), failure.cause(), failure.custody());
+                var applied = (ModeTransitionFinalizer.Applied) installed;
+                travel.ownerReference(new PlayerBodyReference.FreeReference(referenceState.manualIntent(),
+                        Optional.empty(), Optional.of(referenceState.effective())));
+                travel.standingState(StandingConstraints.State.initial());
+                try {
+                    return new Applied(waterMotion == null ? applied.snapshot() : finishWater(free, applied.snapshot(), waterMotion));
+                } catch (RuntimeException failure) {
+                    return new CommittedFailure(applied.snapshot(), failure, free.installationCustody());
+                }
+            }
+        }
         // The installed physical frame, not a fresh enum tie-break or the view, owns reference continuity.
         StandingConstraints.State standingInput = currentStandingState(travel, sample.evidence(), tick, frame);
         if (!standingInput.equals(travel.standingState())) travel.standingState(standingInput);
@@ -1509,7 +1577,7 @@ public final class PlayerPhysicsStep {
             actor.motionX = velocity.x() * dt;
             actor.motionY = velocity.y() * dt;
             actor.motionZ = velocity.z() * dt;
-            actor.setSneaking(controls.sneak());
+            applyOwnedPoseFlags(actor, free, controls.sneak(), false);
             actor.setSprinting(controls.sprint() && !controls.sneak()
                     && (actor.capabilities.isCreativeMode || actor.getFoodStats().getFoodLevel() > 6));
             if (flying) {
@@ -1813,11 +1881,11 @@ public final class PlayerPhysicsStep {
                         actor.attackEntityFrom(DamageSource.FLY_INTO_WALL, damage);
                     }
                 }
-                if (actor.onGround) actor.clearElytraFlying();
+                if (actor.onGround) applyOwnedPoseFlags(actor, free, actor.isSneaking(), true);
             }
             if (flying) {
                 actor.fallDistance = 0;
-                actor.clearElytraFlying();
+                applyOwnedPoseFlags(actor, free, actor.isSneaking(), true);
             }
             if(fluid && actor.collidedHorizontally) {
                 try(var nativeScope=free==null?null:CardinalNativeBoundary.open(boundary,actor,
@@ -1894,6 +1962,16 @@ public final class PlayerPhysicsStep {
         }
     }
 
+    private static void applyOwnedPoseFlags(EntityPlayerMP actor, FreeOwnerTransaction transaction,
+            boolean sneaking, boolean clearGliding) {
+        var pending = transaction == null ? null : transaction.pendingCardinalPose();
+        if (pending != null) pending.applyOwnedFlags(actor, sneaking, clearGliding);
+        else {
+            actor.setSneaking(sneaking);
+            if (clearGliding) actor.clearElytraFlying();
+        }
+    }
+
     private static PlayerPhysicalSnapshot committedSnapshot(EntityPlayerMP actor,
             PlayerPhysicalSnapshot accepted, AxisAlignedBB box, Vec3d position, boolean nearFootLocomotion,
             long revision, PlayerPhysicsServer.PendingCardinalPose pending) {
@@ -1904,7 +1982,8 @@ public final class PlayerPhysicsStep {
         if (pending != null) {
             if (!pending.allowsEye(actor, accepted.scope(), accepted.placement(), Float.floatToIntBits(observedEye))
                     || actor.width != oldShape.dimensions().width() || actor.height != oldShape.dimensions().height())
-                throw new IllegalStateException("Pending native pose changed during Cardinal endpoint observation");
+                throw new IllegalStateException("Pending native pose changed during Cardinal endpoint observation: "
+                        + pending.diagnostic(actor));
             dimensions = oldShape.dimensions();
         }
         var shape = new PlayerBodyShape.Cardinal(oldShape.frame(), dimensions);

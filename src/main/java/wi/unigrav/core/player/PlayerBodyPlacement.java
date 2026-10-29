@@ -111,7 +111,7 @@ public final class PlayerBodyPlacement {
                     arithmetic.roundNearest(arithmetic.add(arithmetic.exact(previousEye.z()), arithmetic.multiply(arithmetic.exact(up.z()), difference))));
             return new FreeEyeAnchor(FreeEyeAnchor.STORED_BASIS_V1, center, observedEye, attitude);
         });
-        shape = new PlayerBodyShape.FreeCapsule(replacement, free.collisionProfile(), replacementAnchor);
+        shape = new PlayerBodyShape.FreeCapsule(replacement, free.collisionProfile(), replacementAnchor, free.pronePose());
         bounds = source.bounds;
         transport = source.transport;
         storedCapsuleGeometry = source.storedCapsuleGeometry.withEyeMetadata(shape.geometryDimensions());
@@ -207,6 +207,33 @@ public final class PlayerBodyPlacement {
                         arithmetic.multiply(arithmetic.exact(up.y()), radius))),
                 arithmetic.roundNearest(arithmetic.subtract(arithmetic.exact(lower.z()),
                         arithmetic.multiply(arithmetic.exact(up.z()), radius))));
+    }
+
+    /** Standing preview above the actual capsule support plane, preserving its tangential centre. */
+    static Vec3d proneSupportFoot(PlayerBodyPlacement placement, CardinalFrame frame, StoredDyadic.Work work) {
+        Objects.requireNonNull(frame, "frame");
+        if (!(placement.shape instanceof PlayerBodyShape.FreeCapsule free) || free.pronePose().isEmpty())
+            throw new IllegalArgumentException("Prone support foot requires an accepted prone capsule");
+        var arithmetic = BootQueryArithmetic.fromSameWork(Objects.requireNonNull(work, "work"));
+        var geometry = placement.storedCapsuleGeometry;
+        var up = frame.up();
+        var center = placement.center;
+        var lower = supportProjection(geometry.negativeEndpoint(), center, up, arithmetic);
+        var upper = supportProjection(geometry.positiveEndpoint(), center, up, arithmetic);
+        var offset = arithmetic.subtract(arithmetic.compare(lower, upper) <= 0 ? lower : upper,
+                arithmetic.exact(geometry.radius()));
+        return new Vec3d(
+                arithmetic.roundNearest(arithmetic.add(arithmetic.exact(center.x()), arithmetic.multiply(arithmetic.exact(up.x()), offset))),
+                arithmetic.roundNearest(arithmetic.add(arithmetic.exact(center.y()), arithmetic.multiply(arithmetic.exact(up.y()), offset))),
+                arithmetic.roundNearest(arithmetic.add(arithmetic.exact(center.z()), arithmetic.multiply(arithmetic.exact(up.z()), offset))));
+    }
+
+    private static BootQueryArithmetic.Number supportProjection(Vec3d endpoint, Vec3d center, Vec3d up,
+            BootQueryArithmetic arithmetic) {
+        return arithmetic.add(arithmetic.add(
+                arithmetic.multiply(arithmetic.subtract(arithmetic.exact(endpoint.x()), arithmetic.exact(center.x())), arithmetic.exact(up.x())),
+                arithmetic.multiply(arithmetic.subtract(arithmetic.exact(endpoint.y()), arithmetic.exact(center.y())), arithmetic.exact(up.y()))),
+                arithmetic.multiply(arithmetic.subtract(arithmetic.exact(endpoint.z()), arithmetic.exact(center.z())), arithmetic.exact(up.z())));
     }
 
     private static Vec3d eyeFromPhysicalFoot(Vec3d physicalFoot, Vec3d up, double eyeHeight,
@@ -361,7 +388,8 @@ public final class PlayerBodyPlacement {
         if (!(acceptedFree.shape instanceof PlayerBodyShape.FreeCapsule))
             throw new IllegalArgumentException("Cardinal desired foot must come from the accepted Free capsule");
         BootQueryArithmetic arithmetic = BootQueryArithmetic.fromSameWork(numeric);
-        Vec3d foot = physicalFoot(acceptedFree, arithmetic);
+        Vec3d foot = ((PlayerBodyShape.FreeCapsule) acceptedFree.shape).pronePose().isPresent()
+                ? proneSupportFoot(acceptedFree, frame, numeric) : physicalFoot(acceptedFree, arithmetic);
         BootQueryArithmetic.Number[] low = new BootQueryArithmetic.Number[3];
         BootQueryArithmetic.Number[] high = new BootQueryArithmetic.Number[3];
         for (int axis = 0; axis < 3; axis++) {

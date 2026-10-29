@@ -66,7 +66,12 @@ final class CapsuleArcEnclosure {
                 || actualTarget.storedCapsuleGeometry().relation().kind() == RealizationRelation.Kind.FIXED_HALF_LENGTH))
             throw new IllegalArgumentException("fixed-half-length endpoints require their explicit arc recipe");
         var dimensions = start.shape().geometryDimensions();
-        if (!start.shape().equals(actualTarget.shape())
+        // Pose semantics and eye anchors do not change the collider. Their provenance and
+        // installation still belong to the owner request; this proof certifies only the arc.
+        var sourceShape = (PlayerBodyShape.FreeCapsule) start.shape();
+        var targetShape = (PlayerBodyShape.FreeCapsule) actualTarget.shape();
+        if (!sourceShape.dimensions().equals(targetShape.dimensions())
+                || !sourceShape.collisionProfile().equals(targetShape.collisionProfile())
                 || !StoredRealizationLimits.sameRaw(start.center(), actualTarget.center())
                 || !StoredRealizationLimits.sameRaw(dimensions, actualTarget.shape().geometryDimensions())
                 || !StoredRealizationLimits.sameRaw(start.capsule().radius(), actualTarget.capsule().radius())) {

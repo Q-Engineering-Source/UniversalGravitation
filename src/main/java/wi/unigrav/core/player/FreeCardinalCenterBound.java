@@ -45,6 +45,7 @@ final class FreeCardinalCenterBound {
         var targetRadius = StoredDyadic.of(target.radius(), work);
         var height = StoredDyadic.of(target.height(), work);
         var allowance = StoredDyadic.of(movementAllowance, work);
+        boolean prone = ((PlayerBodyShape.FreeCapsule) start.shape()).pronePose().isPresent();
         double[] min = new double[3], max = new double[3];
         double[] nativeLow = new double[3], nativeHigh = new double[3];
         StoredDyadic total = StoredDyadic.zero();
@@ -55,18 +56,25 @@ final class FreeCardinalCenterBound {
             max[axis] = centers.hi.roundUp(work);
             // negativeEndpoint is binary64 center - *stored* half-line, not nominal Q*h.
             var halfLine = StoredDyadic.of(component(start.storedCapsuleGeometry().storedHalfLine(), axis), work);
-            var negativeExact = centers.add(halfLine.negate(work), work);
+            double normal = component(frame.up(), axis);
+            // Prone standing uses the belly support plane: tangential coordinates stay at
+            // the centre, and the normal anchor uses the lower actual endpoint plus radius.
+            // Match PlayerBodyPlacement.proneSupportFoot, including endpoint rounding.
+            var endpointOffset = prone
+                    ? normal == 0 ? StoredDyadic.zero()
+                        : halfLine.abs(work).multiply(StoredDyadic.of(-normal, work), work)
+                    : halfLine.negate(work);
+            var negativeExact = centers.add(endpointOffset, work);
             var negativeError = roundingGap(negativeExact, work);
             var negative = negativeExact.widen(negativeError, work);
-            var upRadius = StoredDyadic.of(component(start.bodyUp(), axis), work).multiply(radius, work);
+            var upRadius = StoredDyadic.of(prone ? normal : component(start.bodyUp(), axis), work).multiply(radius, work);
             var footExact = negative.add(upRadius.negate(work), work);
             var footError = roundingGap(footExact, work);
             var feet = footExact.widen(footError, work);
-            var s = new Interval(halfLine.negate(work).subtract(upRadius, work),
-                    halfLine.negate(work).subtract(upRadius, work))
+            var s = new Interval(endpointOffset.subtract(upRadius, work),
+                    endpointOffset.subtract(upRadius, work))
                     .widen(negativeError.add(footError, work), work);
 
-            double normal = component(frame.up(), axis);
             Interval lowError, highError;
             StoredDyadic idealOffset;
             Interval low, high;

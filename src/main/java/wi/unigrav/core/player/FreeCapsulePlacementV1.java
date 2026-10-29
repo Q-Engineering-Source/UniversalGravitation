@@ -22,9 +22,15 @@ record FreeCapsulePlacementV1(RawVec3 currentCenter, RawVec3 storedHalfLine,
     }
 
     record BodyProfile(long diameterBits, long lengthBits, int eyeRecipeVersion,
-                       RawVec3 eyeCenter, RawVec3 worldEye, RawQuaternion eyeAttitude) {
+                       RawVec3 eyeCenter, RawVec3 worldEye, RawQuaternion eyeAttitude,
+                       Optional<PlayerBodyShape.PronePose> pronePose) {
+        BodyProfile(long diameterBits, long lengthBits, int eyeRecipeVersion,
+                RawVec3 eyeCenter, RawVec3 worldEye, RawQuaternion eyeAttitude) {
+            this(diameterBits, lengthBits, eyeRecipeVersion, eyeCenter, worldEye, eyeAttitude, Optional.empty());
+        }
         BodyProfile {
             Objects.requireNonNull(eyeCenter); Objects.requireNonNull(worldEye); Objects.requireNonNull(eyeAttitude);
+            Objects.requireNonNull(pronePose);
         }
     }
 
@@ -62,7 +68,8 @@ record FreeCapsulePlacementV1(RawVec3 currentCenter, RawVec3 storedHalfLine,
 
     int rawFieldCount() {
         // Three vectors and one tag, plus the optional axis-plane witness fields.
-        return (proof instanceof AxisPlane ? 16 : 10) + (bodyProfile.isPresent() ? 13 : 0);
+        return (proof instanceof AxisPlane ? 16 : 10) + (bodyProfile.isPresent() ? 13 : 0)
+                + (bodyProfile.flatMap(BodyProfile::pronePose).isPresent() ? 2 : 0);
     }
 
     record RawVec3(long xBits, long yBits, long zBits) {

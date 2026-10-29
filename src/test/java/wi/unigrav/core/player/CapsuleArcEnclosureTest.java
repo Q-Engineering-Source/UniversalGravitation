@@ -14,6 +14,25 @@ class CapsuleArcEnclosureTest {
     private static final PlayerBodyShape.Dimensions SIZE = new PlayerBodyShape.Dimensions(.5, 2, 1);
     private static final Vec3d CENTER = new Vec3d(.25, 1.125, .75);
 
+    @Test void proneSemanticsCanChangeWithoutChangingTheCertifiedArcCollider() {
+        var q = CardinalFrame.Z_POS.attitude();
+        var anchor = java.util.Optional.of(new FreeEyeAnchor(FreeEyeAnchor.STORED_BASIS_V1, CENTER, CENTER, q));
+        var profile = new PlayerBodyShape.CollisionProfile(SIZE.width(), SIZE.height());
+        var crawl = new PlayerBodyShape.FreeCapsule(SIZE, profile, anchor, java.util.Optional.of(
+                new PlayerBodyShape.PronePose(PlayerBodyShape.PronePose.Kind.CRAWLING, CardinalFrame.Y_POS)));
+        var swim = new PlayerBodyShape.FreeCapsule(SIZE, profile, anchor, java.util.Optional.of(
+                new PlayerBodyShape.PronePose(PlayerBodyShape.PronePose.Kind.SWIMMING, CardinalFrame.Y_POS)));
+        var start = new PlayerBodyPlacement(CENTER, q, crawl);
+        var target = new PlayerBodyPlacement(CENTER, q, swim);
+        var work = new StoredDyadic.Work();
+        var arc = CapsuleArcEnclosure.prepare(CapsulePlacementMath.pose(start, work), target, new Vec3d(0, 1, 0), work);
+        assertEquals(start.capsule(), arc.enclose(0, 1, work).reference());
+        var changed = new PlayerBodyPlacement(CENTER, q, new PlayerBodyShape.FreeCapsule(SIZE,
+                new PlayerBodyShape.CollisionProfile(SIZE.width(), SIZE.height() + .25), anchor, swim.pronePose()));
+        assertThrows(IllegalArgumentException.class, () -> CapsuleArcEnclosure.prepare(
+                CapsulePlacementMath.pose(start, work), changed, new Vec3d(0, 1, 0), work));
+    }
+
     @Test void midpointIsActualRecipeAndIntervalCrossChecksAreNotTheContinuousCertificate() {
         var q0 = new Rotation3d(.15, .2, .3, .7);
         var q1 = new Rotation3d(.6, -.1, .2, .7);

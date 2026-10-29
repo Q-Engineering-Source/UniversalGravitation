@@ -18,15 +18,17 @@ import wi.unigrav.core.GravityMode;
 public final class PlayerPhysicsProtocol {
     public static final String CHANNEL = "ugmotion1";
     // V21 preserves the wire shape but serverSlot now counts consumed INPUT slots, not world ticks.
-    public static final int VERSION = 21;
+    public static final int VERSION = 22;
     // The V11 maximum includes a boundary; its Anchored phase adds present(1), tag(1), revision(8), bootstrap(16).
     // V14 combines the V13 request marker with accepted mobility state (present byte + 22 bytes).
     // V15 adds one canonical transfer-presence byte. V16 reuses that union for TP completion controls.
     // Transfer/control-only frames are shorter than the maximal STATE; the actual maximum fixture verifies this cap.
-    public static final int MAX_BYTES = 629;
+    // V22 adds kind/reference-frame bytes to the profiled Free body for swim/crawl semantics.
+    public static final int MAX_BYTES = 631;
     private static final int CARDINAL_PLACEMENT_TAG = 0;
     private static final int FREE_CAPSULE_PLACEMENT_TAG = 1;
     private static final int PROFILED_FREE_CAPSULE_PLACEMENT_TAG = 2;
+    private static final int PRONE_FREE_CAPSULE_PLACEMENT_TAG = 3;
     private PlayerPhysicsProtocol() {}
     public enum Kind { OFFER, APPLY, OWNED, INPUT, STATE, NATIVE, RECOVER, NATIVE_MOTION, NATIVE_ACK, NATIVE_MOTION_ACK, NATIVE_CORRECTION_COMPLETE, NATIVE_CORRECTION_ACK }
     public record OperationId(long nonce, long epoch, long serial, BoostProtocol.Operation operation) {
@@ -1239,7 +1241,8 @@ public final class PlayerPhysicsProtocol {
             putVector(out, placement.transport());
         } else if (placement.shape() instanceof PlayerBodyShape.FreeCapsule) {
             var free = (PlayerBodyShape.FreeCapsule) placement.shape();
-            out.put((byte) (free.eyeAnchor().isPresent() ? PROFILED_FREE_CAPSULE_PLACEMENT_TAG : FREE_CAPSULE_PLACEMENT_TAG));
+            out.put((byte) (free.pronePose().isPresent() ? PRONE_FREE_CAPSULE_PLACEMENT_TAG
+                    : free.eyeAnchor().isPresent() ? PROFILED_FREE_CAPSULE_PLACEMENT_TAG : FREE_CAPSULE_PLACEMENT_TAG));
             PlayerBodyShape.Dimensions dimensions = placement.shape().dimensions();
             out.putDouble(dimensions.width()).putDouble(dimensions.height()).putDouble(dimensions.eyeHeight());
             putRawQuaternion(out, FreeCapsulePlacementV1.RawQuaternion.from(placement.attitude()));
@@ -1263,6 +1266,8 @@ public final class PlayerPhysicsProtocol {
                 out.putLong(body.diameterBits()).putLong(body.lengthBits()).put((byte) body.eyeRecipeVersion());
                 putRawVector(out, body.eyeCenter()); putRawVector(out, body.worldEye());
                 putRawQuaternion(out, body.eyeAttitude());
+                body.pronePose().ifPresent(pose -> out.put((byte) pose.kind().ordinal())
+                        .put((byte) pose.referenceFrame().ordinal()));
             });
         } else {
             throw new IllegalArgumentException("Unsupported physical-state placement shape");
@@ -1291,7 +1296,8 @@ public final class PlayerPhysicsProtocol {
             Optional<PlayerPhysicalSnapshot.Contacts> contacts = getContacts(in);
             return new CardinalSnapshotFrame(new PlayerPhysicalSnapshot(scope, revision, placement, velocity, contacts));
         }
-        if (placementTag != FREE_CAPSULE_PLACEMENT_TAG && placementTag != PROFILED_FREE_CAPSULE_PLACEMENT_TAG) {
+        if (placementTag != FREE_CAPSULE_PLACEMENT_TAG && placementTag != PROFILED_FREE_CAPSULE_PLACEMENT_TAG
+                && placementTag != PRONE_FREE_CAPSULE_PLACEMENT_TAG) {
             throw new IllegalArgumentException("Unknown physical-state placement tag");
         }
         long widthBits = in.getLong();
@@ -1322,11 +1328,22 @@ public final class PlayerPhysicsProtocol {
             throw new IllegalArgumentException("Unknown FreeCapsule realization proof tag");
         }
         Optional<FreeCapsulePlacementV1.BodyProfile> body = Optional.empty();
-        if (placementTag == PROFILED_FREE_CAPSULE_PLACEMENT_TAG) {
+        if (placementTag == PROFILED_FREE_CAPSULE_PLACEMENT_TAG || placementTag == PRONE_FREE_CAPSULE_PLACEMENT_TAG) {
             long diameter = in.getLong(), length = in.getLong();
             int recipe = Byte.toUnsignedInt(in.get());
+            var eyeCenter = getRawVector(in);
+            var worldEye = getRawVector(in);
+            var eyeAttitude = getRawQuaternion(in);
+            Optional<PlayerBodyShape.PronePose> prone = Optional.empty();
+            if (placementTag == PRONE_FREE_CAPSULE_PLACEMENT_TAG) {
+                int kind = Byte.toUnsignedInt(in.get()), frame = Byte.toUnsignedInt(in.get());
+                if (kind >= PlayerBodyShape.PronePose.Kind.values().length || frame >= CardinalFrame.values().length)
+                    throw new IllegalArgumentException("Unknown prone body kind/reference frame");
+                prone = Optional.of(new PlayerBodyShape.PronePose(PlayerBodyShape.PronePose.Kind.values()[kind],
+                        CardinalFrame.values()[frame]));
+            }
             body = Optional.of(new FreeCapsulePlacementV1.BodyProfile(diameter, length, recipe,
-                    getRawVector(in), getRawVector(in), getRawQuaternion(in)));
+                    eyeCenter, worldEye, eyeAttitude, prone));
         }
         var placement = new FreeCapsulePlacementV1(currentCenter, storedHalfLine, centerReference, proof, body);
         var worldVelocity = getRawVector(in);

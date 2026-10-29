@@ -53,13 +53,16 @@ final class NativeCardinalBodyProfile {
         private final UnigravConfig.NativeBodyProfileEnvironment environment;
         private final WorldCollisionCandidates.ActorGeometry geometry;
         private final double eye;
+        private final PlayerPhysicsServer.PendingCardinalPose pending;
         private Observation(EntityPlayerMP actor, PlayerPhysicalSnapshot accepted,
                 NativeBodyProfileProducer producer, NativeBodyProfileProducer.Profile profile,
                 WorldCollisionCandidates.ActorGeometry geometry, double eye,
-                UnigravConfig.NativeBodyProfileEnvironment environment) {
+                UnigravConfig.NativeBodyProfileEnvironment environment,
+                PlayerPhysicsServer.PendingCardinalPose pending) {
             this.actor = actor; this.accepted = accepted; this.producer = producer; this.profile = profile;
             this.geometry = geometry; this.eye = eye;
             this.environment = environment;
+            this.pending = pending;
         }
         PlayerBodyShape.CollisionProfile physical() { return PlayerBodyShape.CollisionProfile.fromNative(profile); }
         boolean profileCurrent() {
@@ -75,11 +78,24 @@ final class NativeCardinalBodyProfile {
             var observed = producer.unigrav$nativeBodyProfile();
             return observed.isPresent() && profile.equals(observed.orElseThrow())
                     && geometry.equals(WorldCollisionCandidates.ActorGeometry.read(actor))
-                    && StoredRealizationLimits.sameRaw(eye, actor.getEyeHeight());
+                    && StoredRealizationLimits.sameRaw(eye, actor.getEyeHeight())
+                    && (pending == null || pending.matchesSnapshot(actor, accepted, (float) eye));
         }
     }
 
     static Observation observe(EntityPlayerMP actor, PlayerPhysicalSnapshot accepted) {
+        return observe(actor, accepted, null);
+    }
+
+    static Observation observe(FreeOwnerTransaction transaction) {
+        transaction.requireCurrent();
+        var observation = observe(transaction.actor(), transaction.accepted(), transaction.pendingCardinalPose());
+        transaction.requireCurrent();
+        return observation;
+    }
+
+    private static Observation observe(EntityPlayerMP actor, PlayerPhysicalSnapshot accepted,
+            PlayerPhysicsServer.PendingCardinalPose pending) {
         if (!(accepted.placement().shape() instanceof PlayerBodyShape.Cardinal))
             throw new IllegalArgumentException("native profile source must be actual Cardinal");
         if (!(actor instanceof NativeBodyProfileProducer producer))
@@ -96,9 +112,10 @@ final class NativeCardinalBodyProfile {
                 || !geometry.bounds().equals(accepted.placement().bounds())
                 || !StoredRealizationLimits.sameRaw((double) geometry.width(), raw.width())
                 || !StoredRealizationLimits.sameRaw((double) geometry.height(), raw.height())
-                || !StoredRealizationLimits.sameRaw(eye, raw.eyeHeight()))
+                || !(StoredRealizationLimits.sameRaw(eye, raw.eyeHeight())
+                    || pending != null && pending.matchesSnapshot(actor, accepted, (float) eye)))
             throw new IllegalStateException("native profile observation does not match exact accepted Cardinal anchor");
-        var result = new Observation(actor, accepted, producer, profile, geometry, eye, environment);
+        var result = new Observation(actor, accepted, producer, profile, geometry, eye, environment, pending);
         if (!result.matches(accepted)) throw new IllegalStateException("native profile changed during observation");
         return result;
     }

@@ -13,6 +13,8 @@ import wi.unigrav.core.boost.BoostProtocol;
 import wi.unigrav.core.player.GIntentProtocol;
 import wi.unigrav.core.player.PlayerPhysicsInboundConnections;
 import wi.unigrav.core.player.PlayerRenderPoseProtocol;
+import wi.unigrav.core.player.PlayerPhysicalSnapshot;
+import java.util.Optional;
 /** Side-specific hooks, invoked from the mod's lifecycle handlers. */
 public interface IProxy {
 
@@ -27,6 +29,9 @@ public interface IProxy {
     default void runLegacyMotion(EntityLivingBase actor, Runnable original) { original.run(); }
 
     default void runNativePose(EntityLivingBase actor, Runnable original) { original.run(); }
+
+    /** Read-only accepted/journal geometry for precise native adapter ownership. */
+    default Optional<PlayerPhysicalSnapshot> ownedPhysicalBody(EntityPlayer actor) { return Optional.empty(); }
 
     /** The actual Aqua growth move call site, inside its controlled resize callback. */
     default void runPoseMove(EntityLivingBase actor, MoverType type, Vec3d delta, Consumer<Vec3d> original) {

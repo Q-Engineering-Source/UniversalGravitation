@@ -68,7 +68,20 @@ public sealed interface PlayerBodyShape {
     }
 
     /** A capsule whose long axis follows the independently accepted body attitude. */
-    record FreeCapsule(Dimensions dimensions, CollisionProfile collisionProfile, Optional<FreeEyeAnchor> eyeAnchor) implements PlayerBodyShape {
+    /** Locomotion semantics are independent of FREE geometry and the backpack's flight capability. */
+    record PronePose(Kind kind, CardinalFrame referenceFrame) {
+        public enum Kind { CRAWLING, SWIMMING }
+        public PronePose {
+            Objects.requireNonNull(kind, "kind");
+            Objects.requireNonNull(referenceFrame, "referenceFrame");
+        }
+    }
+
+    record FreeCapsule(Dimensions dimensions, CollisionProfile collisionProfile,
+                       Optional<FreeEyeAnchor> eyeAnchor, Optional<PronePose> pronePose) implements PlayerBodyShape {
+        public FreeCapsule(Dimensions dimensions, CollisionProfile collisionProfile, Optional<FreeEyeAnchor> eyeAnchor) {
+            this(dimensions, collisionProfile, eyeAnchor, Optional.empty());
+        }
         public FreeCapsule(Dimensions dimensions) {
             this(dimensions, new CollisionProfile(dimensions.width(), dimensions.height()), Optional.empty());
         }
@@ -79,6 +92,9 @@ public sealed interface PlayerBodyShape {
             Objects.requireNonNull(dimensions, "dimensions");
             Objects.requireNonNull(collisionProfile, "collisionProfile");
             Objects.requireNonNull(eyeAnchor, "eyeAnchor");
+            Objects.requireNonNull(pronePose, "pronePose");
+            if (pronePose.isPresent() && eyeAnchor.isEmpty())
+                throw new IllegalArgumentException("Prone body requires its explicit physical eye anchor");
         }
         @Override public Dimensions geometryDimensions() {
             // Preserve the exact original object and arithmetic path for every ordinary profile.

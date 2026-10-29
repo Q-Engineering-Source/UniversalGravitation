@@ -45,7 +45,7 @@ final class PlayerPlacementCodec {
                 free.eyeAnchor().map(anchor -> new FreeCapsulePlacementV1.BodyProfile(
                         Double.doubleToRawLongBits(free.collisionProfile().diameter()),
                         Double.doubleToRawLongBits(free.collisionProfile().length()), anchor.recipeVersion(),
-                        RawVec3.from(anchor.center()), RawVec3.from(anchor.eye()), RawQuaternion.from(anchor.attitude()))));
+                        RawVec3.from(anchor.center()), RawVec3.from(anchor.eye()), RawQuaternion.from(anchor.attitude()), free.pronePose())));
     }
 
     /**
@@ -112,7 +112,7 @@ final class PlayerPlacementCodec {
             var anchor = new FreeEyeAnchor(body.eyeRecipeVersion(), body.eyeCenter().toVector("eye center anchor"),
                     body.worldEye().toVector("world eye anchor"), eyeQ);
             shape = new PlayerBodyShape.FreeCapsule(dimensions, new PlayerBodyShape.CollisionProfile(diameter, length),
-                    java.util.Optional.of(anchor));
+                    java.util.Optional.of(anchor), body.pronePose());
         }
         else shape = new PlayerBodyShape.FreeCapsule(dimensions);
         var geometryDimensions = shape.geometryDimensions();

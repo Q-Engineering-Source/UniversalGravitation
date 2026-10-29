@@ -588,7 +588,8 @@ class PlayerPhysicsProtocolTest {
         var profileShape = new PlayerBodyShape.FreeCapsule(nativeRaw,
                 new PlayerBodyShape.CollisionProfile(physical.width(), physical.height()),
                 Optional.of(new FreeEyeAnchor(FreeEyeAnchor.STORED_BASIS_V1,
-                        placement.center(), placement.eye(), placement.attitude())));
+                        placement.center(), placement.eye(), placement.attitude())),
+                Optional.of(new PlayerBodyShape.PronePose(PlayerBodyShape.PronePose.Kind.CRAWLING, CardinalFrame.Z_NEG)));
         var profiledPlacement = PlayerBodyPlacement.fromAcceptedFreeGeometry(placement.center(), placement.attitude(),
                 profileShape, placement.storedCapsuleGeometry().withEyeMetadata(profileShape.geometryDimensions()),
                 placement.bounds(), placement.transport(), new StoredDyadic.Work());
@@ -599,7 +600,7 @@ class PlayerPhysicsProtocolTest {
                 withTiming.nativeTeleportId(), withTiming.bodyReferenceReceipt(), withTiming.bodyReferenceAcknowledgement(),
                 withTiming.bodyReferenceState(), Optional.empty(), Optional.of(boundary));
         byte[] fullProfile = PlayerPhysicsProtocol.encode(profiled);
-        assertEquals(580, fullProfile.length, "actual full axis proof, application, boundary and eye-profile payload");
+        assertEquals(582, fullProfile.length, "actual full axis proof, application, boundary, eye-profile and prone payload");
         assertTrue(fullProfile.length <= PlayerPhysicsProtocol.MAX_BYTES);
         assertEquals(profiled, decodeForTest(fullProfile, new PhysicsDecodeBudget(fullProfile.length, new StoredDyadic.Work())));
         var maximal = new PlayerPhysicsProtocol.Packet(profiled.kind(),profiled.scope(),profiled.sequence(),
@@ -613,7 +614,7 @@ class PlayerPhysicsProtocolTest {
                         PlayerMobilityIntent.Hover.OFF,PlayerMobilityIntent.EffectiveMode.FREE,
                         PlayerMobilityIntent.HoverStatus.OFF,PlayerMobilityIntent.Reason.NONE,false,0)));
         byte[] maximalWire = PlayerPhysicsProtocol.encode(maximal);
-        assertEquals(629,maximalWire.length,"all legal profiled Free authority fields coexist without narrowing the old contract");
+        assertEquals(631,maximalWire.length,"all legal profiled prone Free authority fields coexist without narrowing the old contract");
         assertEquals(PlayerPhysicsProtocol.MAX_BYTES,maximalWire.length);
         assertEquals(maximal,decodeForTest(maximalWire, new PhysicsDecodeBudget(maximalWire.length, new StoredDyadic.Work())));
         byte[] oldV19 = maximalWire.clone(); oldV19[0] = 19;

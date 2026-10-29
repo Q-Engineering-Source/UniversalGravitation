@@ -1082,7 +1082,9 @@ final class FreeOwnerTransaction implements AutoCloseable {
         if (!physicalAnchorMatches) return false;
         int actualEye = Float.floatToIntBits(actor.getEyeHeight());
         if (pendingCardinalPose != null
-                && !pendingCardinalPose.allowsInstallationEye(actor, accepted.scope(), placement, actualEye)) return false;
+                && !pendingCardinalPose.allowsInstallationEye(actor, accepted.scope(), placement, actualEye)
+                && !(placement == installed
+                    && pendingCardinalPose.allowsProneSuccessor(actor, accepted, placement, actualEye))) return false;
         if (installedEyeObservation != null && placement == installed)
             return acceptsInstalledEye(placement, Float.intBitsToFloat(actualEye));
         if (actualEye == Float.floatToIntBits((float) dimensions.eyeHeight())) return true;
@@ -1184,6 +1186,38 @@ final class FreeOwnerTransaction implements AutoCloseable {
     /** Installs the eye under this transaction's lifetime fence after every native getter. */
     void installEffectiveEyeHeight(double effectiveEyeHeight) {
         PlayerBodyPlacement placement = preparedInstallation == null ? accepted.placement() : preparedInstallation.placement();
+        if (pendingCardinalPose != null && placement.shape() instanceof PlayerBodyShape.FreeCapsule) {
+            requireOwnerFence();
+            int observedEye = Float.floatToIntBits(actor.getEyeHeight());
+            requireOwnerFence();
+            if (installationStage != InstallationStage.MUTATING || preparedInstallation == null
+                    || observedEye != Float.floatToIntBits((float) effectiveEyeHeight)
+                    || !pendingCardinalPose.allowsProneSuccessor(actor, accepted, placement, observedEye))
+                throw new IllegalStateException("Pending pose cannot hand its native eye to this Free installation");
+            requireOwnerFence();
+            return;
+        }
+        if (accepted.placement().shape() instanceof PlayerBodyShape.FreeCapsule source && source.pronePose().isPresent()
+                && placement.shape() instanceof PlayerBodyShape.Cardinal
+                && actor instanceof NativePoseEyeProducer.OwnedStandingMirror mirror) {
+            var profile = ProneLocomotion.standingProfileForInstallation(this);
+            if (!profile.dimensions().equals(placement.shape().dimensions()))
+                throw new IllegalStateException("Standing eye mirror does not match its proved full native target");
+            var exactPrepared = preparedInstallation;
+            var write = new NativePoseEyeProducer.StandingEyeWrite(actor, profile.input().standingRawEyeHeight(),
+                    (float) effectiveEyeHeight, () -> {
+                        requireOwnerFence();
+                        if (installationStage != InstallationStage.MUTATING || preparedInstallation != exactPrepared
+                                || exactPrepared == null || exactPrepared.placement() != placement || !profile.current())
+                            throw new IllegalStateException("Standing eye mirror lost its exact owner mutation");
+                    });
+            mirror.unigrav$installStandingEye(write);
+            requireOwnerFence();
+            if (Float.floatToIntBits(actor.getEyeHeight()) != Float.floatToIntBits((float) effectiveEyeHeight))
+                throw new IllegalStateException("Standing eye mirror did not round-trip exactly");
+            requireOwnerFence();
+            return;
+        }
         installEffectiveEyeHeight(actor, effectiveEyeHeight, this::requireOwnerFence, pendingCardinalPose,
                 accepted.scope(), placement);
     }

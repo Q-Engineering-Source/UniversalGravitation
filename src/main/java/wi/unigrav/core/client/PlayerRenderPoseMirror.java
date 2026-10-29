@@ -10,11 +10,15 @@ import java.util.UUID;
 import java.util.List;
 import java.util.ArrayList;
 import dev.crlhitbox.api.geometry.Vec3d;
+import dev.crlhitbox.api.geometry.Rotation3d;
+import dev.crlhitbox.api.geometry.Capsule;
+import dev.crlhitbox.api.geometry.Segment3d;
 
 import neofontrender.addons.api.camera.CameraEntityPickGeometry;
 import neofontrender.addons.api.flight.FlightAttitude;
 import neofontrender.addons.api.flight.FlightBodyPose;
 import neofontrender.addons.api.flight.FlightBodyBounds;
+import neofontrender.addons.api.flight.FlightBodyGeometry;
 import neofontrender.addons.api.flight.FlightVector;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.entity.AbstractClientPlayer;
@@ -210,6 +214,13 @@ public final class PlayerRenderPoseMirror {
         if (sampled.isEmpty()) return Optional.empty();
         SampledPresentation presentation = sampled.orElseThrow();
         SampledPose pose = presentation.pose();
+        if (presentation.geometry() != null && presentation.geometry().free() != null) {
+            var geometry = presentation.geometry(); var free = geometry.free();
+            return Optional.of(FlightBodyPose.modelUpY(attitude(pose.body()), attitude(pose.head()),
+                    new FlightVector(geometry.rootOffset().x(), geometry.rootOffset().y(), geometry.rootOffset().z()))
+                    .withGeometry(new FlightBodyGeometry(vector(free.capsuleStart()), vector(free.capsuleEnd()),
+                            free.radius(), vector(free.eye()))).withFreeShadowReference());
+        }
         if (presentation.geometry() != null) {
             var offset = presentation.geometry().rootOffset();
             return Optional.of(FlightBodyPose.modelUpY(attitude(pose.body()), attitude(pose.head()),
@@ -222,6 +233,8 @@ public final class PlayerRenderPoseMirror {
         }
         return Optional.of(FlightBodyPose.modelUpY(attitude(pose.body()), attitude(pose.head())).withFreeShadowReference());
     }
+
+    private static FlightVector vector(Vec3d point) { return new FlightVector(point.x(), point.y(), point.z()); }
 
     @SubscribeEvent
     public void onClientTick(TickEvent.ClientTickEvent event) {
@@ -555,7 +568,9 @@ public final class PlayerRenderPoseMirror {
 
     record SampledPose(PlayerRenderPoseProtocol.Quaternion body,
                        PlayerRenderPoseProtocol.Quaternion head) { }
-    record SampledGeometry(AxisAlignedBB bounds, Vec3d rootOffset, FlightVector axisUp) { }
+    record SampledGeometry(AxisAlignedBB bounds, Vec3d rootOffset, FlightVector axisUp, FreeBodyRenderSample free) {
+        SampledGeometry(AxisAlignedBB bounds, Vec3d rootOffset, FlightVector axisUp) { this(bounds, rootOffset, axisUp, null); }
+    }
     record SampledPresentation(SampledPose pose, SampledGeometry geometry) { }
 
     /** Shared production cache seam; the outer mirror supplies the actual current client identities. */
@@ -634,6 +649,9 @@ public final class PlayerRenderPoseMirror {
                 return false;
             }
             if (!newerThanFence(packet, priorFence)) return false;
+            if (packet.kind() == PlayerRenderPoseProtocol.Kind.POSE && packet.geometry() == null
+                    && priorFence != null && priorFence.lifetime == packet.lifetime()
+                    && priorFence.physicsSession != null) return false;
             if (priorFence != null && priorFence.lifetime == packet.lifetime()
                     && priorFence.physicsSession != null && packet.geometry() != null
                     && (!priorFence.physicsSession.equals(packet.geometry().physicsSession())
@@ -647,6 +665,8 @@ public final class PlayerRenderPoseMirror {
                 if (priorEntry.geometry != null && packet.geometry() != null
                         && packet.physicalRevision() == priorEntry.physicalRevision
                         && !priorEntry.geometry.equals(packet.geometry())) return false;
+                if (packet.kind() == PlayerRenderPoseProtocol.Kind.POSE && priorEntry.geometry != null
+                        && packet.geometry() == null) return false;
             }
 
             if (packet.kind() == PlayerRenderPoseProtocol.Kind.PRESENTATION_RELEASE) {
@@ -752,10 +772,14 @@ public final class PlayerRenderPoseMirror {
             // A known Cardinal pose without its accepted anchor cannot claim a valid body root.
             // Returning no render override delegates native rendering; pick remains explicitly suppressed.
             if (entry.mode == PlayerRenderPoseProtocol.Mode.CARDINAL && entry.geometry == null) return Optional.empty();
-            SampledGeometry geometry = entry.mode != PlayerRenderPoseProtocol.Mode.CARDINAL || entry.geometry == null
-                    ? null : sampleGeometry(entry.geometry, entry.cardinalFrame,
+            SampledGeometry geometry = entry.geometry instanceof PlayerRenderPoseProtocol.CardinalGeometry cardinal
+                    ? sampleGeometry(cardinal, entry.cardinalFrame,
                     entity.lastTickPosX, entity.lastTickPosY, entity.lastTickPosZ,
-                    entity.posX, entity.posY, entity.posZ, partialTicks);
+                    entity.posX, entity.posY, entity.posZ, partialTicks)
+                    : entry.geometry instanceof PlayerRenderPoseProtocol.FreeGeometry free
+                        ? sampleFreeGeometry(free, entry.body, pose.orElseThrow().body(),
+                            entity.lastTickPosX, entity.lastTickPosY, entity.lastTickPosZ,
+                            entity.posX, entity.posY, entity.posZ, partialTicks) : null;
             return Optional.of(new SampledPresentation(pose.orElseThrow(), geometry));
         }
 
@@ -773,6 +797,30 @@ public final class PlayerRenderPoseMirror {
                     max.x() + dx, max.y() + dy, max.z() + dz), geometry.rootOffset(frame),
                     new FlightVector(CardinalFrame.values()[frame].up().x(), CardinalFrame.values()[frame].up().y(),
                             CardinalFrame.values()[frame].up().z()));
+        }
+
+        static SampledGeometry sampleFreeGeometry(PlayerRenderPoseProtocol.FreeGeometry geometry,
+                PlayerRenderPoseProtocol.Quaternion acceptedBody, PlayerRenderPoseProtocol.Quaternion sampledBody,
+                double previousX, double previousY, double previousZ, double x, double y, double z, float partialTicks) {
+            if (!Float.isFinite(partialTicks)) throw new IllegalArgumentException("Non-finite Free interpolation");
+            double alpha = Math.max(0, Math.min(1, partialTicks));
+            var nativeOrigin = new Vec3d(previousX + (x - previousX) * alpha,
+                    previousY + (y - previousY) * alpha, previousZ + (z - previousZ) * alpha);
+            var delta = nativeOrigin.subtract(geometry.transport());
+            var center = geometry.center().add(delta);
+            var accepted = new Rotation3d(acceptedBody.x(), acceptedBody.y(), acceptedBody.z(), acceptedBody.w());
+            var sampled = new Rotation3d(sampledBody.x(), sampledBody.y(), sampledBody.z(), sampledBody.w());
+            java.util.function.UnaryOperator<Vec3d> point = value -> center.add(
+                    sampled.rotate(accepted.inverseRotate(value.subtract(geometry.center()))));
+            var start = point.apply(geometry.negativeEndpoint()); var end = point.apply(geometry.positiveEndpoint());
+            var feet = start.subtract(sampled.basisY().multiply(geometry.radius()));
+            var render = new FreeBodyRenderSample(center, sampled, point.apply(geometry.eye()), feet, start, end, geometry.radius());
+            var min = geometry.bounds().min().add(delta); var max = geometry.bounds().max().add(delta);
+            var rotatedBounds = new Capsule(new Segment3d(start, end), geometry.radius()).bounds();
+            return new SampledGeometry(new AxisAlignedBB(
+                    Math.min(min.x(), rotatedBounds.min().x()), Math.min(min.y(), rotatedBounds.min().y()), Math.min(min.z(), rotatedBounds.min().z()),
+                    Math.max(max.x(), rotatedBounds.max().x()), Math.max(max.y(), rotatedBounds.max().y()), Math.max(max.z(), rotatedBounds.max().z())),
+                    feet.subtract(nativeOrigin), null, render);
         }
 
         List<CameraEntityPickGeometry> pickGeometry(World actualWorld, EntityPlayer localPlayer,
@@ -931,7 +979,7 @@ public final class PlayerRenderPoseMirror {
             private PlayerRenderPoseProtocol.Quaternion head;
             private PlayerRenderPoseProtocol.Quaternion previousBody;
             private PlayerRenderPoseProtocol.Quaternion previousHead;
-            private PlayerRenderPoseProtocol.CardinalGeometry geometry;
+            private PlayerRenderPoseProtocol.TrackedGeometry geometry;
             private UUID physicsSession;
             private long physicsWorldEpoch;
             private long transitionTick;

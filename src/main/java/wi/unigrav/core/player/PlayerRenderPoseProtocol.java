@@ -7,12 +7,14 @@ import java.util.UUID;
 
 import dev.crlhitbox.api.geometry.Vec3d;
 import dev.crlhitbox.api.geometry.Aabb;
+import dev.crlhitbox.api.geometry.Capsule;
+import dev.crlhitbox.api.geometry.Segment3d;
 
 /** Read-only tracked presentation, including accepted Cardinal pick geometry; never movement authority. */
 public final class PlayerRenderPoseProtocol {
     public static final String CHANNEL = "ugpose1";
-    public static final int VERSION = 2;
-    public static final int MAX_BYTES = 256;
+    public static final int VERSION = 3;
+    public static final int MAX_BYTES = 349;
     private static final double UNIT_QUATERNION_ERROR = 1.0e-6;
 
     private PlayerRenderPoseProtocol() { }
@@ -20,8 +22,38 @@ public final class PlayerRenderPoseProtocol {
     public enum Kind { HELLO, WELCOME, FREE_LEASE, FREE_POSE, POSE, REMOVE, PRESENTATION_RELEASE }
     public enum Mode { CARDINAL, FREE }
 
+    public sealed interface TrackedGeometry permits CardinalGeometry, FreeGeometry {
+        UUID physicsSession();
+        long physicsWorldEpoch();
+        Vec3d transport();
+        Aabb bounds();
+    }
+
+    /** Actual accepted capsule/eye data for remote rendering only; never a movement or fit proof. */
+    public record FreeGeometry(UUID physicsSession, long physicsWorldEpoch, Vec3d transport, Aabb bounds,
+            Vec3d center, Vec3d negativeEndpoint, Vec3d positiveEndpoint, double radius, Vec3d eye)
+            implements TrackedGeometry {
+        public FreeGeometry {
+            Objects.requireNonNull(physicsSession); Objects.requireNonNull(transport); Objects.requireNonNull(bounds);
+            Objects.requireNonNull(center); Objects.requireNonNull(negativeEndpoint); Objects.requireNonNull(positiveEndpoint);
+            Objects.requireNonNull(eye);
+            if (physicsWorldEpoch < 0 || !Double.isFinite(radius) || radius <= 0)
+                throw new IllegalArgumentException("Invalid tracked Free scope or radius");
+            for (var point : new Vec3d[]{transport, bounds.min(), bounds.max(), center, negativeEndpoint, positiveEndpoint, eye})
+                if (!Double.isFinite(point.x()) || !Double.isFinite(point.y()) || !Double.isFinite(point.z()))
+                    throw new IllegalArgumentException("Non-finite tracked Free geometry");
+            var capsule = new Capsule(new Segment3d(negativeEndpoint, positiveEndpoint), radius).bounds();
+            if (center.x() < bounds.min().x() || center.y() < bounds.min().y() || center.z() < bounds.min().z()
+                    || center.x() > bounds.max().x() || center.y() > bounds.max().y() || center.z() > bounds.max().z())
+                throw new IllegalArgumentException("Tracked Free center is outside its proxy");
+            if (bounds.min().x() > capsule.min().x() || bounds.min().y() > capsule.min().y() || bounds.min().z() > capsule.min().z()
+                    || bounds.max().x() < capsule.max().x() || bounds.max().y() < capsule.max().y() || bounds.max().z() < capsule.max().z())
+                throw new IllegalArgumentException("Tracked Free proxy does not contain its actual capsule");
+        }
+    }
+
     /** Exact accepted box and its compatibility coordinate, bound to the packet's physical revision. */
-    public record CardinalGeometry(UUID physicsSession, long physicsWorldEpoch, Vec3d transport, Aabb bounds) {
+    public record CardinalGeometry(UUID physicsSession, long physicsWorldEpoch, Vec3d transport, Aabb bounds) implements TrackedGeometry {
         public CardinalGeometry {
             Objects.requireNonNull(physicsSession, "physicsSession");
             Objects.requireNonNull(transport, "transport");
@@ -143,11 +175,11 @@ public final class PlayerRenderPoseProtocol {
     public record Packet(Kind kind, UUID connectionToken, long viewerRealm, long worldRequestGeneration,
                          UUID playerId, int entityId, int dimension,
                          long worldEpoch, long lifetime, long sequence, long physicalRevision,
-                         Mode mode, int cardinalFrame, Quaternion body, Quaternion head, CardinalGeometry geometry, PresentationRelease release) {
+                         Mode mode, int cardinalFrame, Quaternion body, Quaternion head, TrackedGeometry geometry, PresentationRelease release) {
         public Packet(Kind kind, UUID connectionToken, long viewerRealm, long worldRequestGeneration,
                       UUID playerId, int entityId, int dimension, long worldEpoch, long lifetime,
                       long sequence, long physicalRevision, Mode mode, int cardinalFrame, Quaternion body,
-                      Quaternion head, CardinalGeometry geometry) {
+                      Quaternion head, TrackedGeometry geometry) {
             this(kind, connectionToken, viewerRealm, worldRequestGeneration, playerId, entityId, dimension,
                     worldEpoch, lifetime, sequence, physicalRevision, mode, cardinalFrame, body, head, geometry, null);
         }
@@ -204,10 +236,12 @@ public final class PlayerRenderPoseProtocol {
             }
             if ((kind == Kind.PRESENTATION_RELEASE) != (release != null))
                 throw new IllegalArgumentException("Release identity requires PRESENTATION_RELEASE");
-            if (geometry != null) {
+            if (geometry instanceof FreeGeometry && (kind != Kind.POSE || mode != Mode.FREE))
+                throw new IllegalArgumentException("Free geometry requires an accepted Free POSE revision");
+            if (geometry instanceof CardinalGeometry cardinalGeometry) {
                 if (kind != Kind.POSE || mode != Mode.CARDINAL)
                     throw new IllegalArgumentException("Geometry requires an accepted Cardinal POSE revision");
-                geometry.validateFrame(cardinalFrame);
+                cardinalGeometry.validateFrame(cardinalFrame);
                 Vec3d up = CardinalFrame.values()[cardinalFrame].up();
                 if (!CardinalGeometry.near(2 * (body.x() * body.y() - body.z() * body.w()), up.x())
                         || !CardinalGeometry.near(1 - 2 * (body.x() * body.x() + body.z() * body.z()), up.y())
@@ -292,7 +326,7 @@ public final class PlayerRenderPoseProtocol {
         out.put((byte) packet.mode().ordinal()).put((byte) packet.cardinalFrame());
         putQuaternion(out, packet.body());
         putQuaternion(out, packet.head());
-        out.put((byte) (packet.geometry() == null ? 0 : 1));
+        out.put((byte) (packet.geometry() == null ? 0 : packet.geometry() instanceof FreeGeometry ? 2 : 1));
         if (packet.geometry() != null) {
             var geometry = packet.geometry();
             putUuid(out, geometry.physicsSession());
@@ -300,6 +334,10 @@ public final class PlayerRenderPoseProtocol {
             putVector(out, geometry.transport());
             putVector(out, geometry.bounds().min());
             putVector(out, geometry.bounds().max());
+            if (geometry instanceof FreeGeometry free) {
+                putVector(out, free.center()); putVector(out, free.negativeEndpoint()); putVector(out, free.positiveEndpoint());
+                out.putDouble(free.radius()); putVector(out, free.eye());
+            }
         }
         return finish(out);
     }
@@ -343,9 +381,15 @@ public final class PlayerRenderPoseProtocol {
                     int frame = in.get();
                     Quaternion body = getQuaternion(in), head = getQuaternion(in);
                     int tag = Byte.toUnsignedInt(in.get());
-                    if (tag > 1) throw new IllegalArgumentException("Unknown tracked geometry tag");
-                    CardinalGeometry geometry = tag == 0 ? null : new CardinalGeometry(getUuid(in), in.getLong(),
-                            getVector(in), new Aabb(getVector(in), getVector(in)));
+                    if (tag > 2) throw new IllegalArgumentException("Unknown tracked geometry tag");
+                    TrackedGeometry geometry = null;
+                    if (tag != 0) {
+                        var physicsSession = getUuid(in); long physicsEpoch = in.getLong();
+                        var transport = getVector(in); var bounds = new Aabb(getVector(in), getVector(in));
+                        geometry = tag == 1 ? new CardinalGeometry(physicsSession, physicsEpoch, transport, bounds)
+                                : new FreeGeometry(physicsSession, physicsEpoch, transport, bounds,
+                                        getVector(in), getVector(in), getVector(in), in.getDouble(), getVector(in));
+                    }
                     packet = new Packet(kind, connectionToken, viewerRealm, 0, player, entityId, dimension,
                             worldEpoch, lifetime, sequence, revision, mode, frame, body, head, geometry);
                 }

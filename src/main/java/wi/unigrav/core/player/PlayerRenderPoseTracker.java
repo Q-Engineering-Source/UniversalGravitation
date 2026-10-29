@@ -399,6 +399,7 @@ public final class PlayerRenderPoseTracker {
                     connection.world.provider.getDimension(), epoch(connection.world), false, false, false,
                     null, null, 0, 0, false, scope.sessionId(), scope.worldEpoch(), acceptedPresentation.kind()));
         }
+        if (physics.accepted(connection.handler).isPresent()) return Optional.empty();
 
         Optional<GIntentObservation> observed = intent.observe(player);
         boolean personalZeroG = observed.filter(GIntentObservation::active).isPresent();
@@ -426,6 +427,7 @@ public final class PlayerRenderPoseTracker {
         } else if (!custody || !personalZeroG) return Optional.empty();
 
         Optional<PlayerPhysicalSnapshot> physical = physics.accepted(connection.handler);
+        if (physical.isPresent()) return Optional.empty();
         UUID physicalScope = physical.map(snapshot -> snapshot.scope().sessionId()).orElse(null);
         long physicalEpoch = physical.map(snapshot -> snapshot.scope().worldEpoch()).orElse(0L);
         GIntentObservation source = observed.orElse(null);
@@ -488,10 +490,25 @@ public final class PlayerRenderPoseTracker {
                             accepted.scope().worldEpoch(), accepted.placement().transport(), accepted.placement().bounds()));
         }
 
-        // accepted() is used only to prevent a stale/temporarily inadmissible Cardinal owner from
+        if (admitted != null && admitted.kind() == PresentationKind.FREE_OWNER) {
+            var snapshot = admitted.snapshot(); var placement = snapshot.placement();
+            var q = placement.attitude();
+            var body = new PlayerRenderPoseProtocol.Quaternion(q.x(), q.y(), q.z(), q.w());
+            var capsule = placement.capsule();
+            var currentAdmission = acceptedPresentation(connection).orElse(null);
+            if (currentAdmission == null || currentAdmission.kind() != PresentationKind.FREE_OWNER
+                    || currentAdmission.snapshot() != snapshot) return null;
+            return new PoseState(PlayerRenderPoseProtocol.Mode.FREE, -1, snapshot.revision(),
+                    snapshot.scope().sessionId(), 0, epoch(connection.world), connection.world.provider.getDimension(),
+                    body, head == null ? body : head, new PlayerRenderPoseProtocol.FreeGeometry(
+                            snapshot.scope().sessionId(), snapshot.scope().worldEpoch(), placement.transport(), placement.bounds(),
+                            placement.center(), capsule.centerline().start(), capsule.centerline().end(), capsule.radius(), placement.eye()));
+        }
+
+        // accepted() is used only to prevent a stale/temporarily inadmissible physical owner from
         // falling through to the legacy FREE client-body branch. It never grants a report lease.
         PlayerPhysicalSnapshot accepted = physics.accepted(connection.handler).orElse(null);
-        if (accepted != null && accepted.placement().shape() instanceof PlayerBodyShape.Cardinal) return null;
+        if (accepted != null) return null;
         if (connection.lease != null && connection.lease.signature.kind() == PresentationKind.CARDINAL_HEAD) return null;
         if (connection.lease != null && connection.lease.signature.kind() == PresentationKind.FREE_OWNER
                 && (admitted == null || admitted.kind() != PresentationKind.FREE_OWNER
@@ -893,7 +910,7 @@ public final class PlayerRenderPoseTracker {
     private record PoseState(PlayerRenderPoseProtocol.Mode mode, int cardinalFrame, long physicalRevision,
                              UUID physicsScope, long freeLease, long worldEpoch, int dimension,
                              PlayerRenderPoseProtocol.Quaternion body, PlayerRenderPoseProtocol.Quaternion head,
-                             PlayerRenderPoseProtocol.CardinalGeometry geometry) { }
+                             PlayerRenderPoseProtocol.TrackedGeometry geometry) { }
 
     private static final class Pair {
         private final Connection viewer;

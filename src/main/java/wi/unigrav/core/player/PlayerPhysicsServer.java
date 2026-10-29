@@ -17,6 +17,7 @@ import org.apache.logging.log4j.MarkerManager;
 import dev.crlhitbox.api.geometry.Vec3d;
 import dev.crlhitbox.api.geometry.Rotation3d;
 import dev.crlhitbox.api.geometry.Aabb;
+import dev.crlhitbox.api.geometry.contact.CapsuleAabbContact3d.Relation;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.MoverType;
 import net.minecraft.entity.player.EntityPlayerMP;
@@ -24,6 +25,7 @@ import net.minecraft.network.NetHandlerPlayServer;
 import net.minecraft.network.EnumPacketDirection;
 import net.minecraft.network.NetworkManager;
 import net.minecraft.util.math.AxisAlignedBB;
+import net.minecraft.util.text.TextComponentString;
 import net.minecraft.world.WorldServer;
 import net.minecraftforge.common.DimensionManager;
 import net.minecraftforge.common.MinecraftForge;
@@ -106,6 +108,7 @@ public final class PlayerPhysicsServer {
     private long worldEpoch;
     private boolean installed;
     private RemoteTransfer preparingRemote;
+    private InitializationInstallation initializingPose;
     private PlayerPhysicsStep movement;
     private NativeEnvironmentScope nativeEnvironmentScope;
 
@@ -578,6 +581,8 @@ public final class PlayerPhysicsServer {
     }
 
     public synchronized Optional<PlayerPhysicalSnapshot> ownedPhysicalBody(EntityPlayerMP player) {
+        if (initializingPose != null && initializingPose.session.player == player)
+            return initializingPose.presentationJournal();
         if (!drivesMotion(player) || PlayerKinematics.requiresNative(player)) return Optional.empty();
         var installed = FreeOwnerTransaction.nativeInstallation(player);
         if (installed != null) {
@@ -2558,6 +2563,350 @@ public final class PlayerPhysicsServer {
         return true;
     }
 
+    private static final class InitializationDeferred extends RuntimeException {
+        private InitializationDeferred(String reason) { super(reason); }
+        private InitializationDeferred(String reason, RuntimeException cause) { super(reason, cause); }
+    }
+
+    /** First-owner target-only proof. It is deliberately separate from ordinary same-centre transitions. */
+    private InitializationInstallation prepareInitialization(Session session,
+            PlayerPosePersistence.InitializationHistory history, NativePlayerMovement.CenterWindow window,
+            NativePlayerMovement.Receipt receipt, Vec3d velocity) {
+        if (initializingPose != null) throw new IllegalStateException("Nested first-owner pose initialization");
+        var body = NativeCardinalBodyProfile.sample(session.player);
+        if (body.isEmpty()) throw new InitializationDeferred("current-full-body-producer-unqualified");
+        if (!(session.player instanceof ProneBodyProducer producer))
+            throw new InitializationDeferred("current-standing-eye-producer-unavailable");
+        var input = producer.unigrav$proneBodyInput();
+        if (input.isEmpty()) throw new InitializationDeferred("current-standing-eye-input-unavailable");
+        var profile = body.orElseThrow();
+        for (var sample : window.samples()) {
+            if (sample.source().profile().filter(profile.profile()::equals).isEmpty())
+                throw new InitializationDeferred("completed-centre-samples-do-not-match-qualified-body-producer");
+        }
+        var transport = receipt.placement().transport();
+        var staged = new Owned(new BoostMovementBudget(ordinaryCeiling(), serverTick,
+                new Vec3(transport.x(), transport.y(), transport.z())), serverTick,
+                session.world.getTotalWorldTime(), nativeNoGravity(session.player, session.player.hasNoGravity()));
+        var resources = staged.freeResources.acquire(staged, session.world, session.scope, staged.travel.correctionRevision());
+        var prepared = new InitializationInstallation(session, history, window, receipt, velocity,
+                profile, producer, input.orElseThrow(), staged, resources);
+        prepared.requireNativeSource();
+        var saved = history.saved();
+        prepared.selectTarget();
+        prepared.requireNativeSource();
+        if (!StoredRealizationLimits.sameRaw(prepared.target.transport(), transport))
+            throw new IllegalStateException("First-owner rebuilt pose changed the actual native transport");
+        // Equal physical provenance must reconstruct the saved centre exactly; history is not a fit proof.
+        if (saved.physical().filter(profile.physical()::equals).isPresent()
+                && saved.attitude().equals(prepared.target.attitude())
+                && !StoredRealizationLimits.sameRaw(prepared.target.center(), saved.center()))
+            throw new IllegalStateException("First-owner unchanged physical profile reconstructed a different stored centre");
+        prepared.staged.initializeReference(prepared.target, session.player.rotationYaw);
+        if (prepared.target.shape() instanceof PlayerBodyShape.Cardinal cardinal) {
+            var forward = prepared.target.attitude().basisZ().multiply(-1);
+            var tangent = forward.subtract(cardinal.frame().up().multiply(forward.dot(cardinal.frame().up())));
+            double magnitude = Math.sqrt(tangent.lengthSquared());
+            if (!(magnitude > 0)) throw new IllegalStateException("Restored Cardinal attitude has no tangent heading");
+            prepared.staged.travel.bodyReference(PlayerBodyReference.State.initial(cardinal.frame(), tangent.multiply(1 / magnitude)));
+        }
+        prepared.journal = new PlayerPhysicalSnapshot(session.scope, 0, prepared.target, velocity,
+                Optional.of(new PlayerPhysicalSnapshot.Contacts(false, false, false, session.player.fallDistance)));
+        return prepared;
+    }
+
+    /** Unforgeable local installation journal, never exposed as a session owner before readback. */
+    final class InitializationInstallation {
+        private final Session session;
+        private final PlayerPosePersistence.InitializationHistory history;
+        private final NativePlayerMovement.CenterWindow window;
+        private final NativePlayerMovement.Receipt receipt;
+        private final NativeCardinalBodyProfile.Value body;
+        private final ProneBodyProducer producer;
+        private final ProneBodyProducer.Input input;
+        private final Owned staged;
+        private final FreeTickResources resources;
+        private final PlayerPhysicsProtocol.Packet pending;
+        private final long proposal, worldTick;
+        private final GIntentObservation source;
+        private final Vec3d velocity;
+        private final WorldCollisionCandidates.ActorGeometry sourceGeometry;
+        private WorldCollisionCandidates.ActorGeometry installedGeometry;
+        private PlayerBodyPlacement target;
+        private PlayerPhysicalSnapshot journal;
+        private WorldCollisionCandidates.Snapshot capture;
+        private CapsulePlacementMath.Pose environmentPose;
+        private CapsuleEnvironmentObservation.Prepared environment;
+        private CardinalFrame selectionFrame;
+        private boolean standingBlocked;
+        private Optional<PlayerBodyShape.PronePose> selectedPose;
+        private boolean mutating, installed, published;
+
+        private InitializationInstallation(Session session, PlayerPosePersistence.InitializationHistory history,
+                NativePlayerMovement.CenterWindow window, NativePlayerMovement.Receipt receipt, Vec3d velocity,
+                NativeCardinalBodyProfile.Value body, ProneBodyProducer producer, ProneBodyProducer.Input input,
+                Owned staged, FreeTickResources resources) {
+            this.session = session; this.history = history; this.window = window; this.receipt = receipt;
+            this.velocity = velocity; this.body = body; this.producer = producer; this.input = input;
+            this.staged = staged; this.resources = resources; pending = session.pending;
+            proposal = session.proposal; source = session.source; worldTick = session.world.getTotalWorldTime();
+            sourceGeometry = WorldCollisionCandidates.ActorGeometry.read(session.player);
+        }
+
+        private void requireBase() {
+            history.requireCurrent();
+            resources.requireCurrent(staged, session.world, session.scope, staged.travel.correctionRevision());
+            if (published || !current(session) || session.owner != null || session.pending != pending
+                    || session.proposal != proposal || session.source != source
+                    || session.world.getTotalWorldTime() != worldTick || session.player.velocityChanged
+                    || (mutating && initializingPose != this))
+                throw new IllegalStateException("First-owner initialization lost its exact pending session or installation stage");
+        }
+
+        private void requireSources() {
+            requireBase();
+            boolean valid = !NativeFlags.read(session.player).requiresNative()
+                    && body.current() && producer.unigrav$proneBodyInput().filter(input::equals).isPresent()
+                    && intent.observe(session.player).filter(source::equals).isPresent();
+            requireBase();
+            if (!valid) throw new IllegalStateException("First-owner body, eye or intent source changed");
+        }
+
+        private void requireNativeSource() {
+            if (mutating) throw new IllegalStateException("Native initialization source used after mutation began");
+            requireSources();
+            var centers = NativePlayerMovement.INSTANCE.acceptedCenters(session.handler);
+            var currentReceipt = NativePlayerMovement.INSTANCE.current(session.handler);
+            if (centers.isEmpty() || currentReceipt.orElse(null) != receipt
+                    || !centers.orElseThrow().equals(window)
+                    || !sourceGeometry.equals(WorldCollisionCandidates.ActorGeometry.read(session.player)))
+                throw new IllegalStateException("First-owner completed native source or centre window changed");
+            requireBase();
+        }
+
+        private PlayerBodyPlacement fromTransport(Rotation3d attitude, PlayerBodyShape shape) {
+            var numeric = resources.numeric();
+            var origin = new PlayerBodyPlacement(new Vec3d(0, 0, 0), attitude, shape, numeric);
+            var position = receipt.placement().transport();
+            var arithmetic = BootQueryArithmetic.fromSameWork(numeric);
+            var center = new Vec3d(position.x(), arithmetic.roundNearest(arithmetic.subtract(
+                    arithmetic.exact(position.y()), arithmetic.exact(origin.bounds().min().y()))), position.z());
+            var result = new PlayerBodyPlacement(center, attitude, shape, numeric);
+            if (!StoredRealizationLimits.sameRaw(result.transport(), position))
+                throw new IllegalStateException("Rebuilt initialization body cannot represent the unchanged native transport");
+            return result;
+        }
+
+        private PlayerBodyPlacement freeTarget(Rotation3d attitude, Optional<PlayerBodyShape.PronePose> prone) {
+            var arithmetic = BootQueryArithmetic.fromSameWork(resources.numeric());
+            var offset = arithmetic.subtract(arithmetic.exact(input.standingEyeHeight()),
+                    arithmetic.multiply(arithmetic.exact(body.physical().length()), arithmetic.exact(.5)));
+            var up = attitude.basisY();
+            var eye = new Vec3d(arithmetic.roundNearest(arithmetic.multiply(arithmetic.exact(up.x()), offset)),
+                    arithmetic.roundNearest(arithmetic.multiply(arithmetic.exact(up.y()), offset)),
+                    arithmetic.roundNearest(arithmetic.multiply(arithmetic.exact(up.z()), offset)));
+            var anchor = new FreeEyeAnchor(FreeEyeAnchor.STORED_BASIS_V1, new Vec3d(0, 0, 0), eye, attitude);
+            var raw = receipt.placement().shape().dimensions();
+            return fromTransport(attitude, new PlayerBodyShape.FreeCapsule(raw, body.physical(), Optional.of(anchor), prone));
+        }
+
+        private boolean flightSelected() {
+            return session.player.capabilities.isFlying || session.player.isElytraFlying()
+                    || personalGBackpackControl(session);
+        }
+
+        private Optional<PlayerBodyShape.PronePose> selectPose(boolean water) {
+            // No currently accepted swim state exists at first ownership. Historical SWIMMING is not permission.
+            return ProneLocomotion.selectPose(session.player, input, Optional.empty(), selectionFrame,
+                    flightSelected(), water, session.player.isSprinting(), standingBlocked);
+        }
+
+        private void selectTarget() {
+            var saved = history.saved();
+            selectionFrame = saved.reference().orElse(CardinalFrame.Y_POS);
+            var look = saved.kind() == SavedPlayerPose.Kind.CRAWLING || saved.kind() == SavedPlayerPose.Kind.SWIMMING
+                    ? saved.attitude().basisY() : saved.attitude().basisZ().multiply(-1);
+            Rotation3d standingQ = saved.attitude();
+            PlayerBodyPlacement standing = null;
+            if (saved.kind() != SavedPlayerPose.Kind.FREE) {
+                if (saved.kind() != SavedPlayerPose.Kind.CARDINAL) {
+                    var tangent = look.subtract(selectionFrame.up().multiply(look.dot(selectionFrame.up())));
+                    double magnitude = Math.sqrt(tangent.lengthSquared());
+                    tangent = magnitude > 0 ? tangent.multiply(1 / magnitude)
+                            : PlayerBodyReference.initialHeading(selectionFrame, session.player.rotationYaw);
+                    var q = PlayerRenderPoseProtocol.Quaternion.fromUpForward(selectionFrame.up(), tangent);
+                    standingQ = new Rotation3d(q.x(), q.y(), q.z(), q.w());
+                }
+                var dimensions = new PlayerBodyShape.Dimensions(body.physical().diameter(), body.physical().length(), input.standingEyeHeight());
+                target = standing = fromTransport(standingQ, new PlayerBodyShape.Cardinal(selectionFrame, dimensions));
+                standingBlocked = !fit();
+            }
+            selectedPose = selectPose(false);
+            var visited = new LinkedHashSet<Optional<PlayerBodyShape.PronePose>>();
+            // Finite mode fixed point: each distinct current candidate gets its own full fit and actual-fluid scan.
+            while (visited.add(selectedPose)) {
+                if (selectedPose.isPresent()) {
+                    if (saved.reference().isEmpty())
+                        throw new InitializationDeferred("current-prone-mode-needs-a-proven-reference");
+                    var pose = selectedPose.orElseThrow();
+                    boolean sameMode = saved.kind().name().equals(pose.kind().name());
+                    var q = sameMode ? saved.attitude() : ProneLocomotion.attitude(look, saved.attitude(), pose);
+                    target = freeTarget(q, selectedPose);
+                } else target = standing == null ? freeTarget(saved.attitude(), Optional.empty()) : standing;
+                environmentPose = CapsulePlacementMath.pose(target, resources.numeric());
+                var observed = CapsuleEnvironmentObservation.observe(this, session.player, environmentPose,
+                        resources.queries(), this::requireSources, FreeNativeEnvironment.serverLoadedChunks(session.world),
+                        resources.environmentObservationWork());
+                requireNativeSource();
+                if (observed instanceof CapsuleEnvironmentObservation.Unavailable failure)
+                    throw new InitializationDeferred("current-full-target-fluid-unavailable: " + failure.reason(), failure.cause().orElse(null));
+                environment = (CapsuleEnvironmentObservation.Prepared) observed;
+                var currentSelection = selectPose(environment.inWater());
+                requireNativeSource();
+                if (currentSelection.equals(selectedPose)) {
+                    if (!fit()) throw new InitializationDeferred("current-full-target-occupied: " + selectedPose);
+                    requireEnvironment();
+                    return;
+                }
+                selectedPose = currentSelection;
+            }
+            throw new InitializationDeferred("current-pose-and-full-body-fluid-selection-not-stable");
+        }
+
+        private void requireEnvironment() {
+            if (environment == null || !environment.matches(this, environmentPose)
+                    || !selectPose(environment.inWater()).equals(selectedPose))
+                throw new IllegalStateException("First-owner current fluid, pose intent or standing selection changed");
+            requireSources();
+        }
+
+        private WorldCollisionCandidates.Snapshot captureTarget() {
+            var result = WorldCollisionCandidates.capture(session.world, session.player, target.bounds(),
+                    target.shape() instanceof PlayerBodyShape.FreeCapsule
+                            ? CollisionQueryFootprint.QueryPolicy.CAPSULE_CONTACT : CollisionQueryFootprint.QueryPolicy.NATIVE_STRICT,
+                    POSE_SCAN, resources.environmentObservationWork());
+            requireSources();
+            if (result instanceof WorldCollisionCandidates.Unavailable failure)
+                throw new InitializationDeferred("target-capture-unavailable: " + failure.reason()
+                        + "; " + failure.detail(), failure.cause().orElse(null));
+            return (WorldCollisionCandidates.Snapshot) result;
+        }
+
+        private boolean fit() {
+            requireNativeSource();
+            capture = captureTarget();
+            requireNativeSource();
+            if (!capture.actorGeometry().equals(sourceGeometry))
+                throw new IllegalStateException("First-owner target capture used a different native actor");
+            if (!(target.shape() instanceof PlayerBodyShape.FreeCapsule)) return capture.boxes().isEmpty();
+            var capsule = CapsulePlacementMath.pose(target, resources.numeric()).capsule();
+            for (var obstacle : capture.boxes()) {
+                requireNativeSource();
+                var contact = resources.queries().query(capsule, obstacle, FreeOwnerTransaction.ACCURACY, "first-owner-initialization-target");
+                requireNativeSource();
+                if (contact.relation() == Relation.OVERLAPPING) return false;
+                if (contact.relation() != Relation.SEPARATED && contact.relation() != Relation.TOUCHING)
+                    throw new IllegalStateException("First-owner full target relation unresolved: " + contact.relation());
+            }
+            return true;
+        }
+
+        private Optional<PlayerPhysicalSnapshot> presentationJournal() {
+            if (!mutating || published || journal == null) return Optional.empty();
+            requireBase();
+            return Optional.of(journal);
+        }
+
+        private void requireInstalled() {
+            requireSources();
+            requireEnvironment();
+            var actor = session.player;
+            if (!installed || !matchesPhysicalGeometry(actor, journal)
+                    || actor.motionX != velocity.x() * GravityEntityBinder.TICK_SECONDS
+                    || actor.motionY != velocity.y() * GravityEntityBinder.TICK_SECONDS
+                    || actor.motionZ != velocity.z() * GravityEntityBinder.TICK_SECONDS
+                    || actor.onGround || actor.collidedHorizontally || actor.collidedVertically
+                    || actor.fallDistance != journal.contacts().orElseThrow().fallDistance()
+                    || !installedGeometry.equals(WorldCollisionCandidates.ActorGeometry.read(session.player)))
+                throw new IllegalStateException("First-owner installed geometry or eye readback changed");
+            requireBase();
+        }
+
+        WorldCollisionCandidates.ActorGeometry sourceGeometry() { return sourceGeometry; }
+        WorldCollisionCandidates.ActorGeometry installedGeometry() { return installedGeometry; }
+        void requireInstalledComparison(WorldCollisionCandidates.Snapshot before, WorldCollisionCandidates.Snapshot after) {
+            requireInstalled();
+            if (before != capture || after == null || !before.footprint().requestedBounds().equals(target.bounds())
+                    || !after.footprint().requestedBounds().equals(target.bounds()))
+                throw new IllegalStateException("First-owner world bridge is not the prepared target observation");
+        }
+
+        private PlayerPhysicalSnapshot install() {
+            requireNativeSource();
+            requireEnvironment();
+            if (journal == null || !capture.sameObservation(captureTarget()))
+                throw new IllegalStateException("First-owner target world changed before installation");
+            requireNativeSource();
+            history.consume();
+            initializingPose = this;
+            mutating = true;
+            try {
+                var actor = session.player;
+                var dimensions = target.shape().dimensions();
+                var bounds = target.bounds();
+                requireBase();
+                actor.width = (float) dimensions.width();
+                actor.height = (float) dimensions.height();
+                if (actor instanceof NativePoseEyeProducer.OwnedStandingMirror mirror) {
+                    mirror.unigrav$installStandingEye(new NativePoseEyeProducer.StandingEyeWrite(actor,
+                            input.standingRawEyeHeight(), (float) dimensions.eyeHeight(), this::requireBase));
+                } else FreeOwnerTransaction.installEffectiveEyeHeight(actor, dimensions.eyeHeight());
+                requireBase();
+                actor.setEntityBoundingBox(new AxisAlignedBB(bounds.min().x(), bounds.min().y(), bounds.min().z(),
+                        bounds.max().x(), bounds.max().y(), bounds.max().z()));
+                requireBase();
+                // No setPosition or resetPositionToBB: the exact original transport is retained.
+                actor.motionX = velocity.x() * GravityEntityBinder.TICK_SECONDS;
+                actor.motionY = velocity.y() * GravityEntityBinder.TICK_SECONDS;
+                actor.motionZ = velocity.z() * GravityEntityBinder.TICK_SECONDS;
+                actor.onGround = false; actor.collidedHorizontally = false; actor.collidedVertically = false;
+                installedGeometry = WorldCollisionCandidates.ActorGeometry.read(actor);
+                installed = true;
+                requireInstalled();
+                var after = captureTarget();
+                if (!capture.sameInitializationWorld(after, this))
+                    throw new IllegalStateException("First-owner target world changed across installation");
+                requireInstalled();
+                staged.snapshot = journal;
+                session.owner = staged;
+                published = true;
+                initializingPose = null;
+                reconcileMobilityControl(session, staged);
+                history.requireCurrent();
+                resources.requireCurrent(staged, session.world, session.scope, staged.travel.correctionRevision());
+                if (!current(session) || session.owner != staged || staged.snapshot != journal
+                        || !matchesPhysicalGeometry(actor, journal) || !current(session)
+                        || session.owner != staged || staged.snapshot != journal)
+                    throw new IllegalStateException("First-owner publication changed during mobility reconciliation");
+                UnigravMod.LOGGER.info("UG pose initialization committed: scope={}, savedKind={}, targetShape={}, centre={}, transport={}, velocity={}",
+                        session.scope, history.saved().kind(), target.shape(), target.center(), target.transport(), velocity);
+                return journal;
+            } catch (RuntimeException failure) {
+                // A partial first installation has no accepted predecessor to resume. Isolate this connection.
+                if (initializingPose == this) initializingPose = null;
+                try { if (sessions.get(session.manager) == session) retire(session.manager); }
+                catch (RuntimeException cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+                try { session.handler.disconnect(new TextComponentString("UG pose initialization failed; see server log")); }
+                catch (RuntimeException cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+                UnigravMod.LOGGER.error("UG pose initialization failed during installation: scope={}, target={}",
+                        session.scope, target.transport(), failure);
+                return null;
+            } finally {
+                if (initializingPose == this) initializingPose = null;
+            }
+        }
+    }
+
     /**
      * Router-only: both legacy finishers and all packet callbacks have already returned normally.
      */
@@ -2603,6 +2952,35 @@ public final class PlayerPhysicsServer {
                         Optional.of(new PlayerPhysicalSnapshot.Contacts(actor.onGround, actor.collidedHorizontally,
                                 actor.collidedVertically, actor.fallDistance)));
                 var application = session.pending.application();
+                boolean initialized = false;
+                // Failed observation work cannot be reset by another packet/proposal in this world tick.
+                if (session.poseInitializationAttemptTick == session.world.getTotalWorldTime()) return;
+                if (!resuming && !remoteSource) {
+                    try {
+                        var history = PlayerPosePersistence.initializationHistory(actor);
+                        if (history.isPresent()) {
+                            if (snapshot.worldVelocity().lengthSquared() > ordinaryCeiling() * ordinaryCeiling()) return;
+                            session.poseInitializationAttemptTick = session.world.getTotalWorldTime();
+                            var installation = prepareInitialization(session, history.orElseThrow(), window, lastReceipt,
+                                    snapshot.worldVelocity());
+                            snapshot = installation.install();
+                            if (snapshot == null) return;
+                            initialized = true;
+                        }
+                    } catch (RuntimeException failure) {
+                        session.poseInitializationAttemptTick = session.world.getTotalWorldTime();
+                        String reason = failure.getClass().getName() + ": " + failure.getMessage();
+                        if (!reason.equals(session.lastPoseInitializationFailure)) {
+                            session.lastPoseInitializationFailure = reason;
+                            if (failure instanceof InitializationDeferred && failure.getCause() == null)
+                                UnigravMod.LOGGER.warn("UG pose initialization deferred: scope={}, nativeReceipt={}, reason={}",
+                                        session.scope, lastReceipt.delegateRevision(), failure.getMessage());
+                            else UnigravMod.LOGGER.error("UG pose initialization preparation failed: scope={}, nativeReceipt={}",
+                                        session.scope, lastReceipt.delegateRevision(), failure);
+                        }
+                        return;
+                    }
+                }
                 if (resuming) {
                     if (remoteSource || Math.hypot(Math.hypot(vx, vy), vz) > session.owner.budget.ceilingMps()) return;
                     Owned retained = session.owner;
@@ -2667,7 +3045,7 @@ public final class PlayerPhysicsServer {
                     } finally {
                         preparingRemote = null;
                     }
-                } else {
+                } else if (!initialized) {
                     double limit = ordinaryCeiling();
                     if (Math.hypot(Math.hypot(vx, vy), vz) > limit) return;
                     Vec3d transport = snapshot.placement().transport();
@@ -7095,6 +7473,8 @@ public final class PlayerPhysicsServer {
         private PlayerPhysicsProtocol.Packet pending;
         private long pendingTick;
         private boolean overflowReported;
+        private long poseInitializationAttemptTick = Long.MIN_VALUE;
+        private String lastPoseInitializationFailure;
         private Owned owner;
         private FreeOwnerTransaction.InstallationCustody failedInstallationCustody;
 
@@ -7219,20 +7599,29 @@ public final class PlayerPhysicsServer {
 
         private Owned(PlayerPhysicalSnapshot snapshot, BoostMovementBudget budget, long tick, long worldTick,
                       boolean nativeNoGravity, float initialYaw) {
+            this(budget, tick, worldTick, nativeNoGravity);
             this.snapshot = snapshot;
+            initializeReference(snapshot.placement(), initialYaw);
+        }
+
+        /** Private staging object: no snapshot or session owner exists until initialization commits. */
+        private Owned(BoostMovementBudget budget, long tick, long worldTick, boolean nativeNoGravity) {
             this.budget = budget;
             adoptedAtTick = tick;
             travel.nativeNoGravity = nativeNoGravity;
-            if (snapshot.placement().shape() instanceof PlayerBodyShape.Cardinal cardinal) {
+            budgetTick = budget.snapshot().lastTick();
+            lastWorldTick = worldTick;
+            lastStateTick = tick;
+        }
+
+        private void initializeReference(PlayerBodyPlacement placement, float initialYaw) {
+            if (placement.shape() instanceof PlayerBodyShape.Cardinal cardinal) {
                 CardinalFrame initialFrame = cardinal.frame();
                 travel.bodyReference(PlayerBodyReference.State.initial(initialFrame,
                         PlayerBodyReference.initialHeading(initialFrame, initialYaw)));
             } else {
                 travel.ownerReference(new PlayerBodyReference.FreeReference(Optional.empty(), Optional.empty()));
             }
-            budgetTick = budget.snapshot().lastTick();
-            lastWorldTick = worldTick;
-            lastStateTick = tick;
         }
 
         private boolean holdsNativeGeometry() {

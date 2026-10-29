@@ -7,6 +7,7 @@ import net.minecraft.network.NetHandlerPlayServer;
 import net.minecraft.world.WorldServer;
 import wi.unigrav.UnigravMod;
 import java.util.Set;
+import java.util.Optional;
 import java.util.function.BooleanSupplier;
 import net.minecraftforge.common.DimensionManager;
 
@@ -47,6 +48,59 @@ public final class PlayerPosePersistence {
 
     public static void invalidate(EntityPlayerMP player) {
         if (player instanceof Carrier carrier) carrier.unigrav$invalidateExternalPoseHistory();
+    }
+
+    /** Historical input lease only: neither this type nor consuming it proves a target fits. */
+    static final class InitializationHistory {
+        private final EntityPlayerMP player;
+        private final Carrier carrier;
+        private final LoadedPose loaded;
+        private final long externalGeneration;
+        private long consumedGeneration = -1;
+
+        private InitializationHistory(EntityPlayerMP player, Carrier carrier, LoadedPose loaded) {
+            this.player = player; this.carrier = carrier; this.loaded = loaded;
+            externalGeneration = carrier.unigrav$poseExternalGeneration();
+        }
+
+        SavedPlayerPose saved() { return loaded.saved; }
+
+        void requireCurrent() {
+            long expected = consumedGeneration < 0 ? loaded.generation : consumedGeneration;
+            boolean candidateCurrent = consumedGeneration < 0 ? carrier.unigrav$loadedPose() == loaded
+                    : carrier.unigrav$loadedPose() == null;
+            if (!candidateCurrent || carrier.unigrav$poseHistoryGeneration() != expected
+                    || carrier.unigrav$poseExternalGeneration() != externalGeneration
+                    || player.connection != loaded.connection || loaded.connection == null
+                    || loaded.connection.player != player || loaded.connection.netManager.getNetHandler() != loaded.connection
+                    || !loaded.connection.netManager.isChannelOpen() || player.world != loaded.world
+                    || loaded.world == null || !loaded.world.isCallingFromMinecraftThread()
+                    || DimensionManager.getWorld(player.dimension) != loaded.world
+                    || player.dimension != loaded.saved.dimension() || player.isDead || !player.isEntityAlive()
+                    || !atTransport(player, loaded.saved) || NativePlayerMovement.INSTANCE.forceMutationActive(player))
+                throw new IllegalStateException("Pose initialization lost loaded input, connection, world, transport or mutation generation");
+        }
+
+        /** Consume before mutation. Failure after this point cannot revive the loaded candidate. */
+        void consume() {
+            if (consumedGeneration >= 0) throw new IllegalStateException("Pose initialization history already consumed");
+            requireCurrent();
+            carrier.unigrav$invalidatePoseHistory();
+            consumedGeneration = carrier.unigrav$poseHistoryGeneration();
+            requireCurrent();
+        }
+    }
+
+    static Optional<InitializationHistory> initializationHistory(EntityPlayerMP player) {
+        if (!(player instanceof Carrier carrier)) return Optional.empty();
+        LoadedPose loaded = carrier.unigrav$loadedPose();
+        if (loaded == null) return Optional.empty();
+        var history = new InitializationHistory(player, carrier, loaded);
+        history.requireCurrent();
+        if (!loaded.saved.world().equals(PlayerPoseWorldIdentity.get(loaded.world)))
+            throw new IllegalStateException("Pose initialization stable world identity changed");
+        history.requireCurrent();
+        return Optional.of(history);
     }
 
     private record LoadCycle(EntityPlayerMP player, long externalGeneration) { }

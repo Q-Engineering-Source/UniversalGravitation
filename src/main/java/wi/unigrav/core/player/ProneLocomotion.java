@@ -5,6 +5,7 @@ import dev.crlhitbox.api.geometry.Rotation3d;
 import dev.crlhitbox.api.geometry.Vec3d;
 import dev.crlhitbox.api.geometry.contact.CapsuleAabbContact3d.Relation;
 import java.util.Optional;
+import net.minecraft.entity.player.EntityPlayerMP;
 import net.minecraft.enchantment.EnchantmentHelper;
 import wi.unigrav.api.math.Vec3;
 import wi.unigrav.core.GravityEntityBinder;
@@ -80,23 +81,32 @@ final class ProneLocomotion {
             if (current.isEmpty()) return Choice.NONE;
             selected = Optional.empty();
         } else {
-            boolean swimming = water && controls.sprint()
-                    && (actor.capabilities.isCreativeMode || actor.getFoodStats().getFoodLevel() > 6)
-                    && (input.orElseThrow().eyesInWater() || current.filter(pose ->
-                            pose.kind() == PlayerBodyShape.PronePose.Kind.SWIMMING).isPresent());
-            boolean crawl = !swimming && (input.orElseThrow().forcedCrawl()
-                    || (placement.shape() instanceof PlayerBodyShape.Cardinal || current.isPresent())
-                        && !standingRoom(tx, body.orElseThrow().physical(), input.orElseThrow().standingEyeHeight(),
-                                frame, placement.shape() instanceof PlayerBodyShape.Cardinal ? controls.translation() : new Vec3d(0, 0, 0)));
-            if (!swimming && !crawl) return Choice.NONE;
-            selected = Optional.of(new PlayerBodyShape.PronePose(swimming
-                    ? PlayerBodyShape.PronePose.Kind.SWIMMING : PlayerBodyShape.PronePose.Kind.CRAWLING, frame));
+            selected = selectPose(actor, input.orElseThrow(), current, frame, false, water, controls.sprint(), false);
+            if (selected.isEmpty() && (placement.shape() instanceof PlayerBodyShape.Cardinal || current.isPresent())
+                    && !standingRoom(tx, body.orElseThrow().physical(), input.orElseThrow().standingEyeHeight(),
+                            frame, placement.shape() instanceof PlayerBodyShape.Cardinal ? controls.translation() : new Vec3d(0, 0, 0)))
+                selected = selectPose(actor, input.orElseThrow(), current, frame, false, water, controls.sprint(), true);
+            if (selected.isEmpty()) return Choice.NONE;
         }
         Rotation3d requested = selected.isEmpty() ? controls.desiredBodyAttitude().orElse(placement.attitude())
                 : attitude(controls.forward(), placement.attitude(), selected.orElseThrow());
         var request = new ProneTransitionRequest(tx, body.orElseThrow(), producer, input.orElseThrow(), selected, requested);
         if (!request.current()) throw new IllegalStateException("Prone selection lost its native body input");
         return new Choice(Optional.of(request), true);
+    }
+
+    /** Shared current-mode selection; a saved pose is never an already-swimming permission. */
+    static Optional<PlayerBodyShape.PronePose> selectPose(EntityPlayerMP actor, ProneBodyProducer.Input input,
+            Optional<PlayerBodyShape.PronePose> current, CardinalFrame frame,
+            boolean flight, boolean water, boolean sprint, boolean standingBlocked) {
+        if (flight) return Optional.empty();
+        boolean swimming = water && sprint
+                && (actor.capabilities.isCreativeMode || actor.getFoodStats().getFoodLevel() > 6)
+                && (input.eyesInWater() || current.filter(pose ->
+                        pose.kind() == PlayerBodyShape.PronePose.Kind.SWIMMING).isPresent());
+        if (swimming) return Optional.of(new PlayerBodyShape.PronePose(PlayerBodyShape.PronePose.Kind.SWIMMING, frame));
+        return input.forcedCrawl() || standingBlocked
+                ? Optional.of(new PlayerBodyShape.PronePose(PlayerBodyShape.PronePose.Kind.CRAWLING, frame)) : Optional.empty();
     }
 
     /** Full-height query for intent selection only; a clear result never grants standing installation. */

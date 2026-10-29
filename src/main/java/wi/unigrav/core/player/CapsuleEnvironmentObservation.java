@@ -98,7 +98,7 @@ final class CapsuleEnvironmentObservation {
         return observe(sourceIdentity, actor, pose, queries, requireCurrent, loadedChunks, null);
     }
 
-    private static Result observe(Object sourceIdentity, Entity actor, CapsulePlacementMath.Pose pose,
+    static Result observe(Object sourceIdentity, Entity actor, CapsulePlacementMath.Pose pose,
             CapsuleContactQueryBudget queries, Runnable requireCurrent,
             FreeNativeEnvironment.LoadedChunks loadedChunks, EnvironmentObservationWork work) {
         Objects.requireNonNull(sourceIdentity); Objects.requireNonNull(actor); Objects.requireNonNull(pose);

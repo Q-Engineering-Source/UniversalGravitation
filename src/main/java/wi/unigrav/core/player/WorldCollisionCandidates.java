@@ -95,6 +95,7 @@ public final class WorldCollisionCandidates {
         public CollisionQueryFootprint footprint() { return footprint; }
         public long rootEntitiesObserved() { return rootEntities; }
         public List<Aabb> boxes() { return boxes; }
+        ActorGeometry actorGeometry() { return actorGeometry; }
         Optional<NativeCollisionProvenance.Observation> provenance() { return Optional.ofNullable(provenance); }
         /** Join only the certified aggregate support's actual final ordinal, never equal geometry elsewhere. */
         Optional<NativeCollisionProvenance.Entry> blockProducer(CertifiedReferenceEndpoint endpoint,
@@ -292,8 +293,20 @@ public final class WorldCollisionCandidates {
 
         /** Compares two explicit observations; this does not call the world or pretend tick is a mutation revision. */
         public boolean sameObservation(Snapshot other) {
+            return other != null && actorGeometry.equals(other.actorGeometry) && sameObservedWorld(other);
+        }
+
+        /** Only the first-owner installation journal may bridge these two exact actor geometries. */
+        boolean sameInitializationWorld(Snapshot other, PlayerPhysicsServer.InitializationInstallation installation) {
+            installation.requireInstalledComparison(this, other);
+            return actorGeometry.equals(installation.sourceGeometry())
+                    && other != null && other.actorGeometry.equals(installation.installedGeometry())
+                    && sameObservedWorld(other);
+        }
+
+        private boolean sameObservedWorld(Snapshot other) {
             if (world != other.world || actor != other.actor || tick != other.tick
-                    || !actorGeometry.equals(other.actorGeometry) || rootEntities != other.rootEntities
+                    || rootEntities != other.rootEntities
                     || footprint.policy() != other.footprint.policy()
                     || !footprint.requestedBounds().equals(other.footprint.requestedBounds())
                     || !footprint.nativeBounds().equals(other.footprint.nativeBounds())

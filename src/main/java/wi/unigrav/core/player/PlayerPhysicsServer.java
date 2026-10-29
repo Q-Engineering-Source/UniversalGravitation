@@ -6600,19 +6600,28 @@ public final class PlayerPhysicsServer {
     @SubscribeEvent
     public void onLogin(PlayerEvent.PlayerLoggedInEvent event) {
         retirePlayer(event);
-        if (event.player instanceof EntityPlayerMP player) PlayerPosePersistence.retain(player, null);
+        if (event.player instanceof EntityPlayerMP player) {
+            PlayerPosePersistence.retain(player, null);
+            PlayerPosePersistence.bindLogin(player);
+        }
+    }
+
+    @SubscribeEvent
+    public void onClone(net.minecraftforge.event.entity.player.PlayerEvent.Clone event) {
+        if (event.getOriginal() instanceof EntityPlayerMP player) PlayerPosePersistence.invalidate(player);
+        if (event.getEntityPlayer() instanceof EntityPlayerMP player) PlayerPosePersistence.invalidate(player);
     }
 
     @SubscribeEvent
     public void onRespawn(PlayerEvent.PlayerRespawnEvent event) {
         retirePlayer(event);
-        if (event.player instanceof EntityPlayerMP player) PlayerPosePersistence.retain(player, null);
+        if (event.player instanceof EntityPlayerMP player) PlayerPosePersistence.invalidate(player);
     }
 
     @SubscribeEvent
     public void onDimensionChange(PlayerEvent.PlayerChangedDimensionEvent event) {
         retirePlayer(event);
-        if (event.player instanceof EntityPlayerMP player) PlayerPosePersistence.retain(player, null);
+        if (event.player instanceof EntityPlayerMP player) PlayerPosePersistence.invalidate(player);
     }
 
     @SubscribeEvent

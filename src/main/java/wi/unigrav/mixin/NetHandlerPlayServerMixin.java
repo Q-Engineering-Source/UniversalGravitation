@@ -28,6 +28,7 @@ import wi.unigrav.api.math.Vec3;
 import wi.unigrav.core.boost.RemoteBoostServer;
 import wi.unigrav.core.player.PlayerMovementRouter;
 import wi.unigrav.core.player.PlayerPhysicsServer;
+import wi.unigrav.core.player.PlayerPosePersistence;
 
 /**
  * Makes one already-admitted packet visible to every subsequent native X/Y/Z read. The target
@@ -149,6 +150,12 @@ abstract class NetHandlerPlayServerMixin {
                 packet, targetPos == null);
         PlayerPhysicsServer.INSTANCE.confirmNativeTeleport((NetHandlerPlayServer) (Object) this,
                 packet.getTeleportId(), targetPos == null);
+    }
+
+    @Inject(method = "setPlayerLocation(DDDFFLjava/util/Set;)V", at = @At("HEAD"), require = 1, allow = 1)
+    private void unigrav$invalidateLoadedPoseBeforeTeleport(double x, double y, double z, float yaw, float pitch,
+            Set<?> relative, CallbackInfo callback) {
+        PlayerPosePersistence.observeTeleport((NetHandlerPlayServer) (Object) this, x, y, z, yaw, pitch, relative);
     }
 
     @Inject(method = "setPlayerLocation(DDDFFLjava/util/Set;)V", at = @At("TAIL"))

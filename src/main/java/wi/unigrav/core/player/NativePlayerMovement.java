@@ -104,8 +104,9 @@ public final class NativePlayerMovement {
 
     /**
      * Brackets a synchronous UG-owned force/impulse/binding mutation, including foreign-thread
-     * binder calls. Acquire before any binder monitor and close after releasing it. No Entity,
-     * world, Remote budget or G state is read or written; this is not a force-history certificate.
+     * binder calls. Acquire before any binder monitor and close after releasing it. No native
+     * geometry, world, Remote budget or G state is read or written; changed mutations invalidate
+     * only historical pose carriers as well as native observations. This is not a force-history certificate.
      * Call changed before the first semantic write. No-op/read paths close without that mark.
      */
     public synchronized ForceMutation beginForceMutation(Entity entity) {
@@ -123,12 +124,24 @@ public final class NativePlayerMovement {
     public final class ForceMutation implements AutoCloseable {
         private final EntityPlayerMP player;
         private final Thread caller;
+        private boolean initialBinding;
+        private boolean bindingClaimAttempted;
         private boolean changed;
         private boolean closed;
 
         private ForceMutation(EntityPlayerMP player) {
             this.player = player;
             caller = player == null ? null : Thread.currentThread();
+        }
+
+        /** Local one-use classification at tryBindWith's actual new-binding write; acquires no Native lock. */
+        public void initialPlayerBinding() {
+            if (player == null) return;
+            requireCaller();
+            if (closed || changed || bindingClaimAttempted)
+                throw new IllegalStateException("Initial player binding must be classified once before its first write");
+            bindingClaimAttempted = true;
+            initialBinding = PlayerPosePersistence.claimInitialBinding(player);
         }
 
         /** Pure local mark: safe inside the binder monitor, with no Native lock acquisition. */
@@ -150,8 +163,10 @@ public final class NativePlayerMovement {
                 if (remaining == 0) forceMutations.remove(player);
                 else forceMutations.put(player, remaining);
                 if (changed) {
-                    // Only the volatile historical-save carrier is invalidated; no native geometry/world access.
-                    PlayerPosePersistence.retain(player, null);
+                    // Only historical carriers/generation are invalidated; no native geometry/world access.
+                    if (initialBinding && PlayerPosePersistence.initialBindingCurrent(player))
+                        PlayerPosePersistence.retain(player, null);
+                    else PlayerPosePersistence.invalidate(player);
                     for (Lifetime lifetime : lifetimes.values()) {
                         if (lifetime.player != player) continue;
                         lifetime.centers.clear();

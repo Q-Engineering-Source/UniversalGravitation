@@ -15,6 +15,7 @@
     "EntityVelocityPhysicsMixin",
     "EntityBodyProfileMixin",
     "PlayerPosePersistenceMixin",
+    "PlayerListPoseInitializationMixin",
     "ExplosionPhysicsMixin",
     "EntityLivingBasePhysicsMixin",
     "EntityNativeEnvironmentMixin",

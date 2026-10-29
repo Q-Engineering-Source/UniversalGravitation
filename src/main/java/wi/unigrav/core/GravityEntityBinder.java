@@ -37,6 +37,7 @@ import wi.unigrav.core.floor.FloorFieldIndex;
 import wi.unigrav.core.floor.FloorWorldFields;
 import wi.unigrav.core.player.NativePlayerMovement;
 import wi.unigrav.core.player.PlayerPhysicsServer;
+import wi.unigrav.core.player.PlayerPosePersistence;
 
 /**
  * Entity binding layer: applies the global {@link GravityFields} gravity
@@ -578,6 +579,7 @@ public final class GravityEntityBinder {
                 }
                 if (!BodyPhysics.canEstimate(entity)) return;
                 BodyPhysics physics = BodyPhysics.estimate(entity);
+                mutation.initialPlayerBinding();
                 mutation.changed();
                 doBind(entity, registration.mode, registration, physics, true);
                 registration.autoBound.add(entity);
@@ -790,7 +792,9 @@ public final class GravityEntityBinder {
 
     @SubscribeEvent
     public void onEntityJoinWorld(EntityJoinWorldEvent event) {
-        sweepEntity(event.getEntity());
+        if (event.getEntity() instanceof EntityPlayerMP player && PlayerPosePersistence.initialJoinCurrent(player))
+            PlayerPosePersistence.initialBinding(player, () -> sweepEntity(player));
+        else sweepEntity(event.getEntity());
     }
 
     /** Explicit registrations and /mass bindings have no predicate handle to close at shutdown. */
@@ -811,14 +815,14 @@ public final class GravityEntityBinder {
         for (Entity entity : retired) unbind(entity);
     }
 
-    // EntityJoinWorldEvent never fires for players, and players are not in
-    // World.loadedEntityList (they live in World.playerEntities) — observed
-    // live: the server-side EntityPlayerMP stayed unbound, so impact damage
-    // and noGravity consistency silently skipped the local player. Bind
-    // players explicitly on login/respawn/dimension change (idempotent).
+    // Retain explicit lifecycle discovery even when a particular loader/path skips join-world.
+    // The current patched World.spawnEntity also posts EntityJoinWorldEvent for players;
+    // both discoveries remain idempotent and the exact initial join has its own pose-load bracket.
     @SubscribeEvent
     public void onPlayerLoggedIn(PlayerEvent.PlayerLoggedInEvent event) {
-        sweepEntity(event.player);
+        if (event.player instanceof EntityPlayerMP player)
+            PlayerPosePersistence.initialBinding(player, () -> sweepEntity(player));
+        else sweepEntity(event.player);
     }
 
     @SubscribeEvent

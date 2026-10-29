@@ -1,5 +1,236 @@
 # 趴卧与自由方向游泳：方法级规划草案
 
+## 当前权威范围：AQUA_RETAINED_MIXIN_TAKEOVER_SWIM_CRAWL（2026-10-29，ACTIVE）
+
+**scope时序后续闭合（Root提供精确SOURCE/静态证据）：**UIE MixinRenderPlayerFlightRoll.nfrUi$renderWithSampledBodyPose以withSampledPose先activate后包住整个RenderPlayer.doRender original.call；nativePreview提前返回保持不介入。实际Cleanroom0.6.8 patched RenderPlayer.doRender offset85进入RenderLivingBase.doRender，后者offset3构造Pre/19 post，处于该scope内。local SixDofBodyPresentation.sampleFree及remote sampleOnRenderThread均withGeometry，Cardinal既有box geometry。Root已用UG重写后的实际0.6.8 classpath复核，早先临时0.6.13不作为installed基线。该必要时序gate按Root精确证据闭合，Docs未独立重复解析；当前不再保留它为未解项。剩余最终版本配对/静态核验及候选恢复保存按Root推进，40107构建运行中，运行验收仍OPEN。
+**当前收口范围复核（Docs实读，取代旧检查点笼统缺口清单）：**已读2caaf3e模型4文件：HEIGHT slice后精确getter、同一finiteheight抑制局部×3、nested finally恢复、只读UUID排除及clamp、client-only/plugin门控，有限源码未发现确定缺陷。优先render-only；撤回早先无证据的必须改modifier writer建议。Python静态确认updateResizingFlag依据modifier集合非空而非scale==1，亦撤回“缩放抵消跳过”猜测，不扩改flag。尚需精确SOURCE gate：UIE scope open/close与Forge RenderLivingEvent.Pre先后关系，确保本地/远端prone在Aqua事件时已有active+geometry；仅ABI存在不足以证明命中。Root已报告97470 no-test exit0/48.3881461s/19warnings，JAR3029878B SHA D824AC58043DC47D01AA2DE12386A74ED7529D4722375A5C5D7CBB29303E890A；有限静态回执非运行接受。
+
+Docs定点实读Server completePredictionSlot的FreeCapsule suspend、Client END依drivesMotion继续输入（preparePredictionRequest可empty）及Ready checkpoint重采rearm路径：沿既有Free服务端权威策略交接，不新增完整Free predictor作为前置。先前Optional/no-reference/fullprofile/remote分支已补源码，不再作为当前确定未实现项重复列出。剩余SOURCE/静态收口为上述scope时序、最终UG0.1.16/UIE0.8.17版本配对与ABI/refmap、必要源码/配置增量及候选保存身份；用户运行验收NG继续OPEN，不能写运行完成。远端保存Root回执9c0050a73536fedba2a5d00aa56cade1841bb714，23511 exit0/51.2413121s，JAR3026858B SHA A387538854BF19C43C3AAAFDC1376D78BC08EF0C832B9E4734F4212C8EF0326F，属于旧版本WIP，最终候选以新身份为准。
+
+
+用户最后连续指令：“那我们还是 mixin 水游技艺吧”“接管其游泳和爬行实现”。本节覆盖后文退役提案、等待附加功能取舍、旧 DRAFT/延期、source06隔离及旧自动测试流程。保留 Aqua 及其他功能，通过 Mixin 由 UG 接管游泳/爬行姿态选择、真实长胶囊移动/旋转碰撞、水陆/窄缝切换、眼点与模型同步，隔离这两路径的 Aqua 重叠写入；不是监听短盒或只适配尺寸。范围已确认，不再询问三档，不等待完整复刻取舍，不以无 Aqua 启动为 gate。原服务端崩溃、登录方向/短身、阴影GL错误继续属于主干。Root唯一源码writer，现有Goal ACTIVE，不提前按仅诊断交付完成。
+
+**当前实施状态（Root回执，2026-10-29，SOURCE WIP）：**ProneLocomotion/Step已接无pending Cardinal完整长体转姿、Free prone request、全胶囊腹侧支撑、水输入/Depth Strider/碰撞后阻力，起身锚与舍入范围同步；新增回归源码NOT_RUN。UG和UIE诊断代码各完成no-test构建及有限结构核查，未完成最终ABI/映射或运行验收。必须继续已有pending交接、完整站立尺寸/眼高恢复、登录持久化/当前世界重验证及预测/纠偏/本地表现/远端闭包；GL尚需根因证据。正式C48未变，build同版本输出只是WIP，不可交包或标WAIT_USER_TEST。详见唯一推进计划同stage回执；本段不新增完成计数或放宽原六步目标。
+**最新保存与剩余（Root回执）：**UG本地WIP `4f2fa71a70ed831d4f93719237e7555e8ff115c3`、UIE本地WIP `7eba8ad2d1ca706591b806722331d2dafd0ad5e0`，未push/未交包；UG含新增量no-test构建exit0。pending向prone的成功交接、可信StandingProfile及服务端受控眼高安装已补源码，但失败/恢复custody分支、客户端起身眼高镜像/围栏尚缺，不能写双端完成。登录持久化/新世界重验证、预测/纠偏/模型远端闭包继续为必需主干；回归NOT_RUN、GL无运行根因证据，目标ACTIVE而非WAIT_USER_TEST。详细证据沿唯一推进计划，本节不新增验收结论。
+### 初始化FREE方向参考的既有范围澄清（2026-10-29，定点只读核对）
+
+**Optional-reference已保存检查点（Root回执，SOURCE WIP）：**本地commit `e9aefa8ef6b11a182776b8f4a95187152e58d2fd`，7生产文件78+/33-；Docs已核Git身份及build/candidate40/build-result.json.optionalProneReferenceCheckpoint。Root报告最终7609 no-test exit0、51.2424893秒、19warnings；build/libs/unigrav-0.1.15.jar记录3021242B、SHA256 `83A812CAB981D90B1686F0CDCC4270336608996F25D8E8BFB1E33D1408C3E448`。Root静态核ZIP CRC/Optional accessor descriptor/locomotion helpers/major69。水轴覆盖收窄版worldY默认、有效prone ref.up，support独立actual body；previouslyProne区分首次源QY和已有prone -QZ。无ref prone不再必defer，退出清semantic保留fullstanding producer；no-tag链需NativeCardinalBodyProfile.certify fulltarget后才建path source，以上SOURCE可达非运行通过。Root查实际C48 VERSION21/MAX629、WIP VERSION22/MAX631，双端候选版本仍须最终核验。Aqua冻结JAR `506EE8E264C347FAD33302183B8F4DADDB05D5E5F75C0B6D833266C886E127CE`静态注解显示RenderPlayerMixin.applyRotations为TAIL；UIE scopedowner已有HEAD cancellable，不能仅凭双方rotate认定必double-root或要求改priority，此为静态证据非Mixin运行证明。Docs核记录未独立重跑上述静态检查。最终ABI/map、client/remote/prediction闭包及完整候选gate仍待；unit/JVM/game/GL NOT_RUN，无安装重启、未push、C48不变，WIP不可用户安装，运行NG OPEN。
+
+
+**水控制轴收窄方案（Root回执，待实施/验证）：**上一版“无ref水输入沿身体背腹up”工程选择由本条替代，不是用户合同变更。Root将水输入/阻力坐标收窄为：有reference的prone沿其up；无ref prone与普通non-prone均保留既有世界Y水输入/阻尼轴，使无ref sprint退出semantic不切换该轴。世界Y在此仅介质输入/阻尼坐标，不生成Cardinal环境参考或重力许可。bodyQ沿look/实际body轴，腹侧supportUp仍独立使用实际Q/有效ref及真实contact。Root另拟/已自查修正首次nonprone→泳姿背腹候选基准：源non-prone用实际QY，源prone用-QZ，避免误把原front当back；退化使用实际axes。以上为Root回执，Docs尚未独立实读调整后源码；有ref进入/退出的连续性与真实参考有效性仍需原链闭合。build24121为收窄前输入，不作修后证据，后续构建待回执；SOURCE WIP、运行NG OPEN保持。
+
+
+**无参考姿态表达的实现澄清（Root拟实施，未验证）：**将PronePose的referenceFrame改为Optional，使真实长体bodyQ与环境参考分离，符合六步3/4及bodyQ/lookQ/supportFrame职责。原水中规则要求前后/侧向/上下输入、真实水动力及零G交接，但定点核对未找到“真正无ref时jump/sneak固定世界Y或look轴”的更细用户约定。Root拟无ref采用accepted bodyQ实际背腹up、有ref保持frame.up，作为既有上下输入的工程实现选择推进，不伪称用户逐字指定；不由Q生成Cardinal资格，不由背腹轴本身授予支撑，支撑仍需真实全身体接触，失水不保留免费推力。核参考进入/退出连续性与投影退化，不能默认世界Y替代缺失参考。codec拟255表示明确none，其他非法frame继续拒绝、既有有效值映射保持，须闭合所有消费者、双端版本及存档读写；VERSION22未发布目前仅Root说明，最终按实际已分发身份核实。此条是设计范围核对，不是已实现/已构建/运行接受，零G主干仍待完成。
+
+
+**目标中心reference已保存检查点（Root回执，SOURCE WIP）：**本地提交 `6a3178668536a9d488724abe13fb3a0d209bab00`，两生产文件136+/19-；Docs已核实际Git身份和build/candidate40/build-result.json.initializationReferenceCheckpoint绑定。Root报告最终点修后no-test构建88894 exit0、51.8081471秒、19warnings；build/libs/unigrav-0.1.15.jar记录3020104B、SHA256 `CF606BBF800D6A66DA192A72899231DA79AC11338315B11CCCB7C3E461688181`。Root完成ZIP CRC、typed reference/target方法、Selection(reference,pose)及major69有限静态核验；Docs未重复核验产物或独立复核修后实现。每实际target.center重采参考，变化则重做standing/pose/fluid/fullfit；requireEnvironment检查来源current及point==finaltarget.center。此构建覆盖最终点修正，73332仅旧输入记录；不覆盖未来增量。真正零G无reference prone表达、no-tag完整链、客户端/远端/预测闭包仍OPEN；unit/native/check/JVM/game/GL运行均NOT_RUN，无安装重启，未push，正式C48未动，非用户可安装候选，原运行NG OPEN与Goal ACTIVE保持。
+
+
+现有六步实施条款第3项要求长轴沿通道/身体意图，且腹侧支撑与重力参考分离；第4项要求零G交接、转头只是姿态意图、accepted bodyQ由完整碰撞验证决定。推进计划“用户追加修正：无重力绕身体中心旋转”记录用户原话及固定center合同。这些条款允许Q描述身体方向，不等于批准从Q生成环境重力参考、六向站立资格或支撑/磁靴许可。定点检查现有方案及推进计划未找到“真正零G无参考时，按身体Q选一个Cardinal参考供sprint游泳/forced crawl使用”的已确认规则；不得将此补写成已有用户授权。
+
+当前场可提供的参考可沿已有真实机制解析：PlayerEnvironmentSampler.naturalReference按非零当前加速度给出自然参考，低于阈值返回空；compensatedFloorEvidence区分floor force/reference资格。Free采样另有nativeReferenceFields，实际是否选用由PlayerPhysicsStep.nativeGravity资格决定，不能无条件添加Y+，不能重复积分原生重力。现有流水线示例是来源机制的源码证据，不能直接充当首次安装proof。
+
+Root拟在typed InitializationInstallation当前源围栏内单独采样binder/floor reference-only，复用上述解析及StandingConstraints.resolve，属于补齐现有首次接管主干的实现路线；不伪造accepted snapshot/transaction，不把reference-only提升成接触/支撑/boots许可，回调后须复核同一当前来源。真正零G无参考时，Q可作为待验证姿态候选，但如何表达无参考泳姿/爬行仍是实现语义缺口，不能靠默认Y、伪自然参考或历史reference补齐。优先复用能区分姿态与环境参考的现有表达；如确实需改变用户可见行为合同，再向用户说明具体选择，当前不新增需求或替用户选策略。
+
+### 当前模式及环境接线复核（2026-10-29，下游核实后更正退出判断）
+
+**first-OWNED已保存检查点（2026-10-29，SOURCE WIP）：**Root保存本地commit `0351884e438eb97377c653ecef9945968bab52d7`（5生产文件484+/18-）；Docs已核Git提交身份及build/candidate40/build-result.json.firstOwnerInitializationCheckpoint绑定。Root报告最终no-test构建64977 exit0、53.4310174秒、19warnings；现有build/libs/unigrav-0.1.15.jar记录3015280B、SHA256 `478A6971BB441EC1B0D8FDE4EEFE9777B6CBF22CD977480F5E421C09A08933FB`。Root完成Python ZIP CRC、history/install/mode/environment/bridge方法及major69有限静态检查，Docs未重复执行。Root报告fixed-point已改先fluid选择当前模式再fit最终selected，消除先前初始候选occupied先拒绝的路径；不同模式仍独立观察且保留安装前后environment/current selection检查，publish后reconcile末端fence已包含本构建，cleanup只retire exact session。这些新增实现按Root回执登记，未冒充独立源码审阅。Choice.NONE退出误判已在下游复核后撤回，继续保留有效直接Free→Cardinal恢复通道。仍必需闭合FREE无reference真实来源、无tag首次接管/普通起身完整链、协议预测/眼点模型/远端同步及最终映射打包；所有测试与运行NOT_RUN，正式C48不变、运行NG OPEN，本WIP未push且不可用户安装，Goal ACTIVE。
+
+
+Docs重新实读 ProneLocomotion、PlayerPhysicsStep:610–620/2343起、FreeReferenceModePrepared:331起/539起：撤回上一版“Choice.NONE确定导致普通爬行无法退出”结论。Choice.NONE.blocksStanding=false，允许prepareFreeStanding取得真实reference后通过FreeReferenceModePrepared直接Free→Cardinal；standingProfile读取当前完整physical diameter/length及standingEyeHeight，previewCapture实际使用这些targetDimensions。不能一律改成selected=empty且blocksStanding=true的请求，否则会阻断现有站立通道，并有提前清prone后丢完整站姿producer的风险。此处已确认源码通路存在，不等于完整转姿/眼点/协议运行验收通过。
+
+没有当前reference时prepareFreeStanding返回empty selection；这时是否需要清prone模式以及如何保留完整体长/眼高来源，仍由实际无参考语义和调用链核实，不能从Choice.NONE单点定bug。initializer的saved FREE无reference且需要prone时defer也仍不能当作一格裂缝验收完成；须继续闭合当前真实reference来源及最终同步链。
+
+当前selectPose/selectTarget已用历史current=empty、各候选全fit+完整fluid scan、绑定environmentPose并在安装前后复核，旧历史SWIMMING直接授权问题已从本次源码路径移除。初始候选fit先于fluid选择的保守可达性风险仍待结合真实环境入口核实，非已复现，不扩无界枚举。
+
+Root补充SOURCE说明：新Session在onServerTick START生命周期变化时重建，rotateRecoveryScope要求已有owner，与first-OWNED互斥；普通source/proposal复用Session及poseInitializationAttemptTick，未加全局计数器。publish后已加history/resources/currentSession/owner/snapshot/geometry围栏，cleanup只retire exact原session、先清private journal再断连。以上为Root回执，Docs未独立复核全部新增行。无tag首次链已定位Cardinal→ProneLocomotion→cardinalToFree(prone)→full profile/requestedQ/fullfit，完整协议/眼点模型仍OPEN。
+
+Root报告2480无测试构建exit0、stdout约55s/19warnings，精确耗时待回执，且不覆盖新增publish末端围栏。正式C48与运行NG OPEN保持，最新产品是WIP，本轮未运行验证。
+
+### 首次OWNED安装分支源码复核（2026-10-29，WIP未接受）
+
+Docs实读prepareInitialization/InitializationInstallation/InitializationHistory/sameInitializationWorld当前dirty源码，未运行。私有staged Owned未发布、same-center不改、消费历史后安装、同target前后world证据桥接、异常隔离连接等方向符合上轮设计。发现当前需修/闭合：
+
+1.【实际语义缺口】saved.kind SWIMMING分支无条件创建SWIMMING PronePose；requireSources只要求ProneBodyProducer.Input与采样值相等，不要求当前水资格成立。Input.eyesInWater即使false也可相等通过。因此旧泳姿在水已移除的同位置仍可被安装为SWIMMING；CRAWLING也未依当前介质/强制意图选择，CARDINAL在standing能fit时忽略当前forcedCrawl。必须用当前权威水环境/输入调用同一pose选择语义，历史kind/Q是候选，不能作为模式许可；不同目标需重新全fit，不等下一tick纠正已错误发布的模式。无需扩自定义水域。
+
+2.【安装回调后的world比较仍需末端围栏】sameInitializationWorld先requireInstalledComparison，再sameObservedWorld；后者sameProvenance等是否会回调应按当前实现核。你install在比较之后又requireInstalled，这个收尾方向正确，保留。captureTarget中的requireSources不等于native source未改，fit/install调用者已做额外requireNativeSource；不要将此helper独立外用。
+
+3.【source完整性/velocity】requireNativeSource有window一致+source geometry+force/history，当前producer需与全部window的非empty来源相符已做到；prepare传入velocity依赖调用者two-sample核验，保持方法private，不提供外部注入入口。每tick尝试限制目前位于已有session，尚不能自动证明退役/新session在同worldtick不会重建Store重置资源；核现有manager/proposal切换是否能在同tick产生多个session，若能，要复用既有玩家tick资源/attempt lineage，不靠新建计数系统。若实际流程禁止，记录机制即可，不无据扩防御。
+
+4.【无历史正常场景仍缺】这条分支只在initializationHistory存在时执行，不能覆盖用户已有旧存档无新tag但同裂缝的本次验收；需要确认后续普通首次接管→当前可信profile自动长体爬行能够走通（不能回短胶囊失败/永远pending）。不因此允许猜旧非Y历史或以诊断候选结案。
+
+5.【失败与发布】session.owner发布后reconcile可能抛，catch会retire并断开，这属于明确失败非假成功；需确认retire不会保存尚未发送OWNED的半交付姿态、重入观察者不会拿staged当成功接管，现同一线程并不足证明所有callback。部分安装断连后save不会保存坏pose tag，但vanilla几何可能已改变，务必记录并保证下次无history路径可恢复，不宣称有回滚。新预算/initialReference/OWNED协议预测闭包仍需审最终分支，当前未做全链接受。
+
+首要确定问题是1的当前模式资格，其他为列明的接入前检查，不等于均已证实bug。构建67032无结果不计通过，运行NG保持OPEN。
+
+### 首次恢复速度与独立初始化fit设计复核（2026-10-29）
+
+**采样接缝最终本地检查点（Root回执）：**4174db54679db375dc5d44ee4322fa2bb3ba103d，两个生产文件；最终60009 no-test exit0/51.7830009秒及有限ZIP/class/record结构核验，WIP JAR SHA D48E35386D684894468B6A439E37CF5474A5CB343AC152825195827C49F5F6B8，详细身份见唯一账本。未push、非正式候选、无运行验证。剩余qualified observation/fresh whole-target fit/install/协议预测呈现不因本切片保存而关闭；Optional.empty和RN保守规则保持。
+
+**中心采样来源增量与复核（2026-10-29）：**Root未提交WIP新增CenterSource（native W/H、bounds相对transport偏移、实际Profile值、sneak/glide）及immutable placement；真实生产点双读producer并核current，源变化清窗，acceptedCenters和afterLegacyCompletion核最新receipt及before/last来源。Docs实读相关接缝，有限SOURCE范围未见混合高度中心差当速度的直接缺口，不是运行或初始化安装接受。Optional.empty来源不得因两样本相等变成恢复qualified producer；最后flag getter如可回调须把最终无回调围栏置于其后，或核实实际只读契约。精确偏移比较可能因RN保守清窗，不凭空放宽epsilon；静止裂缝取样可达性仍需完整链核查。构建41705回执时运行中，未计通过；原89349已确认exit0/50.7794016s，不再作为当前无终态。first-OWNED prepare/install、fresh fit及预测表现仍未实现/闭合，C48 NG OPEN、ACTIVE WIP。已发Root定点结论，无源码写入/测试。
+
+Docs实读NativePlayerMovement.CenterSample/record producer及PlayerBodyPlacement.fromTransport。建议有条件采用现有two-center+force fence，不能仅在消费者临时读取“当前尺寸”补证历史。
+
+最小采样接缝：在真实完成生产点（当前215–222）将每个CenterSample绑定当次completed receipt的不可变几何来源值：canonical shape/dimensions、实际bounds相对transport的偏移/尺寸、实际transport、必要producer/scale revision。优先引用已有immutable placement/profile observation，不另造全局registry。保证receipt与最后actual geometry一致且callback前后current；不是以producer对象身份相等代替内容稳定。保留同tick替换、1–2tick时间窗、force dirty清窗及session/delegate绑定。
+afterLegacyCompletion恢复分支只在before/last的几何与producer语义连续一致、last与当前receipt/current producer匹配时计算center差；若尺寸或锚偏移不同，丢弃该速度窗口并等真实新样本，不能硬修中心差或置零。只加W/H不足：AABB/transport偏移、scale/姿态语义也可变化。眼高若不影响center无需无差别阻断，但安装眼锚另须current验证。相同原transport+相同几何导致真实样本速度0是计算结果，可以接受，区别于人为填0。不得用native motion字段替代已核速度证据。
+
+初始化fit：在existing session.pending/connection/proposal源合法、owner确为空且非resuming/remote custody时取得私有InitializationObservation，绑定loaded generation、两实际samples/receipt、force mutation代次/非活动、当前qualified profile/eye/environment。只读fresh世界capture及完整target关系得到不可任意构造的PreparedInitialization，提交前重验全部围栏、capture/current/profile；禁止为借用FreeOwnerTransaction先塞临时owner。复用底层几何/query算法但不伪造accepted snapshot与普通NativeCardinalBodyProfile证书。
+
+center重建风险：当前fromTransport按origin.bounds.minY推center且x/z取transport，数学上可表达初始化；实际stored endpoint/proxy RN后必须重新核actual transport精确一致，不能仅理想胶囊半径公式认为同位。保存center/halfline/bounds/eye仅诊断/current producer变化证据，不能直接作许可。若当前profile与保存时一致但同transport重建center明显不同，应明确源不一致或舍入问题，不能静默搬身体。profile实际变化时fresh target可以是初始化当前新合法体，但要记录此语义并保持原transport，不伪装历史精确还原；加载有效无本次物理轨迹才适用target-only，不能扩普通移动。
+
+提交最小顺序：prepare全部通过→exact mutation/install journal核验→安装完整几何/eye和协议所需body reference→读回确认→原子发布owner+初速度/预算+OWNED包/预测起点并消耗loaded。沿已有事务失败清理和send失败责任，不把“普通Applied纯提交”与任意回调安装混淆；任何部分失败不得暴露临时owner或复用已消费candidate。新预算来自已验证velocity/ordinary ceiling/当前tick，不复制旧预算。握手/首次加入binder来源变更后采样要发生于新来源稳定阶段，原样本不能继承。
+
+未决可达性：如协商前已有真实native位移导致Loaded失效，禁止绕过围栏；需证明预期正常静止裂缝登录能取得两样本且不会被自身pose反复变更清窗。该方案是最小责任接入，不是当前已实现/通过。build89349未有终态；测试/运行未执行。
+
+### 读档代次及豁免复核增量（2026-10-29）
+
+**后续Root修正回执（未复核接受）：**同位置positionChanged已先消费指定LOAD_POSITION许可；binding专用公开begin移除，使用锁外普通ForceMutation并在锁内无existing/estimate之后、真实changed/doBind之前一次claim分类，保留原锁序及close代次核验。原发现保留作修正依据，构建21472及最后增量尚无最终结果，本节不关闭初速度/fresh环境/安装authority等主干。
+
+Docs定点复读本轮readCycle/positionChanged/nativeLoadPosition/bindLogin及Mixin，有限SOURCE结论：外部代次从read开始到返回绑定、异常move finally失效、绑定实际handler/netHandler/channel/world复查均已落实，前述相应源码缺口已有修正；不是运行接受，尚不关闭恢复authority等主干。
+
+明确需修的小口：positionChanged首先“pos相同 return”，在检查/消费LOAD_POSITION token之前。因此原生两处setPosition若该次是同位置，token不会在其首次HEAD被消费，仍在整个原生调用期间有效；这与“只豁免该调用一次HEAD/嵌套setter不豁免”契约不符。建议先匹配并消费指定调用token，无论该调用是否实际移动；只有判断是否推进失效代次时才区分同位置。匹配token失败的后续实际移动仍external失效。此处不主张同位置setter都使Loaded失效，而是一次性许可应立即耗尽。
+
+initialBindingCurrent仍仅carrier/generation，并未增加结束时binding来源/实际身份检查；Loaded尚非authority可延后到prepare，但别把它当已证明fresh环境。整个sweep token包括任意predicate/BodyPhysics回调，专用beginInitialPlayerBinding目前公开且不是一次性消费，需确保只在锁内“新建binding、无previous”的那个实际结构写分支获得来源资格，回调触发普通force会失效这一点保留；不要再为安全证明造大框架，最小限定实际调用接缝即可。上轮EntityJoinWorld更早sweep可达性仍未给关闭证据。
+
+readCycle对同player嵌套read会external失效outer，正确；保存几何仍只诊断、current producer/Q重建路线正确，勿提升为旧数据proof。最新构建尚无回执，Root继续单writer。
+
+### 首登录重力绑定初始化复核（2026-10-29，SOURCE限定结论）
+
+**后续Root实际字节码核实：**World.spawnEntity对玩家设置forceSpawn但仍post EntityJoinWorldEvent；PlayerList.playerLoggedIn的spawnEntity在首TP/FML登录事件前。此前更早join风险已确认是真实路径，旧never fires注释已改。Root以playerLoggedIn唯一spawnEntity的require1/allow1包装建立InitialJoin一次token，仅允许对应join同Loaded/generation使用初始化绑定豁免，其他join不放宽；initialBinding finally新增world/connection/transport/alive/未结force核验。尚无最终构建或Docs独立复核，新改动不视为已接受，旧发现保留为修正依据。
+
+Docs只读核实：UnigravMod先new GravityEntityBinder再PlayerPhysicsServer.install；binder onPlayerLoggedIn→sweepEntity→tryBindWith，tryBindWith锁外predicate回调、锁内确认尚未bindings条目，再estimate/doBind。doBind设置noGravity、绑定结构与EntityGravitySources.update；后者按质量注册/移除引力源，不直接积分玩家速度。ServerTick END的tickServerWorlds对EntityPlayerMP直接continue不执行applyDeltaV。因此精确首登录新建binding作为“配置来源初始化，不是已施加冲量”可以有限豁免Loaded失效，但不能保留旧force观测/速度证据。
+
+本轮读时源码已出现initialBinding token及beginInitialPlayerBinding，不是只提案：ForceMutation.close豁免时仍清native centers+observationDirty，这点正确；正常beginForceMutation嵌套会清loaded使token失效。请保留以下最小边界：
+1 token仅包真实onPlayerLoggedIn sweep、仅同一player/unbound loaded generation、仅新建binding成功分支；呼叫predicate任意代码不能被视为可信，若其触发TP/impulse/force变化永久清候选。不得将该豁免开放到普通bind/setBodyPhysics/respawn/dimension/后续sweep。
+2 新建binding虽不积分，改变了noGravity/force source；恢复prepare必须重新采样当前环境/producer及真实初速度，不能保留旧receipt，也不能认为initialBinding意味着velocity=0。
+3 onEntityJoinWorld也调用sweep，可能早于FML login。请针对实际服务器路径核对其是否触发新binding；现源码注释认为server player不保证EntityJoinWorld，不能由“不保证”推成“永不”。若早期join绑定已经改变force并清Loaded，登录sweep只见existing binding不会救回候选；需要日志/实际调用顺序或同一个经证明的具体初始化来源token覆盖该路径，不能按任意prelogin sweep放行。
+4 当前initialBindingCurrent只核carrier/generation，finally成功不核实际world/connection/native transport/force mutation余量。后续bindLogin有transport/world检查但不能替代初始化阶段来源变化记录；建议token结束复核当前身份、同源新binding和无未结外力，失败只失效候选、不回滚已合法binding。
+5 现实现通过带initialBinding boolean的ForceMutation区分来源，请确保构造/调用入口最窄并与新binding分支绑定；同线程token存在不代表任意绑定改动都有豁免权。
+
+结论：窄范围豁免合理，保留上面3的可达性风险和authority阶段fresh证明。move改为完成后实际位移是合理改进，但异常路径/途中away-back仍须由setter代次兜底。89881 exit0不覆盖最后修改；未运行任何验证。
+
+### Loaded候选与一次握手源码复核（2026-10-29，有限SOURCE结论）
+
+Docs实读当前SavedPlayerPose、PlayerPosePersistence.read/bindLogin/initialTeleport/observeTeleport及两个Mixin。未运行构建/测试。一次token在Set重载HEAD消费，second observe会清记录，异常finally清理，Session早退漏洞已在源码路径解决；这是有限源码结论非运行接受。仍有以下接入前必须处理：
+
+A. Loaded安全失效与“能实际恢复”是两件事。当前Entity.move HEAD任意非零请求即清Loaded，即使撞墙实际位移0；协商等待期间正常重力/水流/本机客户端移动包很可能先出现。必须核对真实first OWNED恢复时机是否早于该请求，否则同裂缝候选会安全但永久丢弃，功能不可达。不要无条件放宽force/位移围栏；可在登录后首个可能运动前完成必要握手或明确冻结/接管协议，后者必须有现有授权契约，不能靠忽略运动达成。记录拒绝原因/阶段以便用户复测区分，当前invalidate只null缺定位信息。
+
+B. read创建generation快照在original.readFromNBT返回之后取得，所以只能证明解析期间未变，不能证明整次read期间没有第三方move-away-back或force changed（若该活动属于load许可须明确）。需要限定read生命周期：原生必需初始化setter允许，外部力/TP与嵌套read不得因返回重新创建generation而复活；将load开始token+嵌套深度/禁止事件代次与返回绑定，而不是把所有read返回都当新授权来源。普通read重入又恢复同NBT也需明确单次行为。
+
+C. 解析只是结构校验，不是保存记录几何一致性证明：Free storedHalfLine尚未与Q/length互核，Cardinal native dimensions尚未与bounds轴向大小互核，eye也未与pose/profile锚关联。后续必须以current producer和Q新建真实存储几何，不直接采用halfline/bounds/eye。CARDINAL center==bounds.center raw判等还需静态验证save→read往返是否对合法大坐标/舍入成立，不能猜epsilon。无需把旧数据验证包装成证明，最小办法是标明候选字段仅诊断，恢复只用有当前来源的重建几何。
+
+D. bindLogin当前只核connection非null，尚未核handler.player==player、handler.netManager的当前netHandler/channel与实际world注册；world identity读取后的最终world/alive/connection重验亦不完整。Loaded仅绑定未安装可保留此分层，但typed authority取得前必须全部复查，不能将bind成功直接视作current证据。
+
+E. 初始token范围精确且require/allow1正确；目前源码未见普通second TP可复用已消费token。仍需要最终产物映射核验确认PlayerList唯一调用和Set重载HEAD确实注入，构建89881及最后未编译增量不算运行验证。原安装authority/初始速度/空间fit/存档UUID落盘失配主干保持OPEN。
+
+### 登录加载顺序与围栏复核（2026-10-29，只读静态）
+
+Docs已用既有inspect-class.py通过Python静态解析classpath_compileJava-pre.json所指实际patched Cleanroom JAR与AQ1.15.4（未执行JVM/游戏），并读当前NetHandlerMixin/observeNativeTeleport。真实顺序：PlayerList.initializeConnectionToPlayer offsets56 readPlayerDataFromFile→73 setWorld→138 setPosition（条件分支）→144 setWorld→255写connection→539 playerLoggedIn→563 setPlayerLocation(DDDFF)→878 FML firePlayerLoggedIn。因此FML onLogin绑定发生在初始setPlayerLocation之后，你的“首次同位置握手可保留、onLogin绑定后TP失效”在正常路径可达。注意playerLoggedIn方法不是FML LoggedIn事件，不能在539误判已绑定。
+
+关键阻断：现PlayerPhysicsServer.observeNativeTeleport先sessions.get，session不存在/不current直接return。Loaded资格必须在这个早退之前独立失效（或从NetHandlerMixin入口直接通知实体loaded guard），否则onLogin已绑定但mod协商尚未有Session期间TP漏记。注册事件优先级/其他mod在FML登录事件中再TP也必须涵盖；只布尔loggedIn不足防更早插件TP。允许初始握手最好绑定initializeConnectionToPlayer该具体调用的一次性阶段token，而不是所有onLogin前同位置TP均放行。移走再移回由native位置变化generation永久失效；对同位置但不同yaw/pitch的命令TP也不应认作原生首握手。
+
+NetHandler实际DDDFF重载委托Set重载；后者offset99写targetPos、162–179推进teleportId、219 setPositionAndRotation、随后发SPacket。现Mixin TAIL能看到结果，但入站/重入失效应在调用前标记，避免sendPacket回调或异常未到TAIL留下有效loaded；保存/加载候选的阶段token要finally结束，不只看最终坐标。
+
+Aqua字节码updateSize内先updateEyesInWaterPlayer，再updatePose(offset20)，再updateEyeHeight(offset24)。这证明原生姿态/eye缓存可在同tick变化，不代表其精确首次时机已独立确定（本轮未展开Mixin注解到完整运行排序）。Loaded不应因同位置的尺寸缓存初始化自动作废，但应只保留历史候选，所有profile/eye/实际bounds安装资格需fresh重新取得；如果size变更伴位置补偿，必须视实际位移失效，不能以“合法pose调整”统统豁免。
+
+解析放Entity.readFromNBT完整外层返回后正确；期间setter失效旧候选，返回只可创建本次新generation。缺字段/错误tag类型不能靠NBT默认0过关，校验完整Pos/Dimension/UUID并保留world稳定UUID到onLogin后核。需允许setWorld初始化时刻变化，不能在read返回时以尚未正确world拒绝有效历史；真正绑定后world/connection变化则失效。Loaded只是候选不是authority，仍保留上轮速度/force/fresh-fit阻断。建议按这些点实现，不放宽same-center。
+
+### 存档接缝源码复核增量（2026-10-29，待闭合）
+
+**保存切片最新身份（Root回执）：**UG本地WIP b34b2b69efd11523ffc6cb69a11708b8138476c4，未push/交包；最终no-test构建92255 exit0覆盖force/尺寸/旋转/flag失效增量，有限ZIP/config/12项refmap核验通过。只证明此源码保存与构建阶段，不关闭载入、首次OWNED恢复、当前producer/空间/参考与眼锚/初速度及UUID落盘失配拒绝等复核项，也未提供force mutation期间拒存的关闭证据。仍需在普通same-center之外完成有独立生命周期围栏的初始化authority；本地JAR不是安装候选，运行NOT_RUN。
+
+**身份生命周期最新回执（Root）：**WorldIdentity已改WorldEvent.Load准备、保存仅读READY、Unload清理；失败带cause并拒绝该次pose标签，保全vanilla保存。此修正尚未独立复核/最终构建。身份与玩家文件独立落盘仍须加载侧严格UUID校验，不承诺原子保存。加载、reference/profile/眼锚重建、拒存诊断和恢复初速度尚未完成；顶层unigrav:physical_pose是明确读取契约。第三次增量no-test构建进行中，旧等待事项以此源码进展更新，验收仍开放。
+
+**Root修正回执（尚未复核接受）：**已限制logout/channel关闭才留存，增加connection绑定、原生位置/几何/运动/读取/死亡失效、onLogin最终clear和单次保存finally清理；补最终身份/Pos/Dimension重验；pose-save与retire观察失败明确记录cause/stack并保全原生保存及owner清理。common注入排除client-only setVelocity。下列发现保留为修正前依据，不因回报自动标关闭。仍须世界初始化准备身份及保存只读、落盘一致性、完整profile/reference、加载authority和最终增量构建；目前未完成恢复，无运行验证。
+
+Docs只读本次实际PlayerPosePersistence/WorldIdentity/Mixin及Server6585–6670，结论为SOURCE设计仍有需闭合项，不是接受：
+
+1.【必须修复/证明失效闭包】RetainedPose只带world+snapshot，poseForSave在sessions无条目时无条件返回实体carrier；retire在所有退役原因都留存，包括stop/world unload及其他调用。之后write只比几何/eye，没有retire原因、connection/generation/correction/force标记。发生退役后TP/外力/原生pose变化再恢复相同geometry时，旧carrier仍可写成新有效历史。需将carrier明确绑定logout保存资格/实体连接代次及一次保存期限，所有非正常logout/TP/维度/死亡/新登录/原生控制接管使其失效；无需用持久化旧session授权restore。注意onLogin目前先retain(null)再retirePlayer，若存在旧session可被retire重新填回；respawn/dimension是反顺序，需统一保证最终clear或明确旧session不可能证明。不能靠最后尺寸相等代替生命周期。
+
+2.【最终回调围栏】write在WorldIdentity.get及player.getEyeHeight后只复查world/geometry/eye和current.snapshot引用；初始player.dimension/UUID/isDead以及root Pos/Dimension没有最终重验；poseForSave无session fallback也不复查这些。建议封装save token/current核验，在最后一个callback后同时验证玩家/连接/维度/alive/资格、原NBT Pos/Dimension及source identity，再setTag。重入或回调更换资格必须拒绝。不要为了容错静默写旧snapshot。
+
+3.【保存失败影响面】WorldIdentity.get在玩家writeToNBT路径懒加载/新建UUID，现实现有文件损坏直接抛。需明确playerData保存边界：若可选pose历史失败拖住整份原生玩家保存，会扩大数据丢失风险。不是吞异常假成功：在承担责任边界明确日志记录cause和pose-save失败、删除该次恢复标签，尽可能保全vanilla玩家数据；若要整体失败应给出共享不变量损坏依据。新UUID只有markDirty，玩家文件先保存而world identity未落盘时崩溃可失去匹配，恢复必须明确拒绝，不得自动新UUID认旧pose。最好在世界初始化既有生命周期加载身份，保存只读已就绪身份，核世界保存持久性顺序。
+
+4.【接缝契约】实际现在是root直接unigrav:physical_pose标签，不是ForgeData。并非必然错误，但需明确加载使用同一顶层路径、不会假设ForgeData自动载入，死亡clone的复制/失效行为需核；旧设计文字更新成实际。Root patched字节码logout先writePlayerData为合理留存理由，我本轮没复读该字节码，不将其独立验证。
+
+5.【数据完整性】序列化FREE非prone不写reference，eye仅世界位置，后续restore若需当前参考锁定和局部眼锚/语义必须确认能从所存数据+当前producer唯一重建，不猜默认Y；尚无load/authority所以这是接入前闭合项。当前不保存proof/速度/预算合理，不能因此漏掉新初始化速度责任。已有pending直接拒绝保存意味着该状态退出无历史，要明确用户同裂缝可恢复的路径/失败理由，不能无记录默默变站立。
+
+可继续当前独立typed首次恢复设计；上述仅源码静态核查，未编译/运行，不改产品。
+
+### 登录恢复定点设计复核（2026-10-29，未实现/未运行）
+
+定点设计复核结论：方向可行，但必须作为“尚未首次接管时的初始化恢复”独立入口，不能给普通移动/已OWNED恢复开目标fit捷径。Docs实读NativePlayerMovement类契约（仅Y+、receipt不是隐式PhysicalSnapshot）、NativeCardinalBodyProfile.certify的same-center及profile/capture绑定、afterLegacyCompletion的双中心速度/force围栏/remote custody和new Owned分支，支持你提出的独立typed初始化authority；未运行测试。
+
+最小接入：在已有session+mod协商/可信producer准备完成、普通afterLegacyCompletion建立首次Owned之前增加一条互斥的恢复prepare/install分支；抽复用新建Owned后的reconcile/OWNED packet/预测初始化共同收尾，不能复制一套缺少ACK或重连清理的owner流程。不要将restore塞进resuming或remote transfer分支，已有owner/native-delegated/custody/recovery/TP未结算时拒绝该authority。如果协商期间已发生真实移动，或世界接纳玩家时已经发生合法位置调整，保存pose不再可直接目标fit安装；strict transport仅必要非充分条件，必须同时有从load到commit的未被取代的generation/TP/correction/movement/force标记。
+
+存档：ForgeData使用版本化专属compound，只保存最后真正提交完成且actor镜像一致的snapshot数值，pending/预测/半安装不写。保存必须与原生Pos同一保存事件的一致状态绑定（或保存时比较当前native transport与记录），仅每tick更新compound仍可能与之后native写Pos错配。稳定world身份不能用运行期worldEpoch/session替代；dim+seed也不是唯一世界身份。死亡clone/换维度/TP/原生移动需失效恢复资格，保留旧记录诊断不等于允许下次复活；明确fresh record序号及superseded状态。
+
+数据验证：限定schema/字段容量/有限数/Q合法/pose与reference语义，校验center-transport-proxy bounds推导一致及current profile/eye source；存档D/L与eye不是当前可信producer，当前scale/装备/pose条件改变时必须按当前producer重建和fit，不复用旧proof/contacts/预算/velocity许可。保存方向只能作候选，爬行/泳姿资格必须按当前空间/水介质重新判断。未知旧存档不猜历史，但按已授权完整profile选择新的合法爬行不应以缺历史阻塞。
+
+证明边界：只有从未产生本次accepted物理路径、身份和native transport严格对应、生命周期未变化的初始化才可用fresh全目标fit代替移动扫掠；已有任何接受移动则正常transition全路径。fresh碰撞capture必须覆盖完整胶囊/实际bounds，未加载/不确定明确失败、不强加载/假空；预算不重置或伪造。所有producer/callback后复查token current和native geometry，安装前后核对；提交一次，副作用失败不能留下半安装。新typed prepare携带actual session/connection/player/world identity/proposal/epoch/TP及mutation代次/current producer/capture/预算，类型不可从任意调用者构造。
+
+特别缺口：afterLegacyCompletion双中心同时建立真实初始速度。初始化恢复绕过它必须明确新的速度和预算来源；不得把proxy中心差当位移，也不能盲目恢复旧velocity、随意清零来吞掉登录期间合法冲量。若定义静止重登，需证明无新force/native velocity事件且建立明确初始化契约；否则走现有可信速度接管或明确拒绝等待，不能伪造两次中心样本。
+
+新增针对性检查/用户验收：同裂缝非Y重登；native Pos与saved center偏移但transport一致；协商中TP即使又回原坐标也不得恢复旧pose；死亡clone/换维度/断线重连generation隔离；尺寸来源变化、存档缺失/损坏、目标占用/未加载；安装回调失败不产生Owned/半镜像。按当前禁止自动运行要求仅静态核对/必要no-test构建，运行由用户，不能宣称上述场景已测。现方案无需放宽NativeReceipt或same-center，范围仍现有登录恢复主干。
+
+### 当前模块接缝与最小实施顺序
+
+1. **统一输入及姿态事务。** 先在 PlayerPhysicsStep 现有输入/原生pose/accepted提交链解决 pending 后改 sneaking 的失配机制，逐项保留生命周期与profile核验。将游泳与陆地爬行作为明确语义的姿态意图；沿实际环境与输入选择，不把 PlayerMobilityIntent.WALK/FLIGHT 或渲染 CARDINAL/FREE 直接等同游泳资格。利用现有事务绑定 scope/revision，避免另建owner。
+2. **可信长体与缩放来源。** 复用 NativeBodyProfileProducer / NativeCardinalBodyProfile，以及 PlayerBodyShape.FreeCapsule 已有 collisionProfile 与 eyeAnchor 字段；它们当前存在，不能照旧草案重复造同名数据层。定点核对 Aqua getSize(STANDING)、Artemis及实际合法缩放，区分姿态modifier与身体scale；可信长径不从当前SWIMMING短高/世界AABB反推，不双乘缩放。首次水中/裂缝重登必须独立恢复，保持身体总长，不临时站起测量。
+3. **完整转姿与自动爬行。** 复用 ModeTransitionPrepared / ModeTransitionFinalizer 及 FreeCapsulePlacementV1/存储几何验证链，核实其当前前置契约后扩展必要路径。准备与提交使用同一accepted起点、世界状态和profile，完整检查旋转/平移/resize过程及目标；碰撞体、眼点、姿态原子提交。一格裂缝中可容纳爬行时自动选择长胶囊爬行，长轴沿通道/身体意图，腹侧支撑与重力参考分离；受阻继续合法爬行，空间允许才恢复。禁止缩球、站立模型压扁、未验证补位移或关闭检查。
+4. **游泳运动与介质切换。** 在 PlayerEnvironmentSampler 真实水环境观测及现有运动分派接入水中资格、浮力/阻力/重力、方向输入、实际常用水流/修饰、入出水与零G交接。共用长胶囊不等于复用FLIGHT免费推力；转头只产生目标意图，accepted bodyQ由完整碰撞验证决定。FREE中心旋转合同保持，陆地爬行不能套脚端接触。自定义水域接口/创建指令尚未实现，本轮未获实施指令，不顺手造水文系统。
+5. **Mixin所有权边界及表现同步。** 精确列出 Aqua 两路径 pose/size/travel/eye/输入网络写入口，由UG已建立owner接管时阻止重复执行；原生和Aqua其他功能保持。UG输出已接受姿态给Aqua动画/兼容接口、UIE/YSM及远端，不能让Aqua动画入口重新决定碰撞体。镜像避免递归回调，释放/切换owner在真实生命周期边界进行；不能用全局取消所有Aqua更新代替两路径隔离。完成登录保存/恢复、协议/预测/纠偏、眼点及实际模型一致性，修复本次非Y重登Y_POS短身问题。
+6. **必要构建与完整候选。** 同时闭合原服务器与GL责任修复，按真实影响做既定Java25 no-test构建及静态ABI/映射/版本/产物核验，保留Aqua安装依赖，核实际双方配置与配套身份。原已开启附加功能保留，不复刻也不删JAR。保存源码增量、依赖/配置、提交推送回读、安装包SHA和证据。候选覆盖接管后的游泳与爬行完整主干，未完成则明确剩余，不缩成只诊断即目标完成。
+
+### 验收与目标提示词
+
+继续唯一Root writer，在现有canonical和build/candidate40中完成上述六步及原四项NG，修复失败直至形成需要用户实测的可恢复候选。无token/time预算，不创建副本/缓存/新台账，不自动测试/游戏/专服/JVM或GL探针、安装重启；必要Java25 no-test构建不等于运行通过。新增回归源码未执行标NOT_RUN。碰撞、空间、几何、生命周期及容量检查和阴影功能不得删除或放宽。未完成泳姿/爬行不以旧延期或诊断候选结束目标。
+
+由用户在仍安装Aqua的原环境验收：同角色同裂缝重登、非Y方向/自动爬行/潜行松开与起身空间检查；真实水中完整长胶囊游泳、入出水/受阻转向/合法缩放/重连；第一人称眼点和第三人称/远端模型一致；既有FREE和两种阴影及Aqua其他开启功能无相关退化。原始NG保持OPEN到对应实测结果，交付时明确配套替换清单及最小步骤，不先要求离开裂缝规避复现。阶段标WAIT_USER_TEST，不宣称运行OK。
+
+Root已实读双方Aqua配置一致的回执：开启New Water/New Water Fog/Brighter Water、Easy Elytra Takeoff、Floating Items、Eating Animation、Sneaking Dismounts Parrots，PushOut=APPROXIMATE；关闭Seagrass/Bubble Columns/New Climbing/New Projectile/Sideways Sprinting/Sideways Swimming/Toggle Crawling/No Double Tab Sprinting/Replenish Air Slowly。此为Root现场回执，Docs未独立复读配置。保留其他功能；Toggle Crawling关闭不能否定用户新确认的UG自动爬行要求。
+
+
+## 已被覆盖的历史提案：退役 Aqua（2026-10-29，SUPERSEDED）
+
+用户最新明确：“需要实现这个，退役水游记忆mod”，紧接胶囊体游泳和爬行是否实现的问答。实施方向已授权：UG 自有长胶囊游泳与爬行，退役 Aqua Acrobatics 运行依赖。旧 DRAFT/延期及 D1 默认共存不能否定新方向；下文旧基线、source06、隔离目录、自动测试步骤及“全部未获GO”仅为历史，不用于重启旧流程。当前基线为 C48，Root 唯一源码 writer，复用 canonical/build/candidate40。Root 正等待已发出的新增最低完整范围确认，期间新增范围仅事实调查与设计，原服务端/登录短身/阴影 NG 修复继续；不代用户确认 Aqua 其余功能舍弃，也不承诺全模组复刻。
+
+### 功能与依赖差异清单
+
+下列为迁移必须覆盖的职责清单；除注明已查项外，具体安装功能、配置及其他模组依赖仍须 Root 定点核实，不能称已经穷尽全部消费者。
+
+| 职责 | 当前证据或差异 | 自有方案与完成条件 |
+| --- | --- | --- |
+| 姿态选择/空间不足 | Aqua SWIMMING 当前兼任游泳/爬行表现；当前仍直接依赖 Aqua producer | UG 明确区分陆地爬行与水中游泳意图/介质，统一服务端状态选择和客户端预测；一格裂缝可容纳则自动爬行，空间不足不站起，不用短盒假装长胶囊。 |
+| 可信长径/缩放 | AquaPlayerGeometryMixin 直接读取 getSize(Pose.STANDING)，并生产眼高与缩放信息（Docs 实读） | UG 自有受信身体定义及实际缩放适配，姿态与 scale 分离；首次已爬行/水中登录能重建 D/L，不能依赖先站立或历史最大高度；移除 Aqua 后仍保留实际安装 Artemis 等必要来源。 |
+| 物理/支撑/水动力 | 原规划已有长体、腹侧支撑、自由方向、入出水责任要求 | 复用 UG/CHB 真实几何与事务：保持 D/L、完整转姿与平移路径验碰撞；爬行按腹侧支撑，游泳处理真实介质/浮力/阻力/输入/水流及已确认常用修饰，不能复制零G推力或双执行 native travel。 |
+| 眼点/模型/相机 | 现有 updateEyeHeight、findEyeScaleFactor、playerEyeHeight 属 Aqua 提供方法/字段（Docs 实读） | UG 从已接受姿态和可信身体定义派生眼锚，实际模型姿态及远端同步一致；移除 Aqua 后不留失效 shadow/injection，UIE/YSM 消费自有姿态，不依赖外部 SWIMMING enum。 |
+| 持久化/重登 | 本次非Y下线后 Y_POS 短身问题未闭合 | 保存必要版本化姿态/方向/来源信息；登录以当前尺寸、世界空间重新验证，旧 proof/session 不复活；同裂缝恢复可容纳爬行，不能默认站立测量再压扁。 |
+| 输入/网络 | Aqua 原键位/消息不能自然随 JAR 退役继续存在 | 复用 UG 既有输入/STATE 链，自动爬行为已确认行为；其他新键位及体验依范围答复，避免抢键。协议显式区分语义/版本，服务端不接受客户端自签长径，预测/纠偏/远端一致。 |
+| 注入/编译/运行依赖 | Docs 检索命中 AquaPlayerGeometryMixin、PlayerGeometryMixinPlugin、NativeCardinalBodyProfile、clientIntegration 测试；build.gradle 仅作为候选检查路径，不能据搜索路径声称存在硬依赖 | 枚举源码/配置/Mixin/refmap/打包元数据及实际 class 常量池和启动配置的 Aqua 引用；消除运行硬引用和重叠 writer。无 Aqua 的完整候选必须静态闭合依赖；第三方消费者缺失依赖是阻断，不是删除 JAR 即成功。 |
+| 其他 Aqua 功能与配置 | 动画、视觉、水雾/音效、其他移动增强及第三方兼容是否实际启用未核完 | 按现场配置和实装包列出具体保留/接管/回归原版/损失，不把未知项写成无影响；由用户待确认最低范围决定哪些纳入，不默认全移植或静默丢失。 |
+| 许可/来源 | 既有参考固定源码及 Unlicense 指针保留 | 参考/移植内容保留来源与适用许可说明；退役运行依赖不等于删去版权许可记录。 |
+
+### 单一 owner 迁移设计
+
+在既有 UG accepted snapshot/事务中表达自有姿态、可信身体 profile、bodyQ、supportFrame 与眼锚；优先扩现有结构，不新建平行状态管理系统。pose 表达语义，碰撞长径表达物理定义，native width/height 只作兼容镜像，不得反向当作自由长体真值。陆地爬行与自由泳可共享长胶囊几何，但支撑、动力和进入退出条件必须分开。拟新增类型须经 Root 当前源码核对，旧规划中的名字不是既成 API。
+
+输入先形成同一 tick 的一致意图，再构建/验证姿态提案；pending 绑定该意图和 accepted revision，提交前检查真实归属与世界状态，防止输入在 pending 之后改写 profile。碰撞/姿态/眼点作为完整状态提交，失败保留一致旧状态，不能取消检查。登录恢复同样走可信来源与空间验证，不从原生短 AABB 猜长体。Aqua producer 的替代输入、眼高和缩放链先闭合，再移除其 Mixin/运行依赖；禁止只有拆除没有替代。过渡开发时如 Aqua 仍在实例中，不能将共存验证冒充无 Aqua 候选；避免双写的暂时兼容不改变最终退役目标。
+
+### 主干切片与交付门
+
+1. 范围确认与差异核实：接收已发送的最低范围答复，核实现场 Aqua 功能/消费者/配置，原位更新上表具体差异；既定一格爬行和退役方向不重问。
+2. 自有 profile/pose/眼点/协议与持久化闭包：实现可信来源及登录恢复，先修本次 pending 输入顺序与真实核验问题；旧数据无法恢复的部分明确标记，不伪造历史方向。
+3. 自动爬行完整路径：同裂缝登录、六向支撑、长体转姿、受阻继续爬行、空间允许恢复、客户端模型/眼点及远端同步，不能以短盒或缩模型替代。
+4. 自由长胶囊游泳完整路径：入出水、真实水动力、任意合法方向、受阻转姿、缩放、重登/换世界及既有零G交接。复用原规划几何与眼锚不变量，旧未批准手感参数不当合同。
+5. 退役闭包：移除 Aqua 运行硬依赖及重叠写入，清理实际构建/注册/元数据/分发与受影响第三方接缝，保留必要许可；列明其他 Aqua 功能的处置和已确认损失。候选客户端/服务端安装清单明确不含 Aqua，实际移除与启动仍由用户执行。
+6. 同步闭合当前阴影 GL0x502 与原服务端/短身 NG，必要 Java25 no-test 构建、静态 ABI/映射/身份/依赖核验，按既有授权保存源码/推送/恢复输入/安装包。未经用户同意不能把完整目标缩成只有诊断候选；若仅能提供诊断，明确未交付和剩余主干。
+
+运行测试仍由用户完成，禁止自动测试/游戏/专服/JVM或GL探针、安装重启。旧第11节用例作为有机制依据的验收参考，按当前确认范围和改动选择必要路径，不机械扩成自动测试矩阵。必要常用验收包括同角色同裂缝重登爬行与起身、真实水中长体/入出水/缩放、转视角与模型/眼点一致、远端观察、无 Aqua 依赖启动及原阴影两模式；保留用户实际验收门，静态/构建不替代运行。
+
+完整目标模式需在收到待确认范围后由 Docs 原位合并，再发 Root 更新执行目标；无预算、单 writer、复用环境、保留原 NG 与功能检查。当前仅追加设计，不由本节擅自启动范围未确认部分。
+
+
 状态：**DRAFT / 待用户确认增量范围与控制体验；本文件不授权实施。** 2026-10-17。
 
 最新工作顺序：新增趴卧 / 自由游泳继续延期。SOURCE19 / saved candidate16仍为当前新版用户手测候选，WIP / CANDIDATE / KNOWN_NG，原清单 / save-time receipt / 产物不覆盖，旧14保历史，无部署 / 世界改动。SOURCE26夹具scoped-region-close曾SOURCE_NG、未执行；SOURCE27仅补修逐entry聚合边界，primary / suppressed保留，其余609同26、全部产品同25，c18 / V19不变，27独审无确定SOURCE blocker、26原报告保留。局部反射例外限定actual private map无public scoped API及canonical目录直接.mca / 同cache monitor / close成功才remove，避免全局flush与FML test bridge。run174只重run173失败getter1例，含teardown实际1P / 0skip、compile3P；其余5P未重复，run173 cleanup NG保原来源。原strict sleep已以run175启动，尚无结果 / strong receipt / full build / fresh native39 / candidate18交包或GPU / 真实验收OK。相机未合入，相机 / NFR / 水体合同不变，水文 / 新泳姿 / 无关F08和姿态背包 / 顾问继续延期。本Docs仅增量同步，状态以唯一账本为准。

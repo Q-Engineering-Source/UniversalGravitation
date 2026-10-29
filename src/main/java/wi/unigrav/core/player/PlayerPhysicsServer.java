@@ -4942,6 +4942,7 @@ public final class PlayerPhysicsServer {
                                     WorldCollisionCandidates.ActorGeometry.read(session.player))).isPresent()
                             && matchesPhysicalGeometry(session.player, custody.expectedJournal())) {
                         owner.snapshot = custody.expectedJournal();
+                        retireCardinalPendingAfterFreeCommit(owner);
                         if (custody.expectedPlacement().shape() instanceof PlayerBodyShape.FreeCapsule)
                             owner.travel.ownerReference(new PlayerBodyReference.FreeReference(
                                     owner.travel.ownerReference().manualIntent(), Optional.empty(),
@@ -4986,6 +4987,7 @@ public final class PlayerPhysicsServer {
             if (!PlayerKinematics.requiresNative(session.player)) return;
             if (!ownerCurrent.getAsBoolean()) return;
             owner.snapshot = stopped.snapshot();
+            retireCardinalPendingAfterFreeCommit(owner);
             if (stopped.snapshot().placement().shape() instanceof PlayerBodyShape.FreeCapsule)
                 owner.travel.ownerReference(new PlayerBodyReference.FreeReference(
                         owner.travel.ownerReference().manualIntent(), Optional.empty(),
@@ -5042,6 +5044,7 @@ public final class PlayerPhysicsServer {
                             }
                         }
                         owner.snapshot = committedSnapshot;
+                        retireCardinalPendingAfterFreeCommit(owner);
                         if (custody.expectedPlacement().shape() instanceof PlayerBodyShape.FreeCapsule)
                             owner.travel.ownerReference(new PlayerBodyReference.FreeReference(
                                     owner.travel.ownerReference().manualIntent(), Optional.empty(),
@@ -5051,6 +5054,7 @@ public final class PlayerPhysicsServer {
                 }
             } else if (exactInstalledGeometry) {
                 owner.snapshot = failure.snapshot();
+                retireCardinalPendingAfterFreeCommit(owner);
                 refreshManualReceipt(owner);
             }
             if (!exactFailureOwner) {
@@ -5166,6 +5170,7 @@ public final class PlayerPhysicsServer {
                     || session.scopeHandle != scopeBefore || owner.travel.correctionRevision() != correctionBefore
                     || owner.travel.mobility().generation() != mobilityGenerationBefore || owner.teleportPending)) return;
             owner.snapshot = deferred.snapshot();
+            retireCardinalPendingAfterFreeCommit(owner);
             if (eyeCompletion.isPresent()) {
                 rebaseInstalledPhysicalResizeIntent(owner, before, deferred.snapshot(),
                         eyeCompletion.orElseThrow(), session.player.eyeHeight);
@@ -5434,8 +5439,7 @@ public final class PlayerPhysicsServer {
                 return;
             }
             owner.snapshot = installed;
-            if (installed.placement().shape() instanceof PlayerBodyShape.FreeCapsule
-                    && owner.pendingCardinalPose == pendingBefore) owner.pendingCardinalPose = null;
+            retireCardinalPendingAfterFreeCommit(owner);
             owner.nativeCardinalMotion = continueMotion ? predecessorMotion.withSnapshot(installed) : null;
             if (eyeCompletion.isPresent()) {
                 rebaseInstalledPhysicalResizeIntent(owner, before, installed, eyeCompletion.orElseThrow(),
@@ -5452,6 +5456,13 @@ public final class PlayerPhysicsServer {
             failAppliedOwnerAdmission(session, owner, capturedCustody, publicationFailure,
                     "applied terminal publication");
         }
+    }
+
+    /** Commit/custody checks have already accepted this snapshot. A Cardinal resize token
+     * cannot survive its source geometry, including a committed move whose tail failed. */
+    private static void retireCardinalPendingAfterFreeCommit(Owned owner) {
+        if (owner.snapshot.placement().shape() instanceof PlayerBodyShape.FreeCapsule)
+            owner.pendingCardinalPose = null;
     }
 
     private static void logFreeMovementFailure(Session session, Owned owner, PlayerPhysicalSnapshot accepted,

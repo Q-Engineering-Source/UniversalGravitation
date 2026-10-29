@@ -1564,7 +1564,11 @@ public final class PlayerPhysicsClient {
                 || !INSTANCE.targets(mc.getConnection(), localPlayer, mc.world) || INSTANCE.session == null) {
             return Optional.empty();
         }
-        var accepted = INSTANCE.session.presentationSnapshot();
+        var exactSession = INSTANCE.session;
+        var exactContext = INSTANCE.acceptedOfferContext;
+        var exactConnection = INSTANCE.connection;
+        long exactSerial = INSTANCE.successfulInstallSerial;
+        var accepted = exactSession.presentationSnapshot();
         if (accepted.isEmpty()) return Optional.empty();
         PlayerPhysicalSnapshot snapshot = accepted.orElseThrow();
         if (!snapshot.scope().playerId().equals(actor.getUniqueID())
@@ -1574,7 +1578,13 @@ public final class PlayerPhysicsClient {
                 || !PlayerPhysicsClientMirror.matchesAcceptedPresentationGeometry(actor, snapshot)) {
             return Optional.empty();
         }
-        return accepted;
+        // Bounds may be supplied by another mod and synchronously retire or replace the
+        // installation. A successfully read old box does not keep that old owner current.
+        return INSTANCE.session == exactSession && INSTANCE.acceptedOfferContext == exactContext
+                && INSTANCE.connection == exactConnection && INSTANCE.successfulInstallSerial == exactSerial
+                && INSTANCE.player == actor && INSTANCE.world == actor.world && actor.world == mc.world
+                && !isInstallationFenced(actor) && exactSession.presentationSnapshot().orElse(null) == snapshot
+                ? accepted : Optional.empty();
     }
 
     /** Cardinal geometry is used only to shape Aqua's clearance query, never to install an owner. */
@@ -1586,8 +1596,10 @@ public final class PlayerPhysicsClient {
     }
 
     public static float physicalEyeHeight(EntityPlayer actor, float nativeHeight) {
-        return !isInstallationFenced(actor) && drivesMotion(actor)
-                ? INSTANCE.session.physicalEyeHeight(actor, nativeHeight) : nativeHeight;
+        // The same proved projection supplies the model, camera and native getter. In-flight
+        // installations and retired owners cannot expose an eye from their retained snapshot.
+        return currentProvenPresentation(actor)
+                .map(snapshot -> (float) snapshot.placement().shape().dimensions().eyeHeight()).orElse(nativeHeight);
     }
 
     private static final class ClientFreeEnvironmentOwner {

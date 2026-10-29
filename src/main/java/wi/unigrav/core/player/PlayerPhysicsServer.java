@@ -40,6 +40,7 @@ import wi.unigrav.api.math.Vec3;
 import wi.unigrav.core.UnigravConfig;
 import wi.unigrav.core.BodyPhysics;
 import wi.unigrav.core.GravityEntityBinder;
+import wi.unigrav.core.GravityMode;
 import wi.unigrav.core.boost.BoostMovementBudget;
 import wi.unigrav.core.boost.RemoteBoostBoundedDispatcher;
 import wi.unigrav.core.boost.RemoteBoostServer;
@@ -2637,6 +2638,8 @@ public final class PlayerPhysicsServer {
         private WorldCollisionCandidates.Snapshot capture;
         private CapsulePlacementMath.Pose environmentPose;
         private CapsuleEnvironmentObservation.Prepared environment;
+        private PlayerEnvironmentSampler.InitializationReference initializationReference;
+        private Vec3 initializationReferencePoint;
         private CardinalFrame selectionFrame;
         private boolean standingBlocked;
         private Optional<PlayerBodyShape.PronePose> selectedPose;
@@ -2715,6 +2718,17 @@ public final class PlayerPhysicsServer {
                     || personalGBackpackControl(session);
         }
 
+        EntityPlayerMP referenceActor() { return session.player; }
+        EnvironmentObservationWork referenceWork() { return resources.environmentObservationWork(); }
+        Vec3 referencePoint() { return initializationReferencePoint; }
+        boolean referenceZeroG() { return source.active(); }
+        boolean referenceNativeGravity(Optional<GravityMode> mode) {
+            return !source.active() && !staged.travel.nativeNoGravity
+                    && mode.filter(value -> value == GravityMode.REPLACE).isEmpty()
+                    && !session.player.capabilities.isFlying;
+        }
+        void requireReferenceCurrent() { requireSources(); }
+
         private Optional<PlayerBodyShape.PronePose> selectPose(boolean water) {
             // No currently accepted swim state exists at first ownership. Historical SWIMMING is not permission.
             return ProneLocomotion.selectPose(session.player, input, Optional.empty(), selectionFrame,
@@ -2723,30 +2737,23 @@ public final class PlayerPhysicsServer {
 
         private void selectTarget() {
             var saved = history.saved();
-            selectionFrame = saved.reference().orElse(CardinalFrame.Y_POS);
+            var reference = saved.reference();
+            if (reference.isEmpty() && !flightSelected()) {
+                var free = freeTarget(saved.attitude(), Optional.empty());
+                reference = observeInitializationReference(free);
+            }
+            // This placeholder is never published as reference when the current field has none.
+            selectionFrame = reference.orElse(CardinalFrame.Y_POS);
             var look = saved.kind() == SavedPlayerPose.Kind.CRAWLING || saved.kind() == SavedPlayerPose.Kind.SWIMMING
                     ? saved.attitude().basisY() : saved.attitude().basisZ().multiply(-1);
-            Rotation3d standingQ = saved.attitude();
-            PlayerBodyPlacement standing = null;
-            if (saved.kind() != SavedPlayerPose.Kind.FREE) {
-                if (saved.kind() != SavedPlayerPose.Kind.CARDINAL) {
-                    var tangent = look.subtract(selectionFrame.up().multiply(look.dot(selectionFrame.up())));
-                    double magnitude = Math.sqrt(tangent.lengthSquared());
-                    tangent = magnitude > 0 ? tangent.multiply(1 / magnitude)
-                            : PlayerBodyReference.initialHeading(selectionFrame, session.player.rotationYaw);
-                    var q = PlayerRenderPoseProtocol.Quaternion.fromUpForward(selectionFrame.up(), tangent);
-                    standingQ = new Rotation3d(q.x(), q.y(), q.z(), q.w());
-                }
-                var dimensions = new PlayerBodyShape.Dimensions(body.physical().diameter(), body.physical().length(), input.standingEyeHeight());
-                target = standing = fromTransport(standingQ, new PlayerBodyShape.Cardinal(selectionFrame, dimensions));
-                standingBlocked = !fit();
-            }
+            PlayerBodyPlacement standing = prepareStanding(reference, look);
             selectedPose = selectPose(false);
-            var visited = new LinkedHashSet<Optional<PlayerBodyShape.PronePose>>();
+            record Selection(Optional<CardinalFrame> reference, Optional<PlayerBodyShape.PronePose> pose) { }
+            var visited = new LinkedHashSet<Selection>();
             // Finite mode fixed point: each distinct current candidate gets its own full fit and actual-fluid scan.
-            while (visited.add(selectedPose)) {
+            while (visited.add(new Selection(reference, selectedPose))) {
                 if (selectedPose.isPresent()) {
-                    if (saved.reference().isEmpty())
+                    if (reference.isEmpty())
                         throw new InitializationDeferred("current-prone-mode-needs-a-proven-reference");
                     var pose = selectedPose.orElseThrow();
                     boolean sameMode = saved.kind().name().equals(pose.kind().name());
@@ -2761,6 +2768,16 @@ public final class PlayerPhysicsServer {
                 if (observed instanceof CapsuleEnvironmentObservation.Unavailable failure)
                     throw new InitializationDeferred("current-full-target-fluid-unavailable: " + failure.reason(), failure.cause().orElse(null));
                 environment = (CapsuleEnvironmentObservation.Prepared) observed;
+                if (saved.reference().isEmpty() && !flightSelected()) {
+                    var targetReference = observeInitializationReference(target);
+                    if (!targetReference.equals(reference)) {
+                        reference = targetReference;
+                        selectionFrame = reference.orElse(CardinalFrame.Y_POS);
+                        standing = prepareStanding(reference, look);
+                        selectedPose = selectPose(environment.inWater());
+                        continue;
+                    }
+                }
                 var currentSelection = selectPose(environment.inWater());
                 requireNativeSource();
                 if (currentSelection.equals(selectedPose)) {
@@ -2773,7 +2790,42 @@ public final class PlayerPhysicsServer {
             throw new InitializationDeferred("current-pose-and-full-body-fluid-selection-not-stable");
         }
 
+        private Optional<CardinalFrame> observeInitializationReference(PlayerBodyPlacement candidate) {
+            initializationReferencePoint = new Vec3(candidate.center().x(), candidate.center().y(), candidate.center().z());
+            initializationReference = new PlayerEnvironmentSampler(
+                    Objects.requireNonNull(UnigravMod.entityBinder, "player physics binder"),
+                    MagneticResponseRules.builtIn(), 0.5, ActiveBootRules.core()).sampleInitializationReference(this);
+            var reference = initializationReference.frame();
+            requireNativeSource();
+            return reference;
+        }
+
+        private PlayerBodyPlacement prepareStanding(Optional<CardinalFrame> reference, Vec3d look) {
+            standingBlocked = false;
+            if (reference.isEmpty() || flightSelected()) return null;
+            var saved = history.saved();
+            Rotation3d standingQ = saved.attitude();
+            if (saved.kind() != SavedPlayerPose.Kind.CARDINAL) {
+                var tangent = look.subtract(selectionFrame.up().multiply(look.dot(selectionFrame.up())));
+                double magnitude = Math.sqrt(tangent.lengthSquared());
+                tangent = magnitude > 0 ? tangent.multiply(1 / magnitude)
+                        : PlayerBodyReference.initialHeading(selectionFrame, session.player.rotationYaw);
+                var q = PlayerRenderPoseProtocol.Quaternion.fromUpForward(selectionFrame.up(), tangent);
+                standingQ = new Rotation3d(q.x(), q.y(), q.z(), q.w());
+            }
+            var dimensions = new PlayerBodyShape.Dimensions(body.physical().diameter(), body.physical().length(), input.standingEyeHeight());
+            target = fromTransport(standingQ, new PlayerBodyShape.Cardinal(selectionFrame, dimensions));
+            standingBlocked = !fit();
+            return target;
+        }
+
         private void requireEnvironment() {
+            if (initializationReference != null) {
+                initializationReference.requireCurrent();
+                var center = target.center();
+                if (!initializationReferencePoint.equals(new Vec3(center.x(), center.y(), center.z())))
+                    throw new IllegalStateException("First-owner reference was not observed at the final target centre");
+            }
             if (environment == null || !environment.matches(this, environmentPose)
                     || !selectPose(environment.inWater()).equals(selectedPose))
                 throw new IllegalStateException("First-owner current fluid, pose intent or standing selection changed");

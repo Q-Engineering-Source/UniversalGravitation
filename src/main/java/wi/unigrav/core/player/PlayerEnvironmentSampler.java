@@ -107,6 +107,71 @@ public final class PlayerEnvironmentSampler {
     private interface ReferenceObserver {
         ReferenceResult observe(CertifiedReferenceEndpoint endpoint, boolean nativeGravity);
     }
+
+    /** Field-only initialization evidence. It grants neither support nor body installation authority. */
+    static final class InitializationReference {
+        private final Optional<CardinalFrame> frame;
+        private final Runnable current;
+        private InitializationReference(Optional<CardinalFrame> frame, Runnable current) {
+            this.frame = frame; this.current = current;
+        }
+        Optional<CardinalFrame> frame() { current.run(); return frame; }
+        void requireCurrent() { current.run(); }
+    }
+
+    InitializationReference sampleInitializationReference(PlayerPhysicsServer.InitializationInstallation installation) {
+        installation.requireReferenceCurrent();
+        var player = installation.referenceActor();
+        var world = (WorldServer) player.world;
+        var work = installation.referenceWork();
+        var before = Observation.read(player, world);
+        var point = installation.referencePoint();
+        boolean zeroG = installation.referenceZeroG();
+        var policy = PlayerPhysicsPolicy.capture();
+        var decision = FloorWorldFields.captureDecision(world).orElseThrow(
+                () -> new IllegalStateException("First-owner reference world is unavailable"));
+        var binding = binder.sampleFieldBinding(player, work);
+        installation.requireReferenceCurrent();
+        if (!binding.isCurrent() || !decision.isCurrent())
+            throw new IllegalStateException("First-owner reference source changed during capture");
+        var rawField = binding.active() ? EntityGravitySources.observeFieldAcceleration(player, point,
+                before.tick() * GravityEntityBinder.TICK_SECONDS, work) : null;
+        var ambient = zeroG || rawField == null ? Vec3.ZERO : rawField.acceleration();
+        if (installation.referenceNativeGravity(binding.mode())) ambient = ambient.add(new Vec3(0, -32, 0));
+        var responses = decision.isLocalCompatibilityOwner() ? materials : decision.passiveResponses();
+        double response = responses.playerResponse(before.boots(), before.creative(), false);
+        var floors = decision.sampleForStanding(point, response, work);
+        installation.requireReferenceCurrent();
+        if (floors.isEmpty()) throw new IllegalStateException("First-owner reference floor observation is unavailable");
+        var eligibility = PlayerPhysicsPolicy.floorEligibility(policy, zeroG, true);
+        Evidence fields = before.creative() && zeroG
+                ? compensatedFloorEvidence(ambient, floors.orElseThrow(), eligibility)
+                : new Evidence(StandingConstraints.Availability.AVAILABLE, ambient, Vec3.ZERO,
+                        naturalReference(ambient), List.of(), Optional.empty())
+                    .withFloorSample(floors, eligibility.force(), eligibility.reference());
+        var frame = StandingConstraints.resolve(StandingConstraints.State.initial(),
+                new StandingConstraints.Request(before.tick(), false, fields)).targetReference();
+        // Geometry changes deliberately during installation. The typed journal fences those writes;
+        // this receipt keeps only the actual field/config/equipment inputs current across them.
+        Runnable current = () -> {
+            installation.requireReferenceCurrent();
+            boolean sameInputs = player.world == world && player.connection == before.connection()
+                    && world.getTotalWorldTime() == before.tick()
+                    && player.hasNoGravity() == before.noGravity()
+                    && player.capabilities.isCreativeMode == before.creative()
+                    && player.capabilities.isFlying == before.flying()
+                    && ItemStack.areItemStacksEqual(before.boots(), player.getItemStackFromSlot(EntityEquipmentSlot.FEET));
+            if (!sameInputs || !binding.isCurrent() || !decision.isCurrent()
+                    || !policy.equals(PlayerPhysicsPolicy.capture()) || rawField != null && !rawField.isCurrent())
+                throw new IllegalStateException("First-owner reference field, policy or equipment changed");
+            installation.requireReferenceCurrent();
+        };
+        current.run();
+        if (!before.sameAs(Observation.read(player, world)))
+            throw new IllegalStateException("First-owner native actor changed during reference observation");
+        current.run();
+        return new InitializationReference(frame, current);
+    }
     /** Independent Free observations; six-axis reference scores never stand in for arbitrary-up support. */
     static final class FreeSample implements FreeResult {
         private final FreeStandingObservation observation;

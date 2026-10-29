@@ -59,9 +59,24 @@ public final class NativePlayerMovement {
         }
     }
 
-    /** Completed native centers in simulation ticks; never a physical velocity authorization. */
-    public record CenterSample(long serverTick, Vec3d center) {
-        public CenterSample { Objects.requireNonNull(center, "center"); }
+    /** Value provenance of the occupied set; eye-only changes do not manufacture centre velocity. */
+    public record CenterSource(double width, double height, Vec3d minimumOffset, Vec3d maximumOffset,
+                               Optional<NativeBodyProfileProducer.Profile> profile,
+                               boolean sneaking, boolean gliding) {
+        public CenterSource {
+            Objects.requireNonNull(minimumOffset, "minimumOffset");
+            Objects.requireNonNull(maximumOffset, "maximumOffset");
+            Objects.requireNonNull(profile, "profile");
+        }
+    }
+
+    /** Completed native centers and their immutable sources, never a velocity authorization. */
+    public record CenterSample(long serverTick, Vec3d center, PlayerBodyPlacement placement, CenterSource source) {
+        public CenterSample {
+            Objects.requireNonNull(center, "center");
+            Objects.requireNonNull(placement, "placement");
+            Objects.requireNonNull(source, "source");
+        }
     }
 
     /**
@@ -88,6 +103,16 @@ public final class NativePlayerMovement {
         }
         if (lifetime.centers.isEmpty()
                 || lifetime.observedRevision != receipt.orElseThrow().delegateRevision()) return Optional.empty();
+        var last = lifetime.centers.getLast();
+        var observed = observeCenterSample(handler, lifetime, receipt.orElseThrow());
+        if (observed.isEmpty()) return Optional.empty();
+        if (lifetime.centers.isEmpty() || lifetime.centers.getLast() != last
+                || lifetime.observedRevision != receipt.orElseThrow().delegateRevision()) return Optional.empty();
+        if (!last.source().equals(observed.orElseThrow().source())
+                || !last.placement().equals(observed.orElseThrow().placement())) {
+            lifetime.centers.clear();
+            return Optional.empty();
+        }
         long age = world.getTotalWorldTime() - lifetime.centers.getLast().serverTick();
         if (age < 0 || age > 2) {
             lifetime.centers.clear();
@@ -206,20 +231,57 @@ public final class NativePlayerMovement {
         }
         Receipt completed = receipt.orElseThrow();
         if (lifetime.observedRevision == completed.delegateRevision()) return;
-        long tick = lifetime.world.getTotalWorldTime();
+        var observed = observeCenterSample(handler, lifetime, completed);
+        if (observed.isEmpty()) return;
+        var sample = observed.orElseThrow();
+        long tick = sample.serverTick();
         if (!lifetime.centers.isEmpty()) {
             long previous = lifetime.centers.getLast().serverTick();
-            if (tick < previous || tick - previous > 2) lifetime.centers.clear();
+            if (tick < previous || tick - previous > 2
+                    || !lifetime.centers.getLast().source().equals(sample.source())) lifetime.centers.clear();
             else if (tick == previous) lifetime.centers.removeLast();
         }
-        // Use the actual finalized occupied set, not packet coordinates or native motion.
-        AxisAlignedBB bounds = handler.player.getEntityBoundingBox();
-        Vec3d center = new Vec3d(bounds.minX + (bounds.maxX - bounds.minX) * 0.5,
-                bounds.minY + (bounds.maxY - bounds.minY) * 0.5,
-                bounds.minZ + (bounds.maxZ - bounds.minZ) * 0.5);
-        lifetime.centers.add(new CenterSample(tick, center));
+        lifetime.centers.add(sample);
         if (lifetime.centers.size() > 3) lifetime.centers.removeFirst();
         lifetime.observedRevision = completed.delegateRevision();
+    }
+
+    /** Read real producer values twice around callback-capable geometry reads, then fence publication. */
+    private Optional<CenterSample> observeCenterSample(NetHandlerPlayServer handler, Lifetime lifetime, Receipt receipt) {
+        EntityPlayerMP player = lifetime.player;
+        long tick = lifetime.world.getTotalWorldTime();
+        var profile = centerProfile(player);
+        boolean sneaking = player.isSneaking();
+        boolean gliding = player.isElytraFlying();
+        if (current(handler).filter(value -> value == receipt).isEmpty()) return Optional.empty();
+        if (!profile.equals(centerProfile(player))) {
+            lifetime.centers.clear();
+            return Optional.empty();
+        }
+        if (current(handler).filter(value -> value == receipt).isEmpty()) return Optional.empty();
+        boolean finalSneaking = player.isSneaking();
+        boolean finalGliding = player.isElytraFlying();
+        // Getter callbacks must finish before the final lifetime/force publication fence.
+        if (sneaking != finalSneaking || gliding != finalGliding
+                || lifetimes.get(handler) != lifetime || lifetime.pending != null || lifetime.receipt != receipt
+                || !lifetime.matches(handler) || rejectForceObservation(lifetime) || player.velocityChanged
+                || lifetime.world.getTotalWorldTime() != tick) return Optional.empty();
+        var placement = receipt.placement();
+        var bounds = placement.bounds();
+        var transport = placement.transport();
+        var dimensions = placement.shape().dimensions();
+        var source = new CenterSource(dimensions.width(), dimensions.height(),
+                bounds.min().subtract(transport), bounds.max().subtract(transport), profile, sneaking, gliding);
+        // Preserve the native actual-box centre arithmetic used by the original producer.
+        var center = new Vec3d(bounds.min().x() + (bounds.max().x() - bounds.min().x()) * 0.5,
+                bounds.min().y() + (bounds.max().y() - bounds.min().y()) * 0.5,
+                bounds.min().z() + (bounds.max().z() - bounds.min().z()) * 0.5);
+        return Optional.of(new CenterSample(tick, center, placement, source));
+    }
+
+    private static Optional<NativeBodyProfileProducer.Profile> centerProfile(EntityPlayerMP player) {
+        return player instanceof NativeBodyProfileProducer producer
+                ? producer.unigrav$nativeBodyProfile() : Optional.empty();
     }
 
     public synchronized void install() {
@@ -311,13 +373,16 @@ public final class NativePlayerMovement {
             return Optional.empty();
         }
         if (lifetime.pending != null || lifetime.receipt == null) return Optional.empty();
+        Receipt expected = lifetime.receipt;
         Optional<Geometry> actual = observe(handler);
-        if (actual.isEmpty() || !actual.orElseThrow().placement().equals(lifetime.receipt.placement())
-                || !actual.orElseThrow().motion().equals(lifetime.receipt.observedNativeMotionBlocksPerTick())) {
-            lifetimes.remove(handler);
+        if (lifetimes.get(handler) != lifetime || lifetime.pending != null || lifetime.receipt != expected
+                || !lifetime.matches(handler)) return Optional.empty();
+        if (actual.isEmpty() || !actual.orElseThrow().placement().equals(expected.placement())
+                || !actual.orElseThrow().motion().equals(expected.observedNativeMotionBlocksPerTick())) {
+            lifetimes.remove(handler, lifetime);
             return Optional.empty();
         }
-        return Optional.of(lifetime.receipt);
+        return Optional.of(expected);
     }
 
     /** Absolute native relocation retires this lifetime; a teleport ACK cannot resurrect it. */

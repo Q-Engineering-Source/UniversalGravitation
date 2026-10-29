@@ -2591,6 +2591,7 @@ public final class PlayerPhysicsServer {
                 var last = samples.getLast();
                 long ticks = last.serverTick() - before.serverTick();
                 if (ticks < 1 || ticks > 2 || last.serverTick() != session.world.getTotalWorldTime()) return;
+                if (!before.source().equals(last.source()) || !last.placement().equals(lastReceipt.placement())) return;
                 double vx = (last.center().x() - before.center().x()) * 20.0 / ticks;
                 double vy = (last.center().y() - before.center().y()) * 20.0 / ticks;
                 double vz = (last.center().z() - before.center().z()) * 20.0 / ticks;

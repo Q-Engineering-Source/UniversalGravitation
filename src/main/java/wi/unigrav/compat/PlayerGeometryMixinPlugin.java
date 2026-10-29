@@ -27,6 +27,9 @@ public final class PlayerGeometryMixinPlugin implements IMixinConfigPlugin {
             return supports("com/artemis/artemislib/util/AttachAttributes.class", Set.of(
                     "onPlayerTick(Lnet/minecraftforge/fml/common/gameevent/TickEvent$PlayerTickEvent;)V",
                     "onLivingUpdate(Lnet/minecraftforge/event/entity/living/LivingEvent$LivingUpdateEvent;)V"));
+        if (mixinClassName.endsWith(".AquaArtemisModelMixin"))
+            return supports("com/fuzs/aquaacrobatics/integration/artemislib/AttachAttributesFix.class", Set.of(
+                    "onEntityRenderPre(Lnet/minecraftforge/client/event/RenderLivingEvent$Pre;)V"));
         return true;
     }
 

@@ -8,6 +8,6 @@
   "compatibilityLevel": "JAVA_25",
   "mixins": ["ArtemisPlayerGeometryMixin"],
   "server": [],
-  "client": [],
+  "client": ["AquaArtemisModelMixin"],
   "injectors": {"defaultRequire": 1}
 }

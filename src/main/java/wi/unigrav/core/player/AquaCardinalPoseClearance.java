@@ -17,6 +17,14 @@ public final class AquaCardinalPoseClearance {
 
     private AquaCardinalPoseClearance() { }
 
+    /** Full model scale for an already accepted long body; Aqua's short-pose factor is metadata. */
+    public static double modelHeightScale(EntityPlayer actor) {
+        Double value = attributeValue(actor, ARTEMIS_HEIGHT, AQUA_SWIMMING_HEIGHT_MODIFIER);
+        if (value == null || !Double.isFinite(value) || value <= 0)
+            throw new IllegalStateException("Accepted Aqua model requires a finite positive Artemis height scale");
+        return value;
+    }
+
     /**
      * Reorients a size candidate produced by Aqua's own pose method. That candidate already contains
      * Aqua's pose dimensions and built-in size integrations, so only Artemis's external size scale is

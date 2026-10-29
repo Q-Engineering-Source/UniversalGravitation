@@ -7,6 +7,7 @@ import neofontrender.addons.api.camera.CameraRegistration;
 import neofontrender.addons.api.flight.FlightApi;
 import neofontrender.addons.api.flight.FlightAttitude;
 import neofontrender.addons.api.flight.FlightBodyPose;
+import neofontrender.addons.api.flight.FlightBodyGeometry;
 import neofontrender.addons.api.flight.FlightVector;
 import net.minecraft.util.ResourceLocation;
 import org.junit.jupiter.api.Test;
@@ -58,8 +59,10 @@ class UieFlightBodyPoseCompatibilityTest {
                 "API 12 does not expose the owner's free versus axial shadow reference");
         assertFalse(SixDofBodyPresentation.supportsModelUpYBodyPose(13),
                 "API 13 lacks accepted shadow bounds for remote cardinal players");
-        assertTrue(SixDofBodyPresentation.supportsModelUpYBodyPose(14),
-                "sampled accepted shadow bounds require Flight API 14+");
+        assertFalse(SixDofBodyPresentation.supportsModelUpYBodyPose(14),
+                "API 14 lacks actual Cardinal box presentation geometry");
+        assertTrue(SixDofBodyPresentation.supportsModelUpYBodyPose(15),
+                "actual Cardinal box presentation requires Flight API 15+");
         String expectedVersion = System.getenv("UG_EXPECTED_UIE_FLIGHT_API");
         if (expectedVersion != null && !expectedVersion.isBlank()) {
             assertEquals(Integer.parseInt(expectedVersion), runtimeVersion,
@@ -244,6 +247,30 @@ class UieFlightBodyPoseCompatibilityTest {
                     + sampled.attitude.w * transitioning.attitude.w;
             assertTrue(Math.abs(dot) < .999,
                     "the actual visual reference correction must differ while the accepted shadow axis stays fixed");
+        }
+    }
+
+    /** Recorded C47 dimensions: legal native Cardinal body, not representable as a capsule. NOT_RUN. */
+    @Test void recordedShortNativeDimensionsUseTheAcceptedBoxForAllSixAxes() {
+        var dimensions = new PlayerBodyShape.Dimensions(.6000000238418579, .5999999642372131, .4000000059604645);
+        assertFalse(dimensions.supportsCapsule());
+        for (var frame : CardinalFrame.values()) {
+            var snapshot = presentationSnapshot(frame.attitude(), new PlayerBodyShape.Cardinal(frame, dimensions));
+            var bounds = snapshot.placement().bounds();
+            var effective = new PlayerBodyReference.Effective(PlayerBodyReference.Source.ENVIRONMENT,
+                    frame, frame.attitude().basisZ());
+            var identity = new FlightAttitude(0, 0, 0, 1);
+            var render = new CardinalCameraTransition.RenderSample(identity, new FlightVector(0, 0, 0), identity);
+            var eye = snapshot.placement().eye();
+            var worldEye = new FlightVector(eye.x(), eye.y(), eye.z());
+            var result = SixDofBodyPresentation.sampleCardinalView(snapshot, effective, render,
+                    new FlightVector(0, 0, 0), worldEye, worldEye, null, 0, 0, .5F).body();
+            assertEquals(FlightBodyGeometry.Shape.BOX, result.geometry.shape);
+            var center = bounds.center();
+            assertEquals(0, result.geometry.signedDistance(new FlightVector(bounds.min().x(), center.y(), center.z())), 1e-12);
+            assertSame(dimensions, snapshot.placement().shape().dimensions());
+            assertSame(bounds, snapshot.placement().bounds());
+            assertSame(worldEye, result.geometry.eye);
         }
     }
 

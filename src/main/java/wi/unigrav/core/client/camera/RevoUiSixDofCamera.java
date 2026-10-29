@@ -95,7 +95,7 @@ public final class RevoUiSixDofCamera implements AutoCloseable {
 
     public static final String UIE_MOD_ID = "neofontrender_ui_enhancements";
     private static final int REQUIRED_CAMERA_API = 4;
-    private static final int REQUIRED_FLIGHT_API = 14;
+    private static final int REQUIRED_FLIGHT_API = 15;
     private static final int REQUIRED_INPUT_API = 1;
     private static final int PRIORITY = 500;
     private static final long CAMERA_PROBE_MIN_INTERVAL_TICKS = 20L;

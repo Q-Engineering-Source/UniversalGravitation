@@ -22,7 +22,7 @@ import wi.unigrav.core.player.PlayerPhysicalSnapshot;
 
 /** UIE contract boundary: gait turns the visual root, never the camera's authoritative attitude. */
 public final class SixDofBodyPresentation {
-    static final int MODEL_UP_BODY_POSE_FLIGHT_API = 14;
+    static final int MODEL_UP_BODY_POSE_FLIGHT_API = 15;
 
     private SixDofBodyPresentation() { }
 
@@ -85,21 +85,26 @@ public final class SixDofBodyPresentation {
         CardinalBodyBasis basis = cardinalBodyBasis(snapshot, effectiveReference,
                 viewRelativeBodyForward, previousBodyYaw, bodyYaw, partialTicks);
         // Apply only the shared reference transition to the body; live mouse pitch
-        // stays in the head/camera and never tilts the standing collision capsule.
+        // stays in the head/camera and never tilts the standing collision box.
         Vec3d eyeFromFeet = snapshot.placement().eye()
                 .subtract(snapshot.placement().physicalFeet().orElseThrow());
         FlightVector renderedEyeFromRoot = render.presentReferenceVector(fromWorld(eyeFromFeet));
         FlightVector root = new FlightVector(renderedEyeFromTransport.x - renderedEyeFromRoot.x,
                 renderedEyeFromTransport.y - renderedEyeFromRoot.y,
                 renderedEyeFromTransport.z - renderedEyeFromRoot.z);
-        var capsule = snapshot.placement().capsule();
+        var bounds = snapshot.placement().bounds();
         Vec3d eye = snapshot.placement().eye();
-        FlightVector first = render.presentReferenceVector(fromWorld(capsule.centerline().start().subtract(eye)));
-        FlightVector last = render.presentReferenceVector(fromWorld(capsule.centerline().end().subtract(eye)));
+        FlightVector center = render.presentReferenceVector(fromWorld(bounds.center().subtract(eye)));
+        Vec3d half = bounds.max().subtract(bounds.min()).multiply(0.5);
+        // Cardinal physics is an AABB, including short native poses that cannot be capsules.
+        var geometry = FlightBodyGeometry.box(new FlightVector(rigidEye.x + center.x,
+                        rigidEye.y + center.y, rigidEye.z + center.z),
+                render.presentReferenceVector(new FlightVector(half.x(), 0, 0)),
+                render.presentReferenceVector(new FlightVector(0, half.y(), 0)),
+                render.presentReferenceVector(new FlightVector(0, 0, half.z())), sampledWorldEye);
         // The collision-clamped eye may differ from the rigid body eye during a reference transition.
         return new Sample(FlightBodyPose.modelUpY(render.presentBody(basis.body()), render.attitude(), root)
-                .withGeometry(new FlightBodyGeometry(new FlightVector(rigidEye.x + first.x, rigidEye.y + first.y, rigidEye.z + first.z),
-                        new FlightVector(rigidEye.x + last.x, rigidEye.y + last.y, rigidEye.z + last.z), capsule.radius(), sampledWorldEye))
+                .withGeometry(geometry)
                 .withAxialShadowReference(fromWorld(effectiveReference.frame().up()))
                 .withShadowBounds(shadowBounds(snapshot.placement(), rigidEye.x - eye.x(),
                         rigidEye.y - eye.y(), rigidEye.z - eye.z())),

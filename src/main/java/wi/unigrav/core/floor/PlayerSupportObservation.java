@@ -42,10 +42,21 @@ public final class PlayerSupportObservation {
 
     public enum Reason { UNSUPPORTED_SHAPE, CAPTURE_MISMATCH, BODY_OVERLAP, SUPPORT_BUDGET, NATIVE_QUERY_FAILED }
 
-    public sealed interface Result permits Observed, Unavailable { }
+    public sealed interface Result permits Observed, Overlapping, Unavailable { }
 
     public record Observed(Optional<Surface> actualSupport) implements Result {
         public Observed { Objects.requireNonNull(actualSupport, "actualSupport"); }
+    }
+
+    /** Collision was observed successfully, but this observation cannot certify support. */
+    public record Overlapping(Aabb body, Aabb collider) implements Result {
+        public Overlapping { Objects.requireNonNull(body); Objects.requireNonNull(collider); }
+        public String detail() {
+            return "body=" + body + "; collider=" + collider + "; strictOverlap="
+                    + (Math.min(body.max().x(), collider.max().x()) - Math.max(body.min().x(), collider.min().x())) + ","
+                    + (Math.min(body.max().y(), collider.max().y()) - Math.max(body.min().y(), collider.min().y())) + ","
+                    + (Math.min(body.max().z(), collider.max().z()) - Math.max(body.min().z(), collider.min().z()));
+        }
     }
 
     public record Unavailable(Reason reason, String detail, Optional<RuntimeException> cause) implements Result {
@@ -104,7 +115,8 @@ public final class PlayerSupportObservation {
                 charge(work, EnvironmentObservationWork.Unit.FACE_PREDICATE);
                 if (positiveVolumeIntersection(accepted.placement().bounds(), primitive.rawBounds())) {
                     return new Unavailable(Reason.BODY_OVERLAP,
-                            "accepted Cardinal body overlaps a captured native collision box at " + primitive.cell());
+                            "accepted Cardinal body overlaps a captured native collision box at " + primitive.cell()
+                                    + "; " + new Overlapping(accepted.placement().bounds(), primitive.rawBounds()).detail());
                 }
             }
             List<Candidate> candidates = measurements.candidates();
@@ -209,8 +221,7 @@ public final class PlayerSupportObservation {
         for (Aabb raw : rawBoxes) {
             charge(work, EnvironmentObservationWork.Unit.FACE_PREDICATE);
             if (positiveVolumeIntersection(accepted.placement().bounds(), raw)) {
-                return new Unavailable(Reason.BODY_OVERLAP,
-                        "accepted Cardinal body overlaps a native collision box during support observation");
+                return new Overlapping(accepted.placement().bounds(), raw);
             }
         }
 

@@ -27,6 +27,7 @@ import wi.unigrav.api.math.Vec3;
 import wi.unigrav.compat.EquipmentFlightSampling;
 import wi.unigrav.core.GravityEntityBinder;
 import wi.unigrav.core.UnigravConfig;
+import wi.unigrav.UnigravMod;
 import wi.unigrav.core.GravityMode;
 import wi.unigrav.core.ImpactDamageHandler;
 import wi.unigrav.core.network.ImpactReportMessage;
@@ -148,6 +149,7 @@ public final class PlayerPhysicsStep {
             equipmentFlight = parameters;
         }
         private int jumpTicks;
+        private long nativeOverlapDiagnosticTick = Long.MIN_VALUE;
         private final PlayerMobilityIntent.Owner mobility = new PlayerMobilityIntent.Owner();
         private PlayerMobilityIntent.HoverStatus hoverStatus = PlayerMobilityIntent.HoverStatus.OFF;
         private PlayerMobilityIntent.Reason hoverReason = PlayerMobilityIntent.Reason.NONE;
@@ -1713,7 +1715,7 @@ public final class PlayerPhysicsStep {
             if (!gliding && (standingReference || fluid || flying)) {
                 if (!flying && !fluid && controls.jump())
                     travel.jumpOutcome = PlayerPhysicsProtocol.JumpOutcome.REJECTED;
-                if (!flying && !fluid && controls.jump() && jumpGrounded && travel.jumpTicks == 0) {
+                if (!flying && !fluid && controls.jump() && jumpGrounded && !sample.nativeBodyOverlap() && travel.jumpTicks == 0) {
                     travel.jumpTicks = 10;
                     final var jumpPlacement = accepted.placement();
                     final var jumpFrame = frame;
@@ -1824,6 +1826,13 @@ public final class PlayerPhysicsStep {
         double dt = GravityEntityBinder.TICK_SECONDS;
         boolean preintegrated = retainedSource != null;
         boolean fluid = water || lava;
+        if (sample.nativeBodyOverlap() && (travel.nativeOverlapDiagnosticTick == Long.MIN_VALUE
+                || tick < travel.nativeOverlapDiagnosticTick || tick - travel.nativeOverlapDiagnosticTick >= 20)) {
+            travel.nativeOverlapDiagnosticTick = tick;
+            UnigravMod.LOGGER.warn("ug-native-support-overlap scope={} revision={} worldTick={}"
+                            + " support=UNVERIFIED jumpAuthority=false predictionSeed=UNAVAILABLE collisionMovement=CONTINUES {}",
+                    accepted.scope(), accepted.revision(), tick, sample.nativeOverlapDetail());
+        }
         var dimensions = accepted.placement().shape().dimensions();
         double speed = Math.hypot(Math.hypot(velocity.x(), velocity.y()), velocity.z());
         if (!Double.isFinite(speed)) return unavailable("non-finite integrated velocity");
@@ -2278,6 +2287,8 @@ public final class PlayerPhysicsStep {
         try {
             if (!(snapshot.placement().shape() instanceof PlayerBodyShape.Cardinal cardinal))
                 return new CardinalPredictionSeed.Unsupported(CardinalPredictionSeed.Reason.UNSUPPORTED_SHAPE);
+            if (sample.nativeBodyOverlap())
+                return new CardinalPredictionSeed.Unavailable(CardinalPredictionSeed.Reason.WORLD_UNAVAILABLE, Optional.empty());
             if (actor.isInWater() || actor.isInLava() || actor.isElytraFlying() || PlayerKinematics.requiresNative(actor))
                 return new CardinalPredictionSeed.Unsupported(CardinalPredictionSeed.Reason.UNSUPPORTED_STATE);
             var state = travel.standingState();

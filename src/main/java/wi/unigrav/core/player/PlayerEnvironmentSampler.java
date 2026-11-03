@@ -27,6 +27,7 @@ import wi.unigrav.core.floor.FloorDecision;
 import wi.unigrav.core.floor.ActiveBootRules;
 import wi.unigrav.core.floor.MagneticResponseRules;
 import wi.unigrav.core.floor.PlayerBootObservation;
+import wi.unigrav.core.floor.PlayerSupportObservation;
 import wi.unigrav.core.player.StandingConstraints.ConstraintSource;
 import wi.unigrav.core.player.StandingConstraints.Evidence;
 import wi.unigrav.core.player.StandingConstraints.FaceEvidence;
@@ -82,6 +83,8 @@ public final class PlayerEnvironmentSampler {
         }
         void requireCurrent() { ownerObservation.ifPresent(OwnerObservation::requireCurrent); }
         boolean qualifiedBootEquipment() { return ownerObservation.map(value -> value.qualifiedBoot).orElse(false); }
+        boolean nativeBodyOverlap() { return ownerObservation.map(value -> value.nativeOverlapDetail != null).orElse(false); }
+        String nativeOverlapDetail() { return ownerObservation.map(value -> value.nativeOverlapDetail).orElse(null); }
         public Sample {
             Objects.requireNonNull(rawFields, "rawFields");
             Objects.requireNonNull(environmentAcceleration, "environmentAcceleration");
@@ -93,8 +96,9 @@ public final class PlayerEnvironmentSampler {
     public static final class OwnerObservation {
         private final Runnable current;
         private final boolean qualifiedBoot;
-        private OwnerObservation(Runnable current, boolean qualifiedBoot) {
-            this.current = current; this.qualifiedBoot = qualifiedBoot;
+        private final String nativeOverlapDetail;
+        private OwnerObservation(Runnable current, boolean qualifiedBoot, String nativeOverlapDetail) {
+            this.current = current; this.qualifiedBoot = qualifiedBoot; this.nativeOverlapDetail = nativeOverlapDetail;
         }
         void requireCurrent() { current.run(); }
     }
@@ -500,6 +504,7 @@ public final class PlayerEnvironmentSampler {
                             naturalReference(ambient), List.of(), Optional.empty()).withFloorSample(floors,
                             floorEligibility.force(), floorEligibility.reference());
             boolean qualifiedBoot = false;
+            String nativeOverlapDetail = null;
             if (activeBootRules != null) {
                 var bootObservation = floorDecision.isLocalCompatibilityOwner()
                         ? work == null ? PlayerBootObservation.observe(player, accepted, zeroG, before.boots(),
@@ -520,6 +525,7 @@ public final class PlayerEnvironmentSampler {
                 var boots = (PlayerBootObservation.Observed) bootObservation;
                 evidence = boots.evidence();
                 qualifiedBoot = boots.qualification() instanceof ActiveBootRules.QualifiedBoot;
+                nativeOverlapDetail = boots.overlap().map(PlayerSupportObservation.Overlapping::detail).orElse(null);
             }
             Vec3 environmentAcceleration = environmentAcceleration(binding, evidence, before.inWater(), swims,
                     waterSinkBias);
@@ -549,8 +555,8 @@ public final class PlayerEnvironmentSampler {
             };
             current.run();
             return new Sample(accepted, before.tick(), evidence, binding.mode(), binding.active(), zeroG,
-                    response, environmentAcceleration, work == null ? Optional.empty()
-                            : Optional.of(new OwnerObservation(current, qualifiedBoot)), rawFields);
+                    response, environmentAcceleration, work == null && nativeOverlapDetail == null ? Optional.empty()
+                            : Optional.of(new OwnerObservation(current, qualifiedBoot, nativeOverlapDetail)), rawFields);
         } catch (RuntimeException cause) {
             // This boundary owns failures from arbitrary field/material/filter callbacks.
             return new Unavailable(Reason.SOURCE_FAILED, Optional.of(cause));

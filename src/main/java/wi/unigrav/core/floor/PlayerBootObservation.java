@@ -35,8 +35,12 @@ public final class PlayerBootObservation {
     public sealed interface Result permits Observed, Unavailable { }
 
     public record Observed(long worldTick, long rulesRevision, Qualification qualification,
-                           Evidence evidence) implements Result {
+                           Evidence evidence, Optional<PlayerSupportObservation.Overlapping> overlap) implements Result {
+        public Observed(long worldTick, long rulesRevision, Qualification qualification, Evidence evidence) {
+            this(worldTick, rulesRevision, qualification, evidence, Optional.empty());
+        }
         public Observed {
+            Objects.requireNonNull(overlap, "overlap");
             if (worldTick < 0L || rulesRevision < 0L) throw new IllegalArgumentException("observation revisions must be nonnegative");
             Objects.requireNonNull(qualification, "qualification");
             Objects.requireNonNull(evidence, "evidence");
@@ -170,6 +174,7 @@ public final class PlayerBootObservation {
         QualifiedBoot qualifiedBoot = qualification instanceof QualifiedBoot qualified ? qualified : null;
         boolean bootQualified = qualifiedBoot != null;
         Evidence evidence;
+        Optional<PlayerSupportObservation.Overlapping> overlap = Optional.empty();
         if (bootQualified) {
             // The magnetic sensor and complete active-tier domain are only queried for an
             // actor whose exact same-read FEET stack qualified. Ordinary actors still get an
@@ -235,8 +240,15 @@ public final class PlayerBootObservation {
                                 ? Reason.NATIVE_QUERY_FAILED : Reason.SUPPORT_UNAVAILABLE,
                         failure.reason() + ": " + failure.detail(), failure.cause().orElse(null));
             }
-            evidence = BootStandingEvidence.withNativeSupport(nonBootEvidence,
-                    ((PlayerSupportObservation.Observed) support).actualSupport());
+            if (support instanceof PlayerSupportObservation.Overlapping observed) {
+                overlap = Optional.of(observed);
+                // No support/adhesion is certified. A known overlap is not a failed world read:
+                // the ordinary collision resolver must still be able to move the player outward.
+                evidence = BootStandingEvidence.withNativeSupport(nonBootEvidence, Optional.empty());
+            } else {
+                evidence = BootStandingEvidence.withNativeSupport(nonBootEvidence,
+                        ((PlayerSupportObservation.Observed) support).actualSupport());
+            }
         }
         if (evidence.availability() != wi.unigrav.core.player.StandingConstraints.Availability.AVAILABLE) {
             return unavailable(Reason.CONTEXT_CHANGED, "same-observation standing evidence failed validation");
@@ -250,7 +262,7 @@ public final class PlayerBootObservation {
                     "actor, FEET equipment, accepted placement, world tick, or active rules changed during boot observation");
         }
         if (work != null) work.requireCurrent();
-        return new Observed(tick, activeRules.revision(), qualification, evidence);
+        return new Observed(tick, activeRules.revision(), qualification, evidence, overlap);
     }
 
     private static boolean placementMatches(EntityPlayerMP actor, PlayerPhysicalSnapshot accepted, PendingCardinalPose pending) {

@@ -1830,7 +1830,7 @@ public final class PlayerPhysicsStep {
                 || tick < travel.nativeOverlapDiagnosticTick || tick - travel.nativeOverlapDiagnosticTick >= 20)) {
             travel.nativeOverlapDiagnosticTick = tick;
             UnigravMod.LOGGER.warn("ug-native-support-overlap scope={} revision={} worldTick={}"
-                            + " support=UNVERIFIED jumpAuthority=false predictionSeed=UNAVAILABLE collisionMovement=CONTINUES {}",
+                            + " support=UNVERIFIED groundJumpAuthority=false samplePredictionSeed=UNAVAILABLE movementPolicy=RESOLVE_WITH_COLLISIONS {}",
                     accepted.scope(), accepted.revision(), tick, sample.nativeOverlapDetail());
         }
         var dimensions = accepted.placement().shape().dimensions();

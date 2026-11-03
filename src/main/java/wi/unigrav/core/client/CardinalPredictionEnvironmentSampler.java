@@ -8,7 +8,6 @@ import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.init.MobEffects;
 import net.minecraft.util.math.AxisAlignedBB;
 import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.MathHelper;
 import net.minecraft.world.World;
 import wi.unigrav.core.GravityEntityBinder;
 import wi.unigrav.core.GravityMode;
@@ -16,6 +15,7 @@ import wi.unigrav.compat.EquipmentFlightSampling;
 import wi.unigrav.core.player.CardinalFrame;
 import wi.unigrav.core.player.CardinalMoveFinalizer;
 import wi.unigrav.core.player.CardinalPredictionSeed;
+import wi.unigrav.core.player.CardinalTravelKernel;
 import wi.unigrav.core.player.PlayerBodyShape;
 import wi.unigrav.core.player.PlayerBoostEligibility;
 import wi.unigrav.core.player.PlayerPhysicsProtocol;
@@ -98,18 +98,8 @@ public final class CardinalPredictionEnvironmentSampler {
             double launch = actor.getJumpUpwardsMotion();
             if (actor.isPotionActive(MobEffects.JUMP_BOOST))
                 launch += (actor.getActivePotionEffect(MobEffects.JUMP_BOOST).getAmplifier() + 1) * .1F;
-            Vec3d impulse;
-            if (cardinal.frame() == CardinalFrame.Y_POS) {
-                float yaw = actor.rotationYaw * (float) (Math.PI / 180.0D);
-                impulse = new Vec3d(-MathHelper.sin(yaw) * .2F, 0, MathHelper.cos(yaw) * .2F);
-            } else {
-                Vec3d look = cardinal.frame().toLocal(controls.forward());
-                double length = Math.hypot(look.x(), look.z());
-                Vec3d forward = length > 1.0e-7
-                        ? cardinal.frame().toWorld(new Vec3d(look.x() / length, 0, look.z() / length))
-                        : state.placement().attitude().basisZ();
-                impulse = forward.multiply((double) .2F);
-            }
+            Vec3d impulse = CardinalTravelKernel.jumpSprintImpulse(cardinal.frame(), controls.forward(),
+                    state.placement().attitude().basisZ());
             Vec3d acceleration = seed.environmentAcceleration();
             if (!seed.personalZeroG() && !seed.savedNativeNoGravity()
                     && seed.bindingMode().filter(mode -> mode == GravityMode.REPLACE).isEmpty() && !flying)

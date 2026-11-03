@@ -28,18 +28,30 @@ public final class CardinalTravelKernel {
         return motionY;
     }
 
+    /** The input slot owns jump heading; independently arriving native LOOK packets do not. */
+    public static float jumpYaw(Vec3d worldLook, Vec3d fallbackForward) {
+        Vec3d forward = Math.hypot(worldLook.x(), worldLook.z()) > 1.0e-7 ? worldLook : fallbackForward;
+        return (float) Math.toDegrees(Math.atan2(-forward.x(), forward.z()));
+    }
+
+    public static Vec3d jumpSprintImpulse(CardinalFrame frame, Vec3d worldLook, Vec3d fallbackForward) {
+        if (frame == CardinalFrame.Y_POS) {
+            float yaw = jumpYaw(worldLook, fallbackForward) * 0.017453292F;
+            return new Vec3d(-MathHelper.sin(yaw) * .2F, 0, MathHelper.cos(yaw) * .2F);
+        }
+        Vec3d look = frame.toLocal(worldLook);
+        double length = Math.hypot(look.x(), look.z());
+        Vec3d forward = length > 1.0e-7
+                ? frame.toWorld(new Vec3d(look.x() / length, 0, look.z() / length)) : fallbackForward;
+        return forward.multiply((double) .2F);
+    }
+
     /** Sample jump strength/potion effects outside this kernel; callbacks receive this world motion. */
     public static Vec3d jump(Vec3d motion, CardinalFrame frame, double launch,
                             boolean sprinting, Vec3d worldLook, Vec3d fallbackForward) {
         Vec3d local = frame.toLocal(motion);
         Vec3d result = frame.toWorld(new Vec3d(local.x(), launch, local.z()));
-        if (sprinting) {
-            Vec3d look = frame.toLocal(worldLook);
-            double length = Math.hypot(look.x(), look.z());
-            Vec3d forward = length > 1.0e-7
-                    ? frame.toWorld(new Vec3d(look.x() / length, 0, look.z() / length)) : fallbackForward;
-            result = result.add(forward.multiply((double) .2F));
-        }
+        if (sprinting) result = result.add(jumpSprintImpulse(frame, worldLook, fallbackForward));
         return result;
     }
 

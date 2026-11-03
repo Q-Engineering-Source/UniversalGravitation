@@ -1627,7 +1627,9 @@ public final class PlayerPhysicsStep {
                     final var jumpPlacement = accepted.placement();
                     final var jumpFrame = frame;
                     EquipmentFlightSampling.withInput(actor, controls, () -> {
-                        if (jumpFrame == CardinalFrame.Y_POS) actor.jump();
+                        if (jumpFrame == CardinalFrame.Y_POS)
+                            NativeJumpInput.run(actor, CardinalTravelKernel.jumpYaw(controls.forward(),
+                                    jumpPlacement.attitude().basisZ()), actor::jump);
                         else jumpCardinal(actor, jumpPlacement, controls);
                         return null;
                     });

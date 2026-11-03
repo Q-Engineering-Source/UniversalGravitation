@@ -9,10 +9,18 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Redirect;
 import org.objectweb.asm.Opcodes;
 import wi.unigrav.UnigravMod;
+import wi.unigrav.core.player.NativeJumpInput;
 
 /** Intercepts the virtual call, including EntityPlayer.travel's wrapper, only for installed physical owners. */
 @Mixin(EntityLivingBase.class)
 abstract class EntityLivingBasePhysicsMixin {
+    @Redirect(method = "jump", at = @At(value = "FIELD",
+            target = "Lnet/minecraft/entity/EntityLivingBase;rotationYaw:F", opcode = Opcodes.GETFIELD),
+            require = 1, allow = 1)
+    private float unigrav$jumpInputHeading(EntityLivingBase actor) {
+        return NativeJumpInput.yaw(actor);
+    }
+
     // Native pre-travel damping and small-velocity zeroing are also writers, even when travel is skipped.
     @Redirect(method = "onLivingUpdate", at = @At(value = "FIELD",
             target = "Lnet/minecraft/entity/EntityLivingBase;motionX:D", opcode = Opcodes.PUTFIELD), require = 2, allow = 2)

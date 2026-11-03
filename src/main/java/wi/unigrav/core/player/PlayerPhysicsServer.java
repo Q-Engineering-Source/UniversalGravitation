@@ -4945,9 +4945,12 @@ public final class PlayerPhysicsServer {
     private static void suspendChangedPredictionReference(Session session, Owned owner,
             PlayerPhysicalSnapshot snapshot) {
         var placement = snapshot.placement();
-        if (Objects.equals(owner.predictionShape, placement.shape())
-                && Objects.equals(owner.predictionAttitude, placement.attitude())
-                && !predictionReferenceEquivalent(owner.predictionReference, owner.travel.cardinalReference()))
+        // A native crouch/stand commit changes the replay collider just as a reference
+        // change changes its basis. Suspend the old mapping before publication; retiring
+        // it publishes an unavailable phase that the live client must treat as a rebase.
+        if (!Objects.equals(owner.predictionShape, placement.shape())
+                || !Objects.equals(owner.predictionAttitude, placement.attitude())
+                || !predictionReferenceEquivalent(owner.predictionReference, owner.travel.cardinalReference()))
             owner.predictionTimeline.suspendReference(predictionContext(session, owner));
     }
 

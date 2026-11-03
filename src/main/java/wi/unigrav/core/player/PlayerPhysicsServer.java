@@ -619,6 +619,11 @@ public final class PlayerPhysicsServer {
         if (!drivesMotion(player)) { original.run(); return; }
         Session session = sessions.get(player.connection.netManager);
         Owned owner = session.owner;
+        // Recovery still owns this installed collider. A native pose write cannot be
+        // adopted while that handshake is fenced, so defer it until custody resumes.
+        // Otherwise Aqua can restore standing size behind the retained crouched snapshot.
+        if (owner.recoveryPending || owner.recoveryAwaitingApply || owner.recoveryAwaitingMirror
+                || owner.recoveryTerminal) return;
         // Aqua's independent callback and Artemis's event can run inside updateSize.
         if (owner.poseDepth > 0) {
             original.run();

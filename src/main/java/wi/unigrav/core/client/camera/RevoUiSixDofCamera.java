@@ -969,7 +969,15 @@ public final class RevoUiSixDofCamera implements AutoCloseable {
                 target, provenEye)) {
             return cardinalPresentationCache.sample;
         }
-        CameraEyeAnchor renderedEye = eyeAnchor(sampleWorld, provenEye, render.eyeReferenceCorrection());
+        // The interpolated eye is a presentation target, not a collision-proven start.
+        // Sweep from the currently proven body eye through both movement interpolation
+        // and reference correction, so a corrected/diagonal span cannot cut into a wall.
+        Vec3d installedEye = candidate.snapshot().placement().eye();
+        FlightVector eyeCorrection = new FlightVector(
+                provenEye.x() - installedEye.x() + render.eyeReferenceCorrection().x,
+                provenEye.y() - installedEye.y() + render.eyeReferenceCorrection().y,
+                provenEye.z() - installedEye.z() + render.eyeReferenceCorrection().z);
+        CameraEyeAnchor renderedEye = eyeAnchor(sampleWorld, installedEye, eyeCorrection);
         SixDofBodyPresentation.Sample sample = SixDofBodyPresentation.sampleCardinalView(
                 candidate.snapshot(), candidate.reference(), render,
                 cardinalRenderedEyeFromTransport(player, partialTicks, provenEye, render.eyeReferenceCorrection()),

@@ -219,7 +219,9 @@ final class ClientCardinalPredictionOwner {
         } else { retire("Prediction boundary missing or phase unavailable"); return false; }
         if (replay instanceof PlayerPredictionTiming.NeedsRebase<Input> failed) { retire(failed.reason()); return false; }
         var scratch = fromAuthority(accepted, cooldown);
+        Vec3d replayPreviousEye = scratch.placement().eye();
         for (var slot : ((PlayerPredictionTiming.Ready<Input>) replay).slots()) {
+            replayPreviousEye = scratch.placement().eye();
             scratch = calculate(scratch, slot.state().controls(), slot.state().environment(), collisions, clientTick);
             if (scratch == null) return false;
             if (!validateEndpoint(endpoint, scratch)) return false;
@@ -230,6 +232,10 @@ final class ClientCardinalPredictionOwner {
             submittedInputTicks.entrySet().removeIf(entry -> entry.getKey() <= acknowledgedInputSequence);
         }
         else latestAwaitingRevision = Math.max(latestAwaitingRevision, accepted.revision());
+        // Rendering must interpolate the final two states of this replay, rather than
+        // joining a corrected endpoint to the old prediction's unrelated eye history.
+        // With no pending slot, the accepted endpoint is the complete available span.
+        previousEye = replayPreviousEye;
         authority = accepted; seed = ready; state = scratch; lastReconciledPacket = packet;
         traceReconciliation(packet, predictedBefore, "reconciled", false);
         traceJumpReconciliation(packet, predictedBefore, "reconciled", false);

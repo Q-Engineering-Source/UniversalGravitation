@@ -923,6 +923,97 @@ public final class PlayerPhysicsStep {
         }
     }
 
+    /** External native displacement: no input, gravity, drag, attitude selection or extra physics tick. */
+    Result movePiston(FreeOwnerTransaction transaction, BoostMovementBudget budget, long budgetTick,
+            TravelState travel, BooleanSupplier ownerCurrent, Vec3d clampedDelta) {
+        var previous = travel.ownerCurrent;
+        travel.ownerCurrent = ownerCurrent;
+        try {
+            transaction.requireCurrent();
+            var actor = transaction.actor();
+            var accepted = transaction.accepted();
+            Vec3d delta = clampedDelta;
+            // Entity.move's web prefix runs after its piston clamp, before collision.
+            if (actor.isInWeb) {
+                actor.isInWeb = false;
+                delta = new Vec3d(delta.x() * .25D, delta.y() * .05000000074505806D, delta.z() * .25D);
+                actor.motionX = actor.motionY = actor.motionZ = 0;
+            }
+            Result result;
+            if (accepted.placement().shape() instanceof PlayerBodyShape.Cardinal cardinal) {
+                var admission = budget.preparePiston(Math.incrementExact(budget.lastSequence()), budgetTick,
+                        new Vec3(delta.x(), delta.y(), delta.z()));
+                if (!admission.accepted()) return unavailable("Piston movement budget: " + admission.failure());
+                var boundary = new CommitBoundary(actor, accepted, budget, admission, travel,
+                        travel.nativeCorrectionRevision, Math.incrementExact(accepted.revision()), null,
+                        cardinal.frame(), transaction.pendingCardinalPose());
+                boundary.externalDisplacement = true;
+                try {
+                    var admitted = admission.destination().sub(admission.start());
+                    var request = new CardinalMovementResolver.Request(cardinal.frame(), actor.getEntityBoundingBox(),
+                            new Vec3d(admitted.x(), admitted.y(), admitted.z()), MoverType.PISTON,
+                            actor.onGround, actor.isSneaking(), actor.stepHeight);
+                    var observation = resolveCardinal(actor.getServerWorld(), actor, accepted, request, transaction);
+                    if (observation.worldFailure().isPresent()) {
+                        var failure = observation.worldFailure().orElseThrow();
+                        return new Unavailable("Piston collision world: " + failure.reason(), failure.cause());
+                    }
+                    if (!(observation.calculation().orElse(null) instanceof CardinalMovementResolver.Resolved resolved))
+                        return unavailable("Piston Cardinal collision unavailable");
+                    var preparation = CardinalMoveFinalizer.preparePhysical(actor, request, resolved,
+                            transaction.resources().environmentObservationWork(), transaction::requireOwnerFence, transaction);
+                    if (!(preparation instanceof CardinalMoveFinalizer.Ready ready))
+                        return unavailable("Piston Cardinal tail unavailable");
+                    boundary.finalizer = ready;
+                    if (!(ready.commit(travel::clearReferenceCommitSnapshot) instanceof CardinalMoveFinalizer.Applied applied))
+                        throw new OwnerContextChangedException("Piston Cardinal tail lost its authority");
+                    transaction.requireOwnerFence();
+                    var transport = applied.actualTransport();
+                    if (!budget.commitNative(admission, new Vec3(transport.x(), transport.y(), transport.z())))
+                        throw new IllegalStateException("Piston movement lost its reserved budget ticket");
+                    boundary.budgetCommitted = true;
+                    var installed = committedSnapshot(actor, accepted, applied.actualBounds(), transport,
+                            false, Math.incrementExact(accepted.revision()), transaction.pendingCardinalPose());
+                    if (!installed.placement().shape().equals(accepted.placement().shape()))
+                        throw new OwnerContextChangedException("Piston callback changed the accepted Cardinal shape");
+                    result = new Applied(installed);
+                } catch (RuntimeException failure) {
+                    try {
+                        var recovered = boundary.recover();
+                        if (recovered.isPresent()) return new CommittedFailure(recovered.orElseThrow(), failure);
+                    } catch (RuntimeException recoveryFailure) {
+                        if (recoveryFailure != failure) failure.addSuppressed(recoveryFailure);
+                    }
+                    throw failure;
+                } finally {
+                    budget.abort(admission);
+                }
+            } else {
+                var pose = CapsulePlacementMath.pose(accepted.placement(), transaction.numeric());
+                var tube = CapsulePlacementMath.translationTube(pose, delta, transaction.numeric());
+                var admission = transaction.reservePiston(budgetTick, delta);
+                if (!admission.accepted()) return unavailable("Piston capsule grant: " + admission.failure());
+                var window = CapsuleMovementResolver.window(accepted, tube);
+                var capture = WorldCollisionCandidates.capture(transaction, window,
+                        CollisionQueryFootprint.QueryPolicy.CAPSULE_CONTACT, SCAN,
+                        transaction.resources().environmentObservationWork());
+                if (capture instanceof WorldCollisionCandidates.Unavailable failure)
+                    return new Unavailable("Piston capsule world: " + failure.reason(), failure.cause());
+                // A piston pushes along its actual axis; do not slide around obstacles.
+                var movement = CapsuleMovementResolver.resolve(transaction, tube, (WorldCollisionCandidates.Snapshot) capture);
+                if (!(movement instanceof CapsuleMovementResolver.Resolved resolved))
+                    return unavailable("Piston capsule collision: " + ((CapsuleMovementResolver.Inconclusive) movement).reason());
+                var preparation = CapsuleMoveFinalizer.prepare(transaction, resolved);
+                if (!(preparation instanceof CapsuleMoveFinalizer.Ready ready))
+                    return unavailable("Piston capsule tail unavailable");
+                result = new Applied(ready.commit());
+            }
+            return finishTerminalResponse(result, transaction);
+        } finally {
+            travel.ownerCurrent = previous;
+        }
+    }
+
     private static Result finishFreeCarrier(Result result, FreeOwnerTransaction transaction,
             BoostMovementBudget budget, long tick, boolean carrier) {
         if (!carrier || !(result instanceof Applied applied)
@@ -2042,6 +2133,7 @@ public final class PlayerPhysicsStep {
         private CardinalMoveFinalizer.Ready finalizer;
         private boolean budgetCommitted;
         private boolean consumingLanding;
+        private boolean externalDisplacement;
 
         private CommitBoundary(EntityPlayerMP actor, PlayerPhysicalSnapshot accepted, BoostMovementBudget budget,
                 BoostMovementBudget.Admission admission, TravelState travel, long correctionRevision,
@@ -2118,7 +2210,7 @@ public final class PlayerPhysicsStep {
                 budgetCommitted = true;
             }
             double limit = budget.ceilingMps() * GravityEntityBinder.TICK_SECONDS;
-            if (speed > limit) {
+            if (!externalDisplacement && speed > limit) {
                 double scale = limit / speed;
                 actor.motionX *= scale; actor.motionY *= scale; actor.motionZ *= scale;
             }

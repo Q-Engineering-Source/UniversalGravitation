@@ -492,7 +492,10 @@ final class FreeOwnerTransaction implements AutoCloseable {
         // Authority is only current if the exact transaction fences still hold after that observation.
         requireOwnerFence();
         if (!matchesGeometry)
-            throw new OwnerContextChangedException("Free movement actor geometry changed outside its installation");
+            throw new OwnerContextChangedException("Movement actor geometry changed outside its installation"
+                    + "; expectedPlacement=" + (installed == null ? accepted.placement() : installed)
+                    + "; observedPosition=(" + actor.posX + "," + actor.posY + "," + actor.posZ + ")"
+                    + "; observedNativeSize=" + actor.width + "x" + actor.height);
     }
 
     void requireOwnerFence() {
@@ -781,6 +784,20 @@ final class FreeOwnerTransaction implements AutoCloseable {
         if (admission != null) throw new IllegalStateException("Free center path already reserved");
         admission = ledger.reserveCenterPath(sequence, budgetTick, vector(accepted.placement().transport()),
                 vector(accepted.placement().center()), pathUpper);
+        return admission;
+    }
+
+    /** Only a tube derived from the native single-axis piston delta may request external path authority. */
+    BoostMovementBudget.CenterPathAdmission reservePiston(long budgetTick, Vec3d delta) {
+        requireCurrent();
+        if (admission != null) throw new IllegalStateException("Piston center path already reserved");
+        if (!Double.isFinite(delta.x()) || !Double.isFinite(delta.y()) || !Double.isFinite(delta.z())
+                || Math.abs(delta.x()) + Math.abs(delta.y()) + Math.abs(delta.z()) > 1.02D
+                || (delta.x() != 0 ? 1 : 0) + (delta.y() != 0 ? 1 : 0) + (delta.z() != 0 ? 1 : 0) > 1)
+            throw new IllegalArgumentException("Piston delta is not a native-clamped axis displacement");
+        var tube = CapsulePlacementMath.translationTube(CapsulePlacementMath.pose(accepted.placement(), numeric()), delta, numeric());
+        admission = ledger.reserveExternalCenterPath(nextLedgerSequence(), budgetTick,
+                vector(accepted.placement().transport()), vector(accepted.placement().center()), tube.requestedDisplacementUpper());
         return admission;
     }
 

@@ -13,6 +13,8 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import wi.unigrav.core.player.PlayerPosePersistence;
+import wi.unigrav.core.player.PlayerPhysicsServer;
+import dev.crlhitbox.api.geometry.Vec3d;
 import java.util.concurrent.atomic.AtomicLong;
 
 @Mixin(Entity.class)
@@ -77,6 +79,16 @@ abstract class PlayerPosePersistenceMixin implements PlayerPosePersistence.Carri
             if (!complete || beforeX != player.posX || beforeY != player.posY || beforeZ != player.posZ)
                 PlayerPosePersistence.invalidate(player);
         }
+    }
+
+    // All PISTON axes have already passed the native per-tick clamp and near-zero returns.
+    // Handoff before the web/collision prefix mutates geometry; the owned finalizer runs one tail.
+    @Inject(method = "move(Lnet/minecraft/entity/MoverType;DDD)V", at = @At(value = "INVOKE",
+            target = "Lnet/minecraft/profiler/Profiler;startSection(Ljava/lang/String;)V", ordinal = 0),
+            cancellable = true, require = 1, allow = 1)
+    private void unigrav$ownedPiston(MoverType type, double x, double y, double z, CallbackInfo callback) {
+        if (type == MoverType.PISTON && PlayerPhysicsServer.INSTANCE.movePiston(
+                (Entity) (Object) this, new Vec3d(x, y, z))) callback.cancel();
     }
 
     @Inject(method = "addVelocity(DDD)V", at = @At("HEAD"))

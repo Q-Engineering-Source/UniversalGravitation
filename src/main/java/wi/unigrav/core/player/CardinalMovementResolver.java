@@ -36,8 +36,8 @@ public final class CardinalMovementResolver {
             Objects.requireNonNull(frame, "frame");
             requireBox(worldBounds);
             requireVector(worldDelta);
-            if (moverType != MoverType.SELF && moverType != MoverType.PLAYER) {
-                throw new IllegalArgumentException("normal player collision requires SELF or PLAYER owner");
+            if (moverType != MoverType.SELF && moverType != MoverType.PLAYER && moverType != MoverType.PISTON) {
+                throw new IllegalArgumentException("player collision requires SELF, PLAYER or preclamped PISTON owner");
             }
             if (!Double.isFinite(stepHeight) || stepHeight < 0.0) {
                 throw new IllegalArgumentException("stepHeight must be finite and nonnegative");
@@ -162,7 +162,7 @@ public final class CardinalMovementResolver {
         double x = requested.x();
         double y = requested.y();
         double z = requested.z();
-        if (request.onGround() && request.sneaking()) {
+        if (request.moverType() != MoverType.PISTON && request.onGround() && request.sneaking()) {
             while (x != 0.0 && context.query(checked(start.offset(x, -request.stepHeight(), 0))).isEmpty()) {
                 x = sneakReduction(x);
             }

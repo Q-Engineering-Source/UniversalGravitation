@@ -39,6 +39,17 @@ public final class BoostMovementBudget {
      */
     public CenterPathAdmission reserveCenterPath(long sequence, long serverTick,
             Vec3 expectedTransportOrigin, Vec3 centerOrigin, double requestedPathUpper) {
+        return reserveCenterPath(sequence, serverTick, expectedTransportOrigin, centerOrigin, requestedPathUpper, false);
+    }
+
+    /** Trusted server displacement: preserve player credit while recording its proven center path. */
+    public CenterPathAdmission reserveExternalCenterPath(long sequence, long serverTick,
+            Vec3 expectedTransportOrigin, Vec3 centerOrigin, double requestedPathUpper) {
+        return reserveCenterPath(sequence, serverTick, expectedTransportOrigin, centerOrigin, requestedPathUpper, true);
+    }
+
+    private CenterPathAdmission reserveCenterPath(long sequence, long serverTick,
+            Vec3 expectedTransportOrigin, Vec3 centerOrigin, double requestedPathUpper, boolean external) {
         if (hasPending()) {
             lastDiagnosticFailure = DiagnosticFailure.PENDING;
             return deniedCenter(sequence, serverTick, expectedTransportOrigin, centerOrigin, Failure.PENDING);
@@ -53,9 +64,10 @@ public final class BoostMovementBudget {
             return deniedCenter(sequence, serverTick, expectedTransportOrigin, centerOrigin,
                     lastDenied(sequence, expectedTransportOrigin).failure());
         }
-        double grant = Math.min(requestedPathUpper, Math.min(proposalPerTickDistance(), distanceCredit));
+        double grant = external ? requestedPathUpper
+                : Math.min(requestedPathUpper, Math.min(proposalPerTickDistance(), distanceCredit));
         pendingCenter = new CenterPathAdmission(sequence, serverTick, position, centerOrigin, grant, Failure.NONE);
-        debit(grant);
+        if (!external) debit(grant);
         lastDiagnosticFailure = DiagnosticFailure.NONE;
         return pendingCenter;
     }
@@ -182,6 +194,21 @@ public final class BoostMovementBudget {
         }
         pending = new Admission(sequence, position, candidate, candidateDistance, Failure.NONE);
         debit(candidateDistance);
+        pendingReserved = true;
+        lastDiagnosticFailure = DiagnosticFailure.NONE;
+        return pending;
+    }
+
+    /** Native PISTON cumulative clamp already ran. A reversal can span -.51 to +.51 (1.02); player credit is untouched. */
+    public Admission preparePiston(long sequence, long serverTick, Vec3 clampedDelta) {
+        if (!BoostProtocol.finite(clampedDelta)
+                || Math.abs(clampedDelta.x()) + Math.abs(clampedDelta.y()) + Math.abs(clampedDelta.z()) > 1.02D
+                || (clampedDelta.x() != 0 ? 1 : 0) + (clampedDelta.y() != 0 ? 1 : 0)
+                    + (clampedDelta.z() != 0 ? 1 : 0) > 1)
+            return denied(sequence, position, Failure.INVALID_INPUT, DiagnosticFailure.INVALID_INPUT);
+        Vec3 destination = position.add(clampedDelta);
+        if (!precheck(sequence, serverTick, destination)) return lastDenied(sequence, destination);
+        pending = new Admission(sequence, position, destination, length(clampedDelta), Failure.NONE);
         pendingReserved = true;
         lastDiagnosticFailure = DiagnosticFailure.NONE;
         return pending;

@@ -2569,6 +2569,127 @@ public final class PlayerPhysicsServer {
         return true;
     }
 
+    /** Consumes only the native PISTON call's already-clamped displacement, never a player input slot. */
+    public synchronized boolean movePiston(Entity entity, Vec3d delta) {
+        if (!(entity instanceof EntityPlayerMP actor) || !drivesMotion(actor)) return false;
+        Session session = sessions.get(actor.connection.netManager);
+        Owned owner = session.owner;
+        if (recoveryFenced(owner)) return true;
+        if (owner.movementTransactionOpen) {
+            failNativeEnvironment(session, owner, new OwnerContextChangedException(
+                    "Piston displacement reentered an active movement transaction"), "piston entry");
+            return true;
+        }
+        var before = owner.snapshot;
+        var connection = session.connectionHandle;
+        var scope = session.scopeHandle;
+        var handler = session.handler;
+        var pending = owner.pendingCardinalPose;
+        var attitude = owner.pendingAttitudeRequest;
+        var reference = owner.travel.ownerReference();
+        var world = session.world;
+        long proposal = session.proposal;
+        long correction = owner.travel.correctionRevision();
+        long mobility = owner.travel.mobility().generation();
+        long tick = session.world.getTotalWorldTime();
+        BooleanSupplier currentOwner = () -> sessions.get(session.manager) == session && current(session)
+                && session.owner == owner && owner.snapshot == before && session.player == actor
+                && session.connectionHandle == connection && session.scopeHandle == scope && session.handler == handler
+                && session.world == world && session.proposal == proposal && session.scope.equals(before.scope())
+                && owner.pendingCardinalPose == pending && owner.pendingAttitudeRequest == attitude
+                && owner.travel.ownerReference() == reference && owner.travel.correctionRevision() == correction
+                && owner.travel.mobility().generation() == mobility && !owner.teleportPending && !recoveryFenced(owner)
+                && session.world.getTotalWorldTime() == tick;
+        FreeOwnerTransaction transaction = null;
+        Optional<FreeOwnerTransaction.InstallationCustody> custody = Optional.empty();
+        var states = new ArrayList<Offer>();
+        PlayerPhysicalSnapshot installedEndpoint = null;
+        owner.movementTransactionOpen = true;
+        try {
+            if (movement == null) throw new IllegalStateException("Piston movement engine is unavailable");
+            transaction = new FreeOwnerTransaction(actor, before, owner.travel, owner.budget, currentOwner, owner,
+                    owner.freeResources.acquire(owner, session.world, session.scope, correction),
+                    null, null, pending, owner.nativeCardinalMotion);
+            var result = movement.movePiston(transaction, owner.budget, owner.budgetTick, owner.travel, currentOwner, delta);
+            custody = transaction.installationCustody();
+            if (result instanceof PlayerPhysicsStep.Applied applied) installedEndpoint = applied.snapshot();
+            else if (result instanceof PlayerPhysicsStep.CommittedFailure failed) installedEndpoint = failed.snapshot();
+            if (!(result instanceof PlayerPhysicsStep.Applied applied)) {
+                RuntimeException failure = result instanceof PlayerPhysicsStep.CommittedFailure failed ? failed.cause()
+                        : result instanceof PlayerPhysicsStep.Unavailable unavailable
+                            ? new IllegalStateException("Piston displacement unavailable: " + unavailable.reason(), unavailable.cause().orElse(null))
+                            : new IllegalStateException("Piston displacement did not complete: " + result);
+                throw failure;
+            }
+            var installed = applied.snapshot();
+            transaction.close();
+            var seal = transaction.exportClosedStepAdmissionSeal(installed);
+            // Explicit external displacement invalidates the old input mapping without acknowledging any input.
+            owner.predictionTimeline.suspendDisplacement(predictionContext(session, owner));
+            var prepared = prepareAppliedPublication(session, owner, before, installed).orElseThrow(() ->
+                    new IllegalStateException("Piston STATE publication lost its owner"));
+            if (!currentOwner.getAsBoolean() || !matchesPhysicalGeometry(actor, installed)
+                    || !currentOwner.getAsBoolean())
+                throw new OwnerContextChangedException("Piston installed endpoint changed before publication");
+            if (!seal.consume(actor, installed, null))
+                throw new OwnerContextChangedException("Piston terminal motion lost its closed admission seal");
+            // Nothing below this final fence invokes actor/world callbacks.
+            if (sessions.get(session.manager) != session || session.owner != owner || owner.snapshot != before
+                    || session.connectionHandle != connection || session.scopeHandle != scope || session.handler != handler
+                    || session.world != world || session.proposal != proposal || !session.scope.equals(before.scope())
+                    || actor.world != world || actor.connection != handler || handler.player != actor || actor.isDead
+                    || actor.dimension != before.scope().dimension() || world.captureBlockSnapshots || world.restoringBlockSnapshots
+                    || owner.pendingCardinalPose != pending || owner.pendingAttitudeRequest != attitude
+                    || owner.travel.ownerReference() != reference || owner.travel.correctionRevision() != correction
+                    || owner.travel.mobility().generation() != mobility || owner.teleportPending || recoveryFenced(owner)
+                    || prepared.expectedOwnerSnapshot() != before || prepared.installedSnapshot() != installed
+                    || session.outgoingSequence != prepared.expectedOutgoingSequence()
+                    || session.predictionGeneration != prepared.predictionGeneration()
+                    || owner.travel.ownerReference() != prepared.ownerReference()
+                    || owner.bodyReferenceReceipt != prepared.bodyReferenceReceipt()
+                    || !owner.travel.cardinalReference().equals(prepared.cardinalReference())
+                    || !owner.travel.mobilityState(installed).equals(prepared.mobilityState())
+                    || !owner.nativeTeleportId.equals(prepared.nativeTeleportId())
+                    || owner.eyeProfilePublicationPending != prepared.eyeProfilePublicationPending())
+                throw new OwnerContextChangedException("Piston pure commit identity changed");
+            owner.snapshot = installed;
+            owner.nativeCardinalMotion = null;
+            session.outgoingSequence = prepared.nextOutgoingSequence();
+            owner.lastStateTick = serverTick;
+            owner.manualFailureReceiptPending = false;
+            if (owner.eyeProfilePublicationPending == installed) owner.eyeProfilePublicationPending = null;
+            states.add(prepared.offer());
+            UnigravMod.LOGGER.info("ug-piston-displacement scope={} worldTick={} beforeRevision={} revision={}"
+                            + " clampedDelta={} actualDelta={} shape={}", before.scope(), tick, before.revision(),
+                    installed.revision(), delta, before.placement().translationTo(installed.placement()),
+                    installed.placement().shape());
+        } catch (RuntimeException failure) {
+            if (transaction != null) {
+                transaction.recordFailure(failure);
+                custody = transaction.installationCustody();
+            }
+            // Retain only the endpoint proven by this operation's installation journal, never a callback relocation.
+            if (custody.isEmpty() && installedEndpoint != null
+                    && installedEndpoint.placement().shape() instanceof PlayerBodyShape.Cardinal) {
+                try {
+                    if (currentOwner.getAsBoolean() && matchesPhysicalGeometry(actor, installedEndpoint)
+                            && currentOwner.getAsBoolean()) {
+                        owner.snapshot = installedEndpoint;
+                        refreshManualReceipt(owner);
+                    }
+                } catch (RuntimeException captureFailure) {
+                    if (captureFailure != failure) failure.addSuppressed(captureFailure);
+                }
+            }
+            failAppliedOwnerAdmission(session, owner, custody, failure, "piston displacement");
+        } finally {
+            try { if (transaction != null) transaction.close(); }
+            finally { owner.movementTransactionOpen = false; }
+        }
+        states.forEach(this::sendRecoveryOrOrdinary);
+        return true;
+    }
+
     private static final class InitializationDeferred extends RuntimeException {
         private InitializationDeferred(String reason) { super(reason); }
         private InitializationDeferred(String reason, RuntimeException cause) { super(reason, cause); }
@@ -3217,6 +3338,8 @@ public final class PlayerPhysicsServer {
                 owned.predictionInput(), published.boundary(), Optional.of(seed), Optional.of(published.phase()),
                 Optional.empty(), Optional.of(owner.travel.mobilityState(owner.snapshot)));
         if (owner.recoveryPacket == owned) owner.recoveryPacket = packet;
+        UnigravMod.LOGGER.info("ug-prediction-bootstrap scope={} proposal={} packetSequence={} revision={} seed={} phase={}",
+                session.scope, session.proposal, packet.sequence(), snapshot.revision(), seed, published.phase());
         return Optional.of(packet);
     }
 
@@ -5058,6 +5181,13 @@ public final class PlayerPhysicsServer {
             } else return predictionPublication(identity, owner.predictionTimeline.phase(context,revision,
                     owner.travel.predictionJumpCooldown()),Optional.empty());
         }
+        // A first OWNED observation can precede a usable dry environment. Publish
+        // its real bootstrap through the existing suspension/rearm handshake;
+        // ordinary STATE must never invent a fresh mapping on the client.
+        if ((!stable || !(seed instanceof CardinalPredictionSeed.Ready))
+                && owner.predictionTimeline.suspendBootstrap(context))
+            return predictionPublication(identity, owner.predictionTimeline.phase(context, revision,
+                    owner.travel.predictionJumpCooldown()), Optional.empty());
         if (!stable || !predictionFrameCurrent(owner, snapshot)) {
             owner.predictionTimeline.retire();
             return predictionPublication(identity, new PlayerPhysicsProtocol.PredictionUnavailable(revision,
@@ -5080,9 +5210,11 @@ public final class PlayerPhysicsServer {
 
     private void advanceOwned(Session session, ArrayList<Offer> outboundStates) {
         Owned owner = session.owner;
+        owner.movementTransactionOpen = true;
         try {
             advanceOwnedTracked(session, outboundStates);
         } finally {
+            owner.movementTransactionOpen = false;
             // An aborted or fenced invocation never becomes a processed simulation slot.
             if (owner.predictionTimeline.hasInFlight()) owner.predictionTimeline.retire();
         }
@@ -5398,12 +5530,11 @@ public final class PlayerPhysicsServer {
             }
             commitReferenceGeometryIfInstalled(session, owner, before);
             settlePendingManualReference(session, owner, before);
-            if (before.placement().shape() instanceof PlayerBodyShape.FreeCapsule
-                    || capturedCustody.isPresent()) {
-                failNativeEnvironment(session, owner, stepFailure, "owner step");
-                return;
-            }
-            throw stepFailure;
+            // Cardinal steps use the same transaction and owner invariants as Free steps.
+            // A constructor failure has no installation custody, but still belongs to
+            // this player's recovery boundary rather than the entire server tick loop.
+            failNativeEnvironment(session, owner, stepFailure, "owner step");
+            return;
         }
         if (result instanceof PlayerPhysicsStep.CommittedTailStop stopped) {
             discardUnpromotedTrustedResizeProposal(owner, before);
@@ -7602,6 +7733,7 @@ public final class PlayerPhysicsServer {
         private String pendingServerControlProbeLastEvent;
         private JumpFollowUpProbe jumpFollowUpProbe;
         private final OwnedPredictionTimeline predictionTimeline = new OwnedPredictionTimeline();
+        private boolean movementTransactionOpen;
         private PlayerPhysicsProtocol.Packet latestAdmittedInput;
         private boolean latestAdmittedPredictionAccepted;
         private long predictionOwnedSequence = -1;

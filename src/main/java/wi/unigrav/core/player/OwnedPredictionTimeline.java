@@ -71,6 +71,14 @@ final class OwnedPredictionTimeline {
     boolean suspendReference(Context current) {
         return suspendServer(current, PlayerPhysicsProtocol.PredictionSuspensionOrigin.SERVER_REFERENCE);
     }
+    boolean suspendDisplacement(Context current) {
+        return suspendServer(current, PlayerPhysicsProtocol.PredictionSuspensionOrigin.SERVER_DISPLACEMENT);
+    }
+    /** Preserve a real, never-started mapping while its first environment is not yet eligible. */
+    boolean suspendBootstrap(Context current) {
+        return awaitingMetadata()
+                && suspendServer(current, PlayerPhysicsProtocol.PredictionSuspensionOrigin.SERVER_BOOTSTRAP);
+    }
     private boolean suspendServer(Context current, PlayerPhysicsProtocol.PredictionSuspensionOrigin origin) {
         if (suspension != null) return context != null && context.same(current);
         if (bootstrap == null || bootstrapRetired || bootstrapContext == null || !bootstrapContext.same(current)

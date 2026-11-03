@@ -17,8 +17,8 @@ import wi.unigrav.core.GravityMode;
 /** Independent physical-owner messages; positions are metres and velocities m/s. */
 public final class PlayerPhysicsProtocol {
     public static final String CHANNEL = "ugmotion1";
-    // V21 preserves the wire shape but serverSlot now counts consumed INPUT slots, not world ticks.
-    public static final int VERSION = 22;
+    // V23 adds the typed server-bootstrap suspension origin; packet layout and maximum stay unchanged.
+    public static final int VERSION = 23;
     // The V11 maximum includes a boundary; its Anchored phase adds present(1), tag(1), revision(8), bootstrap(16).
     // V14 combines the V13 request marker with accepted mobility state (present byte + 22 bytes).
     // V15 adds one canonical transfer-presence byte. V16 reuses that union for TP completion controls.
@@ -230,7 +230,7 @@ public final class PlayerPhysicsProtocol {
         }
     }
     public enum PredictionRequestAction { SUSPEND, REARM }
-    public enum PredictionSuspensionOrigin { CLIENT_REFUSAL, SERVER_UNMAPPED_CONTROLS, SERVER_MOBILITY, SERVER_REFERENCE }
+    public enum PredictionSuspensionOrigin { CLIENT_REFUSAL, SERVER_UNMAPPED_CONTROLS, SERVER_MOBILITY, SERVER_REFERENCE, SERVER_BOOTSTRAP, SERVER_DISPLACEMENT }
     public enum PredictionRefusalStage { SAMPLE, PREFRICTION, ENDPOINT, REPLAY }
     public record PredictionRefusal(CardinalPredictionSeed.Reason reason, PredictionRefusalStage stage) {
         public PredictionRefusal { Objects.requireNonNull(reason); Objects.requireNonNull(stage); }

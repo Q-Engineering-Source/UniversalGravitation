@@ -83,6 +83,7 @@ public final class PlayerPhysicsClient {
     private long nativeSubmissionTick;
     private long predictionEpoch;
     private ClientCardinalPredictionOwner prediction;
+    private String lastPredictionAvailability;
     private long lastEquipmentFlightProbeTick = Long.MIN_VALUE;
     private String lastEquipmentFlightProbeIdentity;
     private final LocomotionTransitionProbe locomotionProbe = new LocomotionTransitionProbe();
@@ -850,7 +851,7 @@ public final class PlayerPhysicsClient {
                 successfulInstallation = retransmitted;
                 successfulInstallSerial = Math.incrementExact(successfulInstallSerial);
                 captureSuccessorPredictionQuarantine(ownerContext);
-                if (receiving.predictionEligible()) acceptPrediction(ownerContext, packet, prepared);
+                acceptPredictionIfEligible(ownerContext, packet, prepared);
             }
             return;
         }
@@ -1029,7 +1030,7 @@ public final class PlayerPhysicsClient {
                     }
                 }
             }
-            if (installed && receiving.predictionEligible()) acceptPrediction(ownerContext, packet, prepared);
+            if (installed) acceptPredictionIfEligible(ownerContext, packet, prepared);
             if (!installed) {
                 retirementStarted = true;
                 retireFailedInstallation(exactDecode, exactScope, exactHandler, receiving, ownerContext,
@@ -2629,6 +2630,37 @@ public final class PlayerPhysicsClient {
         return ClientCardinalPredictionOwner.EndpointValidation.allowed();
     }
 
+    private void acceptPredictionIfEligible(AcceptedOfferContext context, PlayerPhysicsProtocol.Packet packet,
+            PlayerPhysicsClientSession.PreparedInstallation published) {
+        boolean eligible = context.session.predictionEligible();
+        if (eligible) acceptPrediction(context, packet, published);
+        if (acceptedOfferContext != context || session != context.session) return;
+        var phase = packet.predictionPhase().orElse(null);
+        var seed = packet.predictionSeed().orElse(null);
+        String phaseKey = phase == null ? "ABSENT" : phase.getClass().getSimpleName();
+        if (phase instanceof PlayerPhysicsProtocol.PredictionUnavailable unavailable)
+            phaseKey += "/" + unavailable.reason();
+        if (phase instanceof PlayerPhysicsProtocol.PredictionSuspended suspended)
+            phaseKey += "/" + suspended.origin();
+        String seedKey = seed == null ? "ABSENT" : seed.getClass().getSimpleName();
+        if (seed instanceof wi.unigrav.core.player.CardinalPredictionSeed.Unsupported unsupported)
+            seedKey += "/" + unsupported.reason();
+        if (seed instanceof wi.unigrav.core.player.CardinalPredictionSeed.Unavailable unavailable)
+            seedKey += "/" + unavailable.reason();
+        boolean active = prediction != null && prediction.current(context, context.actor);
+        Object bootstrap = phase instanceof PlayerPhysicsProtocol.AwaitingFirstResolvedSlot awaiting ? awaiting.bootstrap()
+                : phase instanceof PlayerPhysicsProtocol.Anchored anchored ? anchored.bootstrap()
+                : phase instanceof PlayerPhysicsProtocol.PredictionSuspended suspended ? suspended.bootstrap() : "ABSENT";
+        String key = packet.scope() + "/" + packet.offerSequence() + "/" + eligible + "/"
+                + phaseKey + "/" + seedKey + "/" + active + "/" + (predictionSuspension != null) + "/" + bootstrap;
+        if (key.equals(lastPredictionAvailability) && packet.kind() != PlayerPhysicsProtocol.Kind.OWNED) return;
+        lastPredictionAvailability = key;
+        UnigravMod.LOGGER.info("ug-prediction-availability scope={} proposal={} packetKind={} packetSequence={}"
+                        + " clientTick={} eligible={} active={} suspended={} seed={} phase={}",
+                packet.scope(), packet.offerSequence(), packet.kind(), packet.sequence(), nativeSubmissionTick,
+                eligible, active, predictionSuspension != null, seed, phase);
+    }
+
     private void acceptPrediction(AcceptedOfferContext context, PlayerPhysicsProtocol.Packet packet,
             PlayerPhysicsClientSession.PreparedInstallation published) {
         var snapshot = packet.snapshot().orElseThrow();
@@ -2641,7 +2673,9 @@ public final class PlayerPhysicsClient {
         if (prediction == null && predictionSuspension == null
                 && packet.predictionPhase().orElse(null) instanceof PlayerPhysicsProtocol.PredictionSuspended receipt
                 && (receipt.origin()==PlayerPhysicsProtocol.PredictionSuspensionOrigin.SERVER_MOBILITY
-                    || receipt.origin()==PlayerPhysicsProtocol.PredictionSuspensionOrigin.SERVER_REFERENCE)) {
+                    || receipt.origin()==PlayerPhysicsProtocol.PredictionSuspensionOrigin.SERVER_REFERENCE
+                    || receipt.origin()==PlayerPhysicsProtocol.PredictionSuspensionOrigin.SERVER_BOOTSTRAP
+                    || receipt.origin()==PlayerPhysicsProtocol.PredictionSuspensionOrigin.SERVER_DISPLACEMENT)) {
             var receiving=session;
             var canonical=receiving.presentationSnapshot().orElse(null);
             long serial=successfulInstallSerial;

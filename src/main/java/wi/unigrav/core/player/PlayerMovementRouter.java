@@ -1,6 +1,8 @@
 package wi.unigrav.core.player;
 
 import java.util.Objects;
+
+import dev.crlhitbox.api.minecraft.packet.PacketMovementHooks;
 import java.util.function.BooleanSupplier;
 
 import net.minecraft.entity.Entity;
@@ -39,7 +41,7 @@ public final class PlayerMovementRouter {
     private boolean packetRunning;
     private boolean remoteCustodyObserved;
 
-    public enum Failure { NONE, TELEPORT, COMPETING_OWNER, MOVE_MISMATCH, STALE_PREPARATION, ACTOR_CHANGED }
+    public enum Failure { NONE, TELEPORT, COMPETING_OWNER, MOVE_MISMATCH, STALE_PREPARATION, ACTOR_CHANGED, COLLISION_POLICY }
 
     public PlayerMovementRouter() { this(RemoteBoostServer.INSTANCE, PlayerPhysicsServer.INSTANCE); }
 
@@ -138,8 +140,35 @@ public final class PlayerMovementRouter {
     }
 
     public void move(EntityPlayerMP player, MoverType type, double x, double y, double z) {
+        if (!prepareMove(player, type, x, y, z)) return;
+        player.move(type, x, y, z);
+        captureNativeMove();
+    }
+
+    /** CHB owns the call site; PI may cancel after its one native move and correction. */
+    public PacketMovementHooks.MoveOutcome move(PacketMovementHooks.MoveCall call,
+                                                PacketMovementHooks.CollisionMove next) {
+        requireHookHandler(call.handler());
+        if (!prepareMove(call.actor(), call.type(), call.dx(), call.dy(), call.dz())) {
+            return cancelled ? call.outerCancelled() : call.outerCommitted();
+        }
+        var outcome = next.move(call);
+        if (!outcome.mayContinue()) {
+            cancel(Failure.COLLISION_POLICY);
+            return outcome;
+        }
+        captureNativeMove();
+        return outcome;
+    }
+
+    private void captureNativeMove() {
+        remote.captureNativeResult(handler);
+        NativePlayerMovement.INSTANCE.captureNativeMove(handler);
+    }
+
+    private boolean prepareMove(EntityPlayerMP player, MoverType type, double x, double y, double z) {
         requireActor(player);
-        if (cancelled) return;
+        if (cancelled) return false;
         if (moved) throw new IllegalStateException("packet move already consumed");
         moved = true;
         if (cardinal != null) {
@@ -147,7 +176,7 @@ public final class PlayerMovementRouter {
             if (type != request.moverType() || x != request.worldDelta().x()
                     || y != request.worldDelta().y() || z != request.worldDelta().z()) {
                 cancel(Failure.MOVE_MISMATCH);
-                return;
+                return false;
             }
             switch (cardinal.commit()) {
                 case CardinalMoveFinalizer.Unavailable ignored -> cancel(Failure.STALE_PREPARATION);
@@ -156,11 +185,9 @@ public final class PlayerMovementRouter {
                     validateCardinal(false);
                 }
             }
-            return;
+            return false;
         }
-        player.move(type, x, y, z);
-        remote.captureNativeResult(handler);
-        NativePlayerMovement.INSTANCE.captureNativeMove(handler);
+        return true;
     }
 
     public void jump(EntityPlayerMP player) {
@@ -170,13 +197,31 @@ public final class PlayerMovementRouter {
 
     public void assignEndpoint(EntityPlayerMP player, double x, double y, double z, float yaw, float pitch,
                                boolean teleportPending) {
+        Vec3 position = prepareEndpoint(player, x, y, z, yaw, pitch, teleportPending);
+        if (position != null) player.setPositionAndRotation(position.x(), position.y(), position.z(), yaw, pitch);
+    }
+
+    public PacketMovementHooks.EndpointOutcome assignEndpoint(PacketMovementHooks.EndpointCall call,
+            PacketMovementHooks.CollisionEndpoint next, boolean teleportPending) {
+        requireHookHandler(call.handler());
+        Vec3 position = prepareEndpoint(call.actor(), call.x(), call.y(), call.z(),
+                call.yaw(), call.pitch(), teleportPending);
+        if (position == null) return cancelled ? call.rejected() : call.outerCommitted();
+        var outcome = next.endpoint(call.withCandidate(position.x(), position.y(), position.z(),
+                call.yaw(), call.pitch()));
+        if (!outcome.mayTrack()) cancel(Failure.COLLISION_POLICY);
+        return outcome;
+    }
+
+    private Vec3 prepareEndpoint(EntityPlayerMP player, double x, double y, double z, float yaw, float pitch,
+                                 boolean teleportPending) {
         requireActor(player);
-        if (cancelled) return;
+        if (cancelled) return null;
         if (!moved || assigned) throw new IllegalStateException("endpoint requires one unassigned move");
         assigned = true;
         if (cardinal != null) {
             validateCardinal(teleportPending);
-            if (cancelled) return;
+            if (cancelled) return null;
             if (!Float.isFinite(yaw) || !Float.isFinite(pitch)) {
                 throw new IllegalArgumentException("nonfinite packet orientation");
             }
@@ -186,15 +231,21 @@ public final class PlayerMovementRouter {
             player.prevRotationYaw = yaw;
             player.prevRotationPitch = boundedPitch;
             ((Entity) player).setRotation(yaw, boundedPitch);
-            return;
+            return null;
         }
         if (!remote.mayCommitNativeEndpoint(handler, teleportPending)) {
             NativePlayerMovement.INSTANCE.invalidate(handler);
             cancelled = true;
-            return;
+            return null;
         }
         Vec3 position = remote.finalNativePosition(handler, new Vec3(x, y, z));
-        player.setPositionAndRotation(position.x(), position.y(), position.z(), yaw, pitch);
+        return position;
+    }
+
+    private void requireHookHandler(NetHandlerPlayServer connection) {
+        if (!packetRunning || handler != connection) {
+            throw new IllegalStateException("CHB callback has no matching UG packet lifetime");
+        }
     }
 
     public boolean mustCancel() { return cancelled; }

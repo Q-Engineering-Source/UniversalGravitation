@@ -42,6 +42,7 @@ import wi.unigrav.core.floor.FloorRuntime;
 import wi.unigrav.core.floor.ServerLifetime;
 import net.minecraft.server.MinecraftServer;
 import wi.unigrav.core.player.NativePlayerMovement;
+import wi.unigrav.core.player.PlayerPacketMovementAccess;
 import wi.unigrav.core.player.GIntentNetwork;
 import wi.unigrav.core.player.GIntentServer;
 import wi.unigrav.core.player.PlayerPhysicsNetwork;
@@ -96,6 +97,7 @@ public class UnigravMod {
     @Mod.EventHandler
     public void preInit(FMLPreInitializationEvent event) {
         ChbDependency.requireSupportedContract();
+        PlayerPacketMovementAccess.register();
         LOGGER.info("Universal Gravitation {} loading", Reference.VERSION);
         NETWORK = NetworkRegistry.INSTANCE.newSimpleChannel(Reference.MOD_ID);
         NETWORK.registerMessage(ImpactReportMessage.Handler.class,

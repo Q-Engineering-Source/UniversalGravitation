@@ -9,7 +9,6 @@ import net.minecraft.network.NetHandlerPlayServer;
 import net.minecraft.network.play.client.CPacketConfirmTeleport;
 import net.minecraft.network.play.client.CPacketPlayer;
 import net.minecraft.entity.player.EntityPlayerMP;
-import net.minecraft.entity.MoverType;
 import net.minecraft.util.math.Vec3d;
 
 import org.spongepowered.asm.mixin.Mixin;
@@ -27,6 +26,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import wi.unigrav.api.math.Vec3;
 import wi.unigrav.core.boost.RemoteBoostServer;
 import wi.unigrav.core.player.PlayerMovementRouter;
+import wi.unigrav.core.player.PlayerPacketMovementAccess;
 import wi.unigrav.core.player.PlayerPhysicsServer;
 import wi.unigrav.core.player.PlayerPosePersistence;
 
@@ -36,7 +36,7 @@ import wi.unigrav.core.player.PlayerPosePersistence;
  * movement locals, so no world logic is run on Netty and raw XYZ cannot leak into native move.
  */
 @Mixin(NetHandlerPlayServer.class)
-abstract class NetHandlerPlayServerMixin {
+abstract class NetHandlerPlayServerMixin implements PlayerPacketMovementAccess {
     @Shadow public EntityPlayerMP player;
     @Shadow private double firstGoodX;
     @Shadow private double firstGoodY;
@@ -48,6 +48,13 @@ abstract class NetHandlerPlayServerMixin {
     @Shadow private Vec3d targetPos;
     @Shadow private int teleportId;
     @Unique private final PlayerMovementRouter unigrav$movement = new PlayerMovementRouter();
+
+    @Override
+    public PlayerMovementRouter unigrav$packetMovement() { return unigrav$movement; }
+
+    @Override
+    public boolean unigrav$packetTeleportPending() { return targetPos != null; }
+
 
     @Redirect(method = "update", at = @At(value = "INVOKE",
             target = "Lnet/minecraft/entity/player/EntityPlayerMP;setPositionAndRotation(DDDFF)V"), require = 1, allow = 1)
@@ -98,23 +105,11 @@ abstract class NetHandlerPlayServerMixin {
         unigrav$movement.jump(actor);
     }
 
-    @Redirect(method = "processPlayer", at = @At(value = "INVOKE",
-            target = "Lnet/minecraft/entity/player/EntityPlayerMP;move(Lnet/minecraft/entity/MoverType;DDD)V"))
-    private void unigrav$routeMove(EntityPlayerMP actor, MoverType type, double x, double y, double z) {
-        unigrav$movement.move(actor, type, x, y, z);
-    }
-
     @Inject(method = "processPlayer", at = @At(value = "FIELD",
             target = "Lnet/minecraft/entity/player/EntityPlayerMP;onGround:Z", opcode = Opcodes.PUTFIELD, ordinal = 0),
             cancellable = true)
     private void unigrav$cancelFailedMove(CPacketPlayer packet, CallbackInfo callback) {
         unigrav$cancelIfNecessary(callback);
-    }
-
-    @Redirect(method = "processPlayer", at = @At(value = "INVOKE",
-            target = "Lnet/minecraft/entity/player/EntityPlayerMP;setPositionAndRotation(DDDFF)V", ordinal = 1))
-    private void unigrav$routeEndpoint(EntityPlayerMP actor, double x, double y, double z, float yaw, float pitch) {
-        unigrav$movement.assignEndpoint(actor, x, y, z, yaw, pitch, targetPos != null);
     }
 
     @Inject(method = "processPlayer", at = @At(value = "INVOKE",

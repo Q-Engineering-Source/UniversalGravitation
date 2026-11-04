@@ -10,7 +10,7 @@ import java.util.Optional;
 public sealed interface CardinalPredictionSeed {
     enum Reason {
         UNSUPPORTED_SHAPE, UNSUPPORTED_STATE, ACTIVE_BOOTS, WORLD_UNAVAILABLE, ACTOR_CHANGED,
-        PERSONAL_G_MISMATCH, NATIVE_BLOCK_EFFECT, INVALID_PARAMETERS, SAMPLING_FAILED
+        PERSONAL_G_MISMATCH, NATIVE_BLOCK_EFFECT, INVALID_PARAMETERS, SAMPLING_FAILED, DYNAMIC_COLLISION_UNAVAILABLE
     }
     record Ready(long snapshotRevision, long worldTick, CardinalFrame frame, Vec3d environmentAcceleration,
                  Optional<GravityMode> bindingMode, boolean bindingActive, boolean personalZeroG,

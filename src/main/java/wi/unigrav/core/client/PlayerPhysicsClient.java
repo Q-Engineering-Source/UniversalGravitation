@@ -1,5 +1,6 @@
 package wi.unigrav.core.client;
 
+import dev.crlhitbox.api.minecraft.collision.ClientCollisionScenes;
 import wi.unigrav.core.player.PlayerMobilityIntent;
 import wi.unigrav.core.player.LocomotionTransitionProbe;
 import org.apache.logging.log4j.message.StringMapMessage;
@@ -2041,10 +2042,22 @@ public final class PlayerPhysicsClient {
                     if (!predictionOwnerIdentityCurrent(predictionContext, exactPrediction)) {
                         exactPrediction.retire("Prediction owner changed during sampling"); return;
                     }
-                    predictionInput = exactPrediction.predict(nativeSubmissionTick, sampledControls, ready.environment(),
-                            box -> predictionContext.world.getCollisionBoxes(predictionContext.actor, box),
-                            endpoint -> predictionEndpoint(predictionContext.world, endpoint,
-                                    () -> predictionOwnerIdentityCurrent(predictionContext, exactPrediction)));
+                    var captured = ClientCollisionScenes.capture(predictionContext.world, predictionContext.actor);
+                    if (!predictionOwnerIdentityCurrent(predictionContext, exactPrediction)) {
+                        exactPrediction.retire("Prediction owner changed during collision scene capture"); return;
+                    }
+                    if (captured instanceof ClientCollisionScenes.CaptureUnavailable unavailable) {
+                        exactPrediction.refuse(ClientCardinalPredictionOwner.EndpointValidation.refused(
+                                wi.unigrav.core.player.CardinalPredictionSeed.Reason.DYNAMIC_COLLISION_UNAVAILABLE,
+                                PlayerPhysicsProtocol.PredictionRefusalStage.SAMPLE, unavailable.reason()));
+                    } else {
+                        Optional<ClientCollisionScenes.Scene> scene = captured instanceof ClientCollisionScenes.Ready dynamic
+                                ? Optional.of(dynamic.scene()) : Optional.empty();
+                        predictionInput = exactPrediction.predict(nativeSubmissionTick, sampledControls, ready.environment(),
+                                box -> predictionContext.world.getCollisionBoxes(predictionContext.actor, box),
+                                endpoint -> predictionEndpoint(predictionContext.world, endpoint,
+                                        () -> predictionOwnerIdentityCurrent(predictionContext, exactPrediction)), scene);
+                    }
                 } catch (Throwable cause) {
                     if (predictionOwnerIdentityCurrent(predictionContext, exactPrediction))
                         recoverPrediction(predictionContext, "Prediction step failed", cause);
@@ -2564,6 +2577,9 @@ public final class PlayerPhysicsClient {
         if (suspended.acknowledged && !suspended.rearmSent && suspended.checkpoint!=null
                 && (suspended.lastProbeTick==Long.MIN_VALUE || nativeSubmissionTick-suspended.lastProbeTick>=20)) {
             suspended.lastProbeTick=nativeSubmissionTick;
+            long probeTick=suspended.lastProbeTick;
+            var checkpoint=suspended.checkpoint;
+            var transaction=suspended.suspend;
             var snapshot=owner.session.presentationSnapshot().orElseThrow();
             if (suspended.checkpoint.snapshot().filter(snapshot::equals).isPresent()
                     && suspended.checkpoint.predictionSeed().orElse(null) instanceof wi.unigrav.core.player.CardinalPredictionSeed.Ready ready) {
@@ -2578,8 +2594,27 @@ public final class PlayerPhysicsClient {
                     PlayerPhysicsClient.<RuntimeException>rethrow(cause);
                 }
                 if (predictionSuspension!=suspended || !acceptedOwnerLifetimeCurrent(owner,Minecraft.getMinecraft())
-                        || owner.session.presentationSnapshot().orElse(null)!=snapshot) return Optional.empty();
-                if (sampled instanceof CardinalPredictionEnvironmentSampler.Sampled) suspended.rearmSent=true;
+                        || owner.session.presentationSnapshot().orElse(null)!=snapshot
+                        || suspended.checkpoint!=checkpoint || suspended.suspend!=transaction
+                        || suspended.rearmSent || suspended.lastProbeTick!=probeTick) return Optional.empty();
+                if (sampled instanceof CardinalPredictionEnvironmentSampler.Sampled) {
+                    var captured = ClientCollisionScenes.capture(owner.world, owner.actor);
+                    boolean sceneCurrent = !(captured instanceof ClientCollisionScenes.Ready dynamic)
+                            || dynamic.scene().valid(owner.world, owner.actor);
+                    if (predictionSuspension!=suspended || !acceptedOwnerLifetimeCurrent(owner,Minecraft.getMinecraft())
+                            || owner.session.presentationSnapshot().orElse(null)!=snapshot
+                            || suspended.checkpoint!=checkpoint || suspended.suspend!=transaction
+                            || suspended.rearmSent || suspended.lastProbeTick!=probeTick) return Optional.empty();
+                    if (captured instanceof ClientCollisionScenes.CaptureUnavailable unavailable)
+                        sampled = new CardinalPredictionEnvironmentSampler.Unsupported(
+                                wi.unigrav.core.player.CardinalPredictionSeed.Reason.DYNAMIC_COLLISION_UNAVAILABLE,
+                                unavailable.reason(), PlayerPhysicsProtocol.PredictionRefusalStage.SAMPLE);
+                    else if (!sceneCurrent)
+                        sampled = new CardinalPredictionEnvironmentSampler.Unsupported(
+                                wi.unigrav.core.player.CardinalPredictionSeed.Reason.DYNAMIC_COLLISION_UNAVAILABLE,
+                                "SCENE_LIFETIME_CHANGED", PlayerPhysicsProtocol.PredictionRefusalStage.SAMPLE);
+                    else suspended.rearmSent=true;
+                }
                 // This observes the existing once-per-20-tick check, not an extra sampling attempt.
                 UnigravMod.LOGGER.info(new StringMapMessage().with("event","ugmotion1_prediction_rearm_sample")
                         .with("scope",snapshot.scope().toString()).with("requestId",Long.toString(suspended.suspend.requestId()))
@@ -2603,6 +2638,8 @@ public final class PlayerPhysicsClient {
                         .with("gObservationAtRearmCheck",ClientGIntent.acknowledgedObservation(owner.actor).map(Object::toString).orElse("NOT_OBSERVED")));
             }
         }
+        if (predictionSuspension!=suspended || !acceptedOwnerLifetimeCurrent(owner,Minecraft.getMinecraft()))
+            return Optional.empty();
         return Optional.of(suspended.request());
     }
 
@@ -2672,7 +2709,8 @@ public final class PlayerPhysicsClient {
         }
         if (prediction == null && predictionSuspension == null
                 && packet.predictionPhase().orElse(null) instanceof PlayerPhysicsProtocol.PredictionSuspended receipt
-                && (receipt.origin()==PlayerPhysicsProtocol.PredictionSuspensionOrigin.SERVER_MOBILITY
+                && (receipt.origin()==PlayerPhysicsProtocol.PredictionSuspensionOrigin.SERVER_UNMAPPED_CONTROLS
+                    || receipt.origin()==PlayerPhysicsProtocol.PredictionSuspensionOrigin.SERVER_MOBILITY
                     || receipt.origin()==PlayerPhysicsProtocol.PredictionSuspensionOrigin.SERVER_REFERENCE
                     || receipt.origin()==PlayerPhysicsProtocol.PredictionSuspensionOrigin.SERVER_BOOTSTRAP
                     || receipt.origin()==PlayerPhysicsProtocol.PredictionSuspensionOrigin.SERVER_DISPLACEMENT)) {

@@ -1,5 +1,6 @@
 package wi.unigrav.core.player;
 
+import dev.crlhitbox.api.minecraft.collision.ClientCollisionScenes;
 import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
@@ -5323,9 +5324,20 @@ public final class PlayerPhysicsServer {
         suspendChangedPredictionReference(session, owner);
         if (owner.predictionTimeline.active() && (!predictionStable(session, owner, owner.controls)
                 || !predictionFrameCurrent(owner))) owner.predictionTimeline.retire();
-        Optional<OwnedPredictionTimeline.Frozen> predictionSlot = owner.predictionTimeline.active()
-                ? owner.predictionTimeline.freeze(predictionContext(session, owner), before.revision(),
-                        worldTick, INPUT_TIMEOUT_TICKS, IDLE) : Optional.empty();
+        Optional<OwnedPredictionTimeline.Frozen> predictionSlot = Optional.empty();
+        if (owner.predictionTimeline.active()) {
+            predictionSlot = owner.predictionTimeline.freeze(predictionContext(session, owner), before.revision(),
+                    worldTick, INPUT_TIMEOUT_TICKS, IDLE);
+            owner.predictionTimeline.expiredPending().ifPresent(expired ->
+                    UnigravMod.LOGGER.info("ug-prediction-mapping-expired reason=PENDING_INPUT_EXPIRED scope={}"
+                                    + " proposal={} revision={} bootstrap={} expired={} headAgeTicks={}"
+                                    + " latestAdmittedSequence={} latestReceivedWorldTick={} latestAgeTicks={}"
+                                    + " latestControls={} action=SUSPEND_REARM acknowledgementCreated=false",
+                            before.scope(), session.proposal, before.revision(), owner.predictionTimeline.bootstrap(),
+                            expired, worldTick - expired.receivedWorldTick(),
+                            owner.latestAdmittedInput == null ? -1 : owner.latestAdmittedInput.sequence(),
+                            owner.inputWorldTick, worldTick - owner.inputWorldTick, owner.controls));
+        }
         PlayerPhysicsProtocol.Controls stepControls = predictionSlot.map(OwnedPredictionTimeline.Frozen::controls)
                 .orElse(worldTick - owner.inputWorldTick <= INPUT_TIMEOUT_TICKS ? owner.controls : IDLE);
         boolean freshInput = owner.inputWorldTick != Long.MIN_VALUE
@@ -5765,6 +5777,14 @@ public final class PlayerPhysicsServer {
             return;
         }
         if (result instanceof PlayerPhysicsStep.Unavailable failure) {
+            if (failure.cause().orElse(null) instanceof ClientCollisionScenes.SceneUnavailableException unavailable
+                    && owner.predictionTimeline.active()) {
+                owner.predictionTimeline.suspendUnmapped(predictionContext(session, owner), stepInputSequence);
+                predictionSlot = Optional.empty();
+                UnigravMod.LOGGER.info("ug-dynamic-collision-unavailable scope={} inputSequence={} reason={}"
+                                + " action=SUSPEND_REARM acknowledgementCreated=false",
+                        before.scope(), stepInputSequence, unavailable.reason());
+            }
             if (!retainBlockedPhysicalResizeIntent(session, owner, before, trustedResizeProposal, worldTick))
                 discardUnpromotedTrustedResizeProposal(owner, before);
             if (trustedResize.isPresent() && !matchesPhysicalGeometry(session.player, before)) {

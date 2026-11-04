@@ -28,6 +28,12 @@ final class OwnedPredictionTimeline {
     private PlayerPhysicsProtocol.Packet first, latest;
     private final ArrayDeque<Pending> pending = new ArrayDeque<>();
     private Pending held;
+    /** Describes discarded mapping work, never an execution or acknowledgement receipt. */
+    record ExpiredPending(long headSequence, long headClientTick, long receivedWorldTick,
+                          long worldTick, long timeoutTicks, int queuedInputs,
+                          long latestSequence, long consumedSequence) { }
+    private ExpiredPending expiredPending;
+    Optional<ExpiredPending> expiredPending() { return Optional.ofNullable(expiredPending); }
     private long retiredEpoch, slot, anchorSlot, preSnapshotRevision;
     private long edgeId, edgeOriginTick;
     private boolean anchored;
@@ -152,6 +158,17 @@ final class OwnedPredictionTimeline {
         if (revision < 0 || timeout < 0) throw new IllegalArgumentException("Invalid slot freeze");
         boolean consumesInput = !pending.isEmpty();
         var chosen = consumesInput ? pending.getFirst() : Objects.requireNonNull(held, "held input");
+        if (consumesInput && worldTick - chosen.receivedWorldTick() > timeout) {
+            // Substituting neutral here would acknowledge an input that was never executed.
+            // End this mapping through the real handshake; ordinary fresh controls and the
+            // physical owner continue independently while the client installs a new epoch.
+            var expired = new ExpiredPending(chosen.packet().sequence(),
+                    chosen.packet().predictionInput().orElseThrow().clientTick(), chosen.receivedWorldTick(),
+                    worldTick, timeout, pending.size(), latest.sequence(), held == null ? -1 : held.packet().sequence());
+            suspendUnmapped(current, chosen.packet().sequence());
+            expiredPending = expired;
+            return Optional.empty();
+        }
         var controls = worldTick - chosen.receivedWorldTick() <= timeout
                 ? chosen.packet().controls().orElseThrow() : neutral;
         // Empty input queues do not stop gravity/physics and do not acknowledge unsent future inputs.
@@ -216,7 +233,7 @@ final class OwnedPredictionTimeline {
         bootstrapRetired = true; suspension=null; rearmRequested=false;
         if (first != null) retiredEpoch = Math.max(retiredEpoch, first.predictionInput().orElseThrow().epoch());
         context = null; first = latest = null; boundary = null; inFlight = null;
-        pending.clear(); held = null;
+        pending.clear(); held = null; expiredPending = null;
         slot = 0; anchored = false; edgeId = edgeOriginTick = terminalEdge = 0;
         unpublishedJumps.clear(); publishedJump = PlayerPhysicsProtocol.JumpDecision.none();
     }

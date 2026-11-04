@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 import java.util.AbstractList;
 import java.util.ArrayList;
@@ -35,6 +36,57 @@ class CardinalMovementResolverTest {
     private static final AxisAlignedBB GROUND = new AxisAlignedBB(-10, -1, -10, 10, 0, 10);
     private static final Limits LIMITS = new Limits(256, 4096, 32768);
     private static final Vec3d ZERO = new Vec3d(0, 0, 0);
+
+    @ParameterizedTest
+    @EnumSource(CardinalFrame.class)
+    void customColliderReceivesOriginalWorldAxesAndActualStageBounds(CardinalFrame frame) {
+        var calls = new ArrayList<Vec3d>();
+        var boxes = new ArrayList<AxisAlignedBB>();
+        var collider = new AxisAlignedBB(100, 100, 100, 101, 101, 101) {
+            private double clip(AxisAlignedBB box, Vec3d delta, double value) {
+                calls.add(delta); boxes.add(box); return value * .5;
+            }
+            @Override public double calculateXOffset(AxisAlignedBB box, double delta) {
+                return clip(box, new Vec3d(delta, 0, 0), delta);
+            }
+            @Override public double calculateYOffset(AxisAlignedBB box, double delta) {
+                return clip(box, new Vec3d(0, delta, 0), delta);
+            }
+            @Override public double calculateZOffset(AxisAlignedBB box, double delta) {
+                return clip(box, new Vec3d(0, 0, delta), delta);
+            }
+        };
+        var result = assertInstanceOf(Resolved.class, CardinalMovementResolver.resolve(
+                request(frame, new Vec3d(1, 1, 1), false, false, 0), bounds -> List.of(collider), LIMITS));
+        assertVector(new Vec3d(.5, .5, .5), result.nativeResolvedLocalDelta());
+        assertEquals(3, calls.size());
+        assertVector(frame.toWorld(new Vec3d(0, 1, 0)), calls.get(0));
+        assertVector(frame.toWorld(new Vec3d(1, 0, 0)), calls.get(1));
+        assertVector(frame.toWorld(new Vec3d(0, 0, 1)), calls.get(2));
+        assertBox(world(frame, PLAYER), boxes.get(0));
+        assertBox(world(frame, PLAYER.offset(0, .5, 0)), boxes.get(1));
+        assertBox(world(frame, PLAYER.offset(.5, .5, 0)), boxes.get(2));
+        assertSame(collider, result.queries().getFirst().worldCandidates().getFirst());
+    }
+
+    @Test void customColliderFailureRetainsCauseAndNonFiniteDoesNotReachNextCollider() {
+        var cause = new IllegalStateException("native narrow phase failed");
+        var bad = new AxisAlignedBB(100,100,100,101,101,101) {
+            @Override public double calculateXOffset(AxisAlignedBB box,double delta) { throw cause; }
+        };
+        var request = request(CardinalFrame.Y_POS,new Vec3d(1,0,0),false,false,0);
+        var rejected = rejected(request, bounds -> List.of(bad), LIMITS);
+        assertEquals(Failure.INVALID_COLLIDER,rejected.failure());assertSame(cause,rejected.cause());
+        var nonFinite = new AxisAlignedBB(100,100,100,101,101,101) {
+            @Override public double calculateXOffset(AxisAlignedBB box,double delta) { return Double.NaN; }
+        };
+        var after = new AxisAlignedBB(100,100,100,101,101,101) {
+            @Override public double calculateXOffset(AxisAlignedBB box,double delta) {
+                fail("invalid offset must fail before another native callback");return 0;
+            }
+        };
+        assertEquals(Failure.NUMERICAL_RANGE,rejected(request,bounds -> List.of(nonFinite,after),LIMITS).failure());
+    }
 
     @ParameterizedTest
     @EnumSource(CardinalFrame.class)

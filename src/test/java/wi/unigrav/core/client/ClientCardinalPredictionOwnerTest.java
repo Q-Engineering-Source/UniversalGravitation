@@ -1,6 +1,7 @@
 package wi.unigrav.core.client;
 
 import dev.crlhitbox.api.geometry.Vec3d;
+import dev.crlhitbox.api.minecraft.collision.ClientCollisionScenes;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import wi.unigrav.core.floor.BootWorldFixture;
@@ -41,6 +42,57 @@ class ClientCardinalPredictionOwnerTest {
                 Optional.empty(), Optional.empty(), Optional.of(controls()), java.util.OptionalInt.empty(), Optional.empty(),
                 Optional.empty(), Optional.empty(), Optional.of(identity), Optional.empty(), Optional.empty()));
     }
+    @Test void replayQueriesTheSceneRetainedByThatInputRatherThanItsPredecessor(@TempDir Path path) {
+        try (var fixture=BootWorldFixture.open(path,new UUID(0,887),true)) {
+            var actor=fixture.serverPlayer(new UUID(0,888));var authority=snapshot(actor);
+            var owner=new ClientCardinalPredictionOwner(new Object(),actor,2,initial(authority));
+            var firstCalls=new java.util.concurrent.atomic.AtomicInteger();
+            var secondCalls=new java.util.concurrent.atomic.AtomicInteger();
+            var first=emptyScene("first-frame",firstCalls);
+            var second=emptyScene("second-frame",secondCalls);
+            sent(owner,authority,owner.predict(4,controls(),environment(),box->List.of(),
+                    pose->ClientCardinalPredictionOwner.EndpointValidation.allowed(),Optional.of(first)).orElseThrow());
+            owner.predict(5,controls(),environment(),box->List.of(),
+                    pose->ClientCardinalPredictionOwner.EndpointValidation.allowed(),Optional.of(second)).orElseThrow();
+            firstCalls.set(0);secondCalls.set(0);
+            var boundary=new PlayerPhysicsProtocol.PredictionBoundary(2,1,10,11,4,1,1,1,0,
+                    PlayerPhysicsProtocol.JumpDecision.none(),PlayerPhysicsProtocol.StepOutcome.APPLIED);
+            var packet=new PlayerPhysicsProtocol.Packet(PlayerPhysicsProtocol.Kind.STATE,authority.scope(),4,0,Optional.empty(),
+                    Optional.of(authority),Optional.empty(),java.util.OptionalInt.empty(),Optional.empty(),Optional.empty(),Optional.empty(),
+                    Optional.empty(),Optional.of(boundary),Optional.of(seed(authority)),
+                    Optional.of(new PlayerPhysicsProtocol.Anchored(BOOTSTRAP,authority.revision())));
+            assertTrue(owner.reconcile(packet,6,box->List.of(),pose->ClientCardinalPredictionOwner.EndpointValidation.allowed()));
+            assertEquals(0,firstCalls.get());assertEquals(1,secondCalls.get());
+        }
+    }
+    private static ClientCollisionScenes.Scene emptyScene(Object identity,java.util.concurrent.atomic.AtomicInteger calls) {
+        return new ClientCollisionScenes.Scene() {
+            @Override public Object identity() { return identity; }
+            @Override public boolean valid(net.minecraft.world.World world,net.minecraft.entity.player.EntityPlayer actor) { return true; }
+            @Override public ClientCollisionScenes.QueryResult query(net.minecraft.util.math.AxisAlignedBB bounds) {
+                calls.incrementAndGet();return new ClientCollisionScenes.Colliders(List.of());
+            }
+        };
+    }
+    @Test void expectedDynamicSceneUnknownRefusesPredictionWithoutBecomingEmptyOrUnexpectedFailure(@TempDir Path path) {
+        try (var fixture=BootWorldFixture.open(path,new UUID(0,889),true)) {
+            var actor=fixture.serverPlayer(new UUID(0,890));var authority=snapshot(actor);
+            var owner=new ClientCardinalPredictionOwner(new Object(),actor,2,initial(authority));
+            var scene=new ClientCollisionScenes.Scene() {
+                @Override public Object identity() { return "unknown-frame"; }
+                @Override public boolean valid(net.minecraft.world.World world,net.minecraft.entity.player.EntityPlayer player) { return true; }
+                @Override public ClientCollisionScenes.QueryResult query(net.minecraft.util.math.AxisAlignedBB bounds) {
+                    return new ClientCollisionScenes.QueryUnavailable("UNRESOLVED_CONTACT");
+                }
+            };
+            assertTrue(owner.predict(4,controls(),environment(),box->List.of(),
+                    pose->ClientCardinalPredictionOwner.EndpointValidation.allowed(),Optional.of(scene)).isEmpty());
+            assertEquals(CardinalPredictionSeed.Reason.DYNAMIC_COLLISION_UNAVAILABLE,
+                    owner.refusal().orElseThrow().refusal().orElseThrow().reason());
+            assertEquals(authority.placement(),owner.state().placement());
+        }
+    }
+
     @Test void firstInputMovesActualActorWithoutStateAndAuthorityCanBeProvenAgain(@TempDir Path path) {
         try (var fixture=BootWorldFixture.open(path,new UUID(0,875), true)) {
             var actor=fixture.serverPlayer(new UUID(0,878)); var authority=snapshot(actor); Object lifetime=new Object();

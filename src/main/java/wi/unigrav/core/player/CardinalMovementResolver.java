@@ -342,30 +342,45 @@ public final class CardinalMovementResolver {
             if (count < 0) throw new QueryFailure(Failure.INVALID_COLLIDER, null);
             candidateCount += count;
             List<AxisAlignedBB> world = new ArrayList<>(count);
-            List<AxisAlignedBB> local = new ArrayList<>(count);
             try {
                 for (int index = 0; index < count; index++) {
                     AxisAlignedBB collider = raw.get(index);
                     requireBox(collider);
                     world.add(collider);
-                    local.add(transform(collider, frame::toLocal));
                 }
             } catch (RuntimeException failure) {
                 throw new QueryFailure(Failure.INVALID_COLLIDER, failure);
             }
             observations.add(new QueryObservation(worldBounds, world));
-            return local;
+            return world;
         }
 
         private double clip(int axis, List<AxisAlignedBB> candidates, AxisAlignedBB box, double delta) {
+            // Keep the original collider's narrow phase, including third-party overrides.
+            // Cardinal frames are exact signed permutations, so one local axis maps to
+            // exactly one world axis even when the requested displacement is zero.
+            Vec3d direction = frame.toWorld(switch (axis) {
+                case 0 -> new Vec3d(1, 0, 0);
+                case 1 -> new Vec3d(0, 1, 0);
+                case 2 -> new Vec3d(0, 0, 1);
+                default -> throw new AssertionError("unknown local axis");
+            });
+            AxisAlignedBB worldBox = transform(box, frame::toWorld);
+            double sign = direction.x() != 0 ? direction.x() : direction.y() != 0 ? direction.y() : direction.z();
             for (AxisAlignedBB collider : candidates) {
                 offsetCount++;
-                delta = switch (axis) {
-                    case 0 -> collider.calculateXOffset(box, delta);
-                    case 1 -> collider.calculateYOffset(box, delta);
-                    case 2 -> collider.calculateZOffset(box, delta);
-                    default -> throw new AssertionError("unknown local axis");
-                };
+                double allowed;
+                try {
+                    allowed = direction.x() != 0 ? collider.calculateXOffset(worldBox, sign * delta)
+                            : direction.y() != 0 ? collider.calculateYOffset(worldBox, sign * delta)
+                            : collider.calculateZOffset(worldBox, sign * delta);
+                } catch (RuntimeException failure) {
+                    throw new QueryFailure(Failure.INVALID_COLLIDER, failure);
+                }
+                if (!Double.isFinite(allowed))
+                    throw new QueryFailure(Failure.NUMERICAL_RANGE,
+                            new IllegalArgumentException("Native collider returned non-finite axis offset"));
+                delta = sign * allowed;
             }
             return delta;
         }

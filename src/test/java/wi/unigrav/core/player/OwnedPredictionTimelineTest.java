@@ -192,9 +192,46 @@ class OwnedPredictionTimelineTest {
         assertFalse(timeline.accept(context(),input(5,22,0),100));
         assertTrue(timeline.accept(context(),input(4,21,0),100));
     }
+    @Test void expiredPendingInputSuspendsWithoutAcknowledgingItOrItsFreshTail() {
+        var timeline=timeline();
+        assertTrue(timeline.accept(context(),input(3,20,1),100));
+        assertTrue(timeline.accept(context(),input(4,21,1),120));
+        assertTrue(timeline.freeze(context(),9,121,20,controls(false)).isEmpty());
+        assertFalse(timeline.hasInFlight());assertFalse(timeline.active());
+        assertTrue(timeline.boundary(context()).isEmpty());
+        var expired=timeline.expiredPending().orElseThrow();
+        assertEquals(3,expired.headSequence());assertEquals(20,expired.headClientTick());
+        assertEquals(100,expired.receivedWorldTick());assertEquals(121,expired.worldTick());
+        assertEquals(20,expired.timeoutTicks());assertEquals(2,expired.queuedInputs());
+        assertEquals(4,expired.latestSequence());assertEquals(-1,expired.consumedSequence());
+        var paused=assertInstanceOf(PlayerPhysicsProtocol.PredictionSuspended.class,timeline.phase(context(),9,0));
+        assertEquals(PlayerPhysicsProtocol.PredictionSuspensionOrigin.SERVER_UNMAPPED_CONTROLS,paused.origin());
+        assertFalse(timeline.accept(context(),input(5,22,1),122));
+        var rearm=new PlayerPhysicsProtocol.PredictionRequest(paused.requestId(),BOOTSTRAP,
+                PlayerPhysicsProtocol.PredictionRequestAction.REARM,Optional.empty(),paused.origin());
+        assertTrue(timeline.request(context(),rearm));
+        var next=new PlayerPhysicsProtocol.PredictionBootstrap(2,0);timeline.begin(context(),next);
+        assertTrue(timeline.expiredPending().isEmpty());assertFalse(timeline.request(context(),rearm));
+        assertFalse(timeline.accept(context(),input(5,22,1),122));
+        assertEquals(next,assertInstanceOf(PlayerPhysicsProtocol.AwaitingFirstResolvedSlot.class,
+                timeline.phase(context(),10,0)).bootstrap());
+    }
+    @Test void inputAtFreshnessBoundaryStillConsumesItsRealControls() {
+        var timeline=timeline();var packet=input(3,20,1);
+        assertTrue(timeline.accept(context(),packet,100));
+        var frozen=timeline.freeze(context(),9,120,20,controls(false)).orElseThrow();
+        assertEquals(packet.controls().orElseThrow(),frozen.controls());assertTrue(frozen.consumesInput());
+        assertFalse(timeline.suspended());assertTrue(timeline.expiredPending().isEmpty());
+        assertEquals(20,PlayerPredictionTiming.resolvedClientTick(timeline.complete(context(),frozen,
+                PlayerPhysicsProtocol.StepOutcome.APPLIED,0).orElseThrow()));
+    }
+
     @Test void timeoutFreezesActualNeutralWithoutInventingNewHeldSequence() {
         var timeline=timeline();timeline.accept(context(),input(3,20,1),100);
+        var first=timeline.freeze(context(),8,100,20,controls(false)).orElseThrow();
+        timeline.complete(context(),first,PlayerPhysicsProtocol.StepOutcome.APPLIED,0).orElseThrow();
         var neutral=controls(false);var frozen=timeline.freeze(context(),9,121,20,neutral).orElseThrow();
+        assertFalse(frozen.consumesInput());assertFalse(timeline.suspended());
         assertSame(neutral,frozen.controls());assertTrue(frozen.packet().controls().orElseThrow().jump());
         assertEquals(3,timeline.complete(context(),frozen,PlayerPhysicsProtocol.StepOutcome.DEFERRED,0).orElseThrow().heldInputSequence());
     }
@@ -236,8 +273,10 @@ class OwnedPredictionTimelineTest {
     }
     @Test void timeoutProducesExpiredOnlyAfterAnActualNeutralProcessedSlot() {
         var timeline=timeline();timeline.accept(context(),input(3,20,1),100);
+        var first=timeline.freeze(context(),8,100,20,controls(false)).orElseThrow();
+        timeline.complete(context(),first,PlayerPhysicsProtocol.StepOutcome.APPLIED,0).orElseThrow();
         var frozen=timeline.freeze(context(),9,121,20,controls(false)).orElseThrow();
-        assertTrue(timeline.boundary(context()).isEmpty());
+        assertFalse(frozen.consumesInput());assertFalse(timeline.suspended());
         var boundary=timeline.complete(context(),frozen,PlayerPhysicsProtocol.StepOutcome.DEFERRED,0,
                 PlayerPhysicsProtocol.JumpOutcome.NONE).orElseThrow();
         assertEquals(new PlayerPhysicsProtocol.JumpDecision(1,20,PlayerPhysicsProtocol.JumpOutcome.EXPIRED),boundary.jumpDecision());

@@ -1,6 +1,7 @@
 package wi.unigrav.core.client;
 
 import dev.crlhitbox.api.geometry.Vec3d;
+import dev.crlhitbox.api.minecraft.collision.ClientCollisionScenes;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.util.math.AxisAlignedBB;
 import wi.unigrav.core.player.CardinalPredictionSeed;
@@ -34,7 +35,7 @@ final class ClientCardinalPredictionOwner {
         static EndpointValidation rejected(String reason) { return new EndpointValidation(false, reason); }
     }
     record Input(PlayerPhysicsProtocol.PredictionInput identity, PlayerPhysicsProtocol.Controls controls,
-                 CardinalPredictionStep.Environment environment) { }
+                 CardinalPredictionStep.Environment environment, Optional<ClientCollisionScenes.Scene> collisionScene) { }
     private final Object lifetime;
     private final EntityPlayer actor;
     private final net.minecraft.world.World world;
@@ -125,6 +126,13 @@ final class ClientCardinalPredictionOwner {
     Optional<PlayerPhysicsProtocol.PredictionInput> predict(long clientTick, PlayerPhysicsProtocol.Controls controls,
             CardinalPredictionStep.Environment environment, Function<AxisAlignedBB, List<AxisAlignedBB>> collisions,
             Function<CardinalPredictionStep.State, EndpointValidation> endpoint) {
+        return predict(clientTick, controls, environment, collisions, endpoint, Optional.empty());
+    }
+    Optional<PlayerPhysicsProtocol.PredictionInput> predict(long clientTick, PlayerPhysicsProtocol.Controls controls,
+            CardinalPredictionStep.Environment environment, Function<AxisAlignedBB, List<AxisAlignedBB>> collisions,
+            Function<CardinalPredictionStep.State, EndpointValidation> endpoint,
+            Optional<ClientCollisionScenes.Scene> collisionScene) {
+        Objects.requireNonNull(collisionScene);
         if (!active()) return Optional.empty();
         if (clientTick == lastTick) throw new IllegalStateException("Prediction slot already consumed");
         if (firstTick >= 0 && lastTick >= firstTick && clientTick != lastTick + 1) {
@@ -138,7 +146,7 @@ final class ClientCardinalPredictionOwner {
         var identity = new PlayerPhysicsProtocol.PredictionInput(epoch, nextFirstTick, clientTick,
                 controls.jump() ? nextJumpEdge : 0, Optional.of(bootstrap));
         if (controls.jump()) jumpTracePending = true;
-        var next = calculate(state, controls, environment, collisions, clientTick);
+        var next = calculate(state, controls, environment, collisions, clientTick, collisionScene);
         if (next == null) return Optional.empty();
         if (!validateEndpoint(endpoint, next)) return Optional.empty();
         if (firstTick < 0) {
@@ -147,7 +155,7 @@ final class ClientCardinalPredictionOwner {
         }
         jumpEdge = nextJumpEdge; jumpHeld = controls.jump();
         previousEye = state.placement().eye(); state = next;
-        history.append(clientTick, new Input(identity, controls, environment));
+        history.append(clientTick, new Input(identity, controls, environment, collisionScene));
         lastTick = clientTick;
         return Optional.of(identity);
     }
@@ -222,7 +230,7 @@ final class ClientCardinalPredictionOwner {
         Vec3d replayPreviousEye = scratch.placement().eye();
         for (var slot : ((PlayerPredictionTiming.Ready<Input>) replay).slots()) {
             replayPreviousEye = scratch.placement().eye();
-            scratch = calculate(scratch, slot.state().controls(), slot.state().environment(), collisions, clientTick);
+            scratch = calculate(scratch, slot.state().controls(), slot.state().environment(), collisions, clientTick, slot.state().collisionScene());
             if (scratch == null) return false;
             if (!validateEndpoint(endpoint, scratch)) return false;
         }
@@ -310,15 +318,43 @@ final class ClientCardinalPredictionOwner {
     }
     private CardinalPredictionStep.State calculate(CardinalPredictionStep.State start,
             PlayerPhysicsProtocol.Controls controls, CardinalPredictionStep.Environment environment,
-            Function<AxisAlignedBB, List<AxisAlignedBB>> collisions, long clientTick) {
+            Function<AxisAlignedBB, List<AxisAlignedBB>> collisions, long clientTick,
+            Optional<ClientCollisionScenes.Scene> collisionScene) {
         var result = CardinalPredictionStep.step(start, environment, controls, CardinalPredictionStep.Mode.NORMAL_DRY,
-                collisions, ledger(clientTick));
+                withFrozenScene(collisions, collisionScene), ledger(clientTick));
         if (result instanceof CardinalPredictionStep.Predicted predicted) return predicted.pose();
         if (result instanceof CardinalPredictionStep.Rejected rejected) {
+            if (rejected.cause() instanceof ClientCollisionScenes.SceneUnavailableException unavailable) {
+                refuse(EndpointValidation.refused(CardinalPredictionSeed.Reason.DYNAMIC_COLLISION_UNAVAILABLE,
+                        PlayerPhysicsProtocol.PredictionRefusalStage.ENDPOINT,
+                        "scene=" + collisionScene.map(ClientCollisionScenes.Scene::identity)
+                                + ",reason=" + unavailable.reason()));
+                return null;
+            }
             retire(rejected.reason());
             if (rejected.cause() != null) throw new IllegalStateException(rejected.reason(), rejected.cause());
         } else retire("Unsupported prediction mode");
         return null;
+    }
+    /** Only dynamic geometry is frozen here; native terrain keeps its existing world query contract. */
+    private Function<AxisAlignedBB, List<AxisAlignedBB>> withFrozenScene(
+            Function<AxisAlignedBB, List<AxisAlignedBB>> nativeCollisions,
+            Optional<ClientCollisionScenes.Scene> captured) {
+        if (captured.isEmpty()) return nativeCollisions;
+        var scene = captured.orElseThrow();
+        return bounds -> {
+            if (!scene.valid(world, actor))
+                throw new ClientCollisionScenes.SceneUnavailableException("SCENE_LIFETIME_CHANGED");
+            var nativeBoxes = nativeCollisions.apply(bounds);
+            var query = scene.query(bounds);
+            if (query instanceof ClientCollisionScenes.QueryUnavailable unavailable)
+                throw new ClientCollisionScenes.SceneUnavailableException(unavailable.reason());
+            if (!scene.valid(world, actor))
+                throw new ClientCollisionScenes.SceneUnavailableException("SCENE_LIFETIME_CHANGED");
+            var result = new java.util.ArrayList<>(Objects.requireNonNull(nativeBoxes, "native collision boxes"));
+            result.addAll(((ClientCollisionScenes.Colliders) query).boxes());
+            return List.copyOf(result);
+        };
     }
     CardinalPredictionStep.State state() { return state; }
     CardinalPredictionSeed.Ready seed() { return seed; }

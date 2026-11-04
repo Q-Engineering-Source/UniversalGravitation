@@ -451,6 +451,24 @@ public final class WorldCollisionCandidates {
 
     private static Capture captureInternal(WorldServer world, Entity actor, Aabb requestedBounds,
             QueryPolicy policy, Limits limits, FreeOwnerTransaction transaction, EnvironmentObservationWork work) {
+        return captureInternal(world, actor, requestedBounds, policy, limits, transaction, work, null);
+    }
+
+    private static final class SynchronousNativeColliders {
+        private List<AxisAlignedBB> boxes;
+        void accept(List<AxisAlignedBB> value) {
+            if (boxes != null) throw new IllegalStateException("Native colliders already captured");
+            boxes = value;
+        }
+        List<AxisAlignedBB> result() { return Objects.requireNonNull(boxes, "Native collider capture not published"); }
+    }
+
+    /** Native callbacks are handed only to this synchronous cardinal calculation, never the stored Snapshot. */
+    private static Capture captureInternal(WorldServer world, Entity actor, Aabb requestedBounds,
+            QueryPolicy policy, Limits limits, FreeOwnerTransaction transaction, EnvironmentObservationWork work,
+            SynchronousNativeColliders nativeSink) {
+        if (nativeSink != null && transaction != null)
+            throw new IllegalArgumentException("Native callback capture is cardinal-only");
         Objects.requireNonNull(world, "world");
         Objects.requireNonNull(actor, "actor");
         Objects.requireNonNull(requestedBounds, "requestedBounds");
@@ -509,8 +527,9 @@ public final class WorldCollisionCandidates {
                             "world border changed during owner native collision capture");
                 }
             }
+            List<AxisAlignedBB> synchronousBoxes = nativeSink == null ? null : new ArrayList<>();
             List<Aabb> boxes = transaction == null
-                    ? copyNativeBoxes(nativeBoxes, limits.maxCandidateBoxes(), work)
+                    ? copyNativeBoxes(nativeBoxes, limits.maxCandidateBoxes(), work, synchronousBoxes)
                     : copyNativeBoxes(nativeBoxes, limits.maxCandidateBoxes(), transaction, work);
             ObservedChunks after = preflight(world, footprint, limits, transaction, work);
             if (transaction != null) requireTransactionCurrent(transaction);
@@ -522,6 +541,7 @@ public final class WorldCollisionCandidates {
                         "native observation changed actor/chunk/tick/radius/border context");
             }
             if (deferred(world)) return unavailable(Reason.DEFERRED_WORLD, "block snapshots became active during capture");
+            if (nativeSink != null) nativeSink.accept(List.copyOf(synchronousBoxes));
             return new Snapshot(world, actor, tick, footprint, before, loaded.chunks, loaded.rootEntities,
                     boxes, outsideBefore, outsideAfter, borderBefore, borderAfter, provenance);
         } catch (ObservationFailure failure) {
@@ -647,8 +667,10 @@ public final class WorldCollisionCandidates {
         CardinalMovementResolver.Result result = CardinalMovementResolver.resolve(request, query -> {
             Aabb requested = new Aabb(new Vec3d(query.minX, query.minY, query.minZ),
                     new Vec3d(query.maxX, query.maxY, query.maxZ));
-            Capture captured = work == null ? capture(world, actor, requested, QueryPolicy.NATIVE_STRICT, scanLimits)
-                    : capture(world, actor, requested, QueryPolicy.NATIVE_STRICT, scanLimits, work);
+            var nativeColliders = new SynchronousNativeColliders();
+            if (work != null) work.requireCurrent(actor);
+            Capture captured = captureInternal(world, actor, requested, QueryPolicy.NATIVE_STRICT, scanLimits,
+                    null, work, nativeColliders);
             if (captured instanceof Unavailable unavailable) throw new CaptureProblem(unavailable);
             Snapshot snapshot = (Snapshot) captured;
             snapshots.add(snapshot);
@@ -658,11 +680,12 @@ public final class WorldCollisionCandidates {
                 throw new CaptureProblem(unavailable(Reason.CONTEXT_CHANGED,
                         "cardinal probes no longer observe the original actor/tick/radius context"));
             }
-            return snapshot.boxes.stream().map(WorldCollisionCandidates::nativeBox).toList();
+            return nativeColliders.result();
         }, movementLimits);
         if (result instanceof CardinalMovementResolver.Rejected rejected) {
             Optional<Unavailable> failure = rejected.cause() instanceof CaptureProblem problem
-                    ? Optional.of(problem.failure) : Optional.empty();
+                    ? Optional.of(problem.failure) : rejected.cause() == null ? Optional.empty()
+                    : Optional.of(unavailable(Reason.NATIVE_QUERY_FAILED, rejected.cause()));
             return new CardinalObservation(accepted, Optional.of(result), snapshots, failure);
         }
         try {
@@ -773,6 +796,11 @@ public final class WorldCollisionCandidates {
 
     private static List<Aabb> copyNativeBoxes(List<AxisAlignedBB> nativeBoxes, int maximum,
             EnvironmentObservationWork work) {
+        return copyNativeBoxes(nativeBoxes, maximum, work, null);
+    }
+
+    private static List<Aabb> copyNativeBoxes(List<AxisAlignedBB> nativeBoxes, int maximum,
+            EnvironmentObservationWork work, List<AxisAlignedBB> synchronousBoxes) {
         Objects.requireNonNull(nativeBoxes, "nativeBoxes");
         if (maximum < 1 || maximum > 4096) throw new IllegalArgumentException("invalid candidate limit");
         if (nativeBoxes.size() > maximum) {
@@ -790,6 +818,7 @@ public final class WorldCollisionCandidates {
                 }
                 if (work != null) work.charge(EnvironmentObservationWork.Unit.COORDINATE_CONVERSION);
                 result.add(new Aabb(new Vec3d(box.minX, box.minY, box.minZ), new Vec3d(box.maxX, box.maxY, box.maxZ)));
+                if (synchronousBoxes != null) synchronousBoxes.add(box);
             } catch (IllegalArgumentException invalid) {
                 throw new ObservationFailure(Reason.MALFORMED_COLLIDER, null, "native collision box is not representable", invalid);
             }

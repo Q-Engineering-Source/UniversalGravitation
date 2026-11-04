@@ -5057,14 +5057,25 @@ public final class PlayerPhysicsServer {
                 && predictionReferenceEquivalent(owner.predictionReference, owner.travel.cardinalReference());
     }
 
-    /** Kernel geometry/qualification follows effective source, frame and accepted tangent heading.
-     * Manual preferences and pending/transition metadata do not change an installed prediction basis;
-     * their eventual selection is observed through effective(), while Ready carries sampled forces
-     * and standing qualification. Never mint another transaction for metadata-only cleanup.
+    /** Geometry and explicit reference ownership fence replay; native flight alone does not rotate it.
+     * NATURAL and SAFE_NATIVE can exchange the same upright Y+ basis on takeoff/landing.
+     * Their force/standing samples travel in STATE seeds and each retained input's environment;
+     * discarding that history would instead reinstall an older canonical position at the toggle.
+     * Environmental/manual ownership and any actual heading, frame, shape or attitude change
+     * still require their existing rebase and geometry checks.
      */
     static boolean predictionReferenceEquivalent(Optional<PlayerBodyReference.State> previous,
             Optional<PlayerBodyReference.State> current) {
-        return previous.map(PlayerBodyReference.State::effective).equals(current.map(PlayerBodyReference.State::effective));
+        var before = previous.map(PlayerBodyReference.State::effective);
+        var after = current.map(PlayerBodyReference.State::effective);
+        if (before.equals(after)) return true;
+        if (before.isEmpty() || after.isEmpty()) return false;
+        var a = before.orElseThrow();
+        var b = after.orElseThrow();
+        if (a.frame() != CardinalFrame.Y_POS || b.frame() != CardinalFrame.Y_POS
+                || !a.tangentHeading().equals(b.tangentHeading())) return false;
+        return a.source() == PlayerBodyReference.Source.NATURAL && b.source() == PlayerBodyReference.Source.SAFE_NATIVE
+                || a.source() == PlayerBodyReference.Source.SAFE_NATIVE && b.source() == PlayerBodyReference.Source.NATURAL;
     }
 
     private static void suspendChangedPredictionReference(Session session, Owned owner) {

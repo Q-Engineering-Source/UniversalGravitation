@@ -55,6 +55,24 @@ class OwnedPredictionTimelineTest {
         assertFalse(PlayerPhysicsServer.predictionReferenceEquivalent(Optional.empty(),Optional.of(environment)));
     }
 
+    @Test void nativeFlightSourceChangeKeepsOnlyTheSameUprightPredictionBasis() {
+        var nativeReference = PlayerBodyReference.State.initial(CardinalFrame.Y_POS, new Vec3d(0, 0, 1));
+        var natural = nativeReference.accepted(new PlayerBodyReference.Effective(PlayerBodyReference.Source.NATURAL,
+                CardinalFrame.Y_POS, new Vec3d(0, 0, 1)), PlayerBodyReference.Transition.STABLE);
+        assertTrue(PlayerPhysicsServer.predictionReferenceEquivalent(Optional.of(nativeReference), Optional.of(natural)));
+        assertTrue(PlayerPhysicsServer.predictionReferenceEquivalent(Optional.of(natural), Optional.of(nativeReference)));
+        var turned = natural.accepted(new PlayerBodyReference.Effective(PlayerBodyReference.Source.NATURAL,
+                CardinalFrame.Y_POS, new Vec3d(1, 0, 0)), PlayerBodyReference.Transition.STABLE);
+        assertFalse(PlayerPhysicsServer.predictionReferenceEquivalent(Optional.of(nativeReference), Optional.of(turned)));
+        for (var source : new PlayerBodyReference.Source[]{PlayerBodyReference.Source.MANUAL, PlayerBodyReference.Source.ENVIRONMENT}) {
+            var explicit = natural.accepted(new PlayerBodyReference.Effective(source, CardinalFrame.Y_POS,
+                    new Vec3d(0, 0, 1)), PlayerBodyReference.Transition.STABLE);
+            assertFalse(PlayerPhysicsServer.predictionReferenceEquivalent(Optional.of(natural), Optional.of(explicit)));
+            assertFalse(PlayerPhysicsServer.predictionReferenceEquivalent(Optional.of(nativeReference), Optional.of(explicit)));
+        }
+        assertFalse(PlayerPhysicsServer.predictionReferenceEquivalent(Optional.empty(), Optional.of(natural)));
+    }
+
     @Test void staleMetadataCannotRetireSuccessorBootstrap() {
         var timeline=timeline();
         var next=new PlayerPhysicsProtocol.PredictionBootstrap(2,0);

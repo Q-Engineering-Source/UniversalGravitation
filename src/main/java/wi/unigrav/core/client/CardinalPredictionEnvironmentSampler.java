@@ -101,13 +101,18 @@ public final class CardinalPredictionEnvironmentSampler {
             Vec3d impulse = CardinalTravelKernel.jumpSprintImpulse(cardinal.frame(), controls.forward(),
                     state.placement().attitude().basisZ());
             Vec3d acceleration = seed.environmentAcceleration();
-            if (!seed.personalZeroG() && !seed.savedNativeNoGravity()
-                    && seed.bindingMode().filter(mode -> mode == GravityMode.REPLACE).isEmpty() && !flying)
+            boolean nativeGravity = !seed.personalZeroG() && !seed.savedNativeNoGravity()
+                    && seed.bindingMode().filter(mode -> mode == GravityMode.REPLACE).isEmpty() && !flying;
+            if (nativeGravity)
                 acceleration = acceleration.add(new Vec3d(0, -GravityEntityBinder.VANILLA_PLAYER_GRAVITY, 0));
+            // A locally accepted flight exit precedes the next STATE seed. Its ordinary Y+
+            // gravity and walking/jump qualification must describe this same input slot.
+            boolean standingReference = seed.standingReference()
+                    || nativeGravity && cardinal.frame() == CardinalFrame.Y_POS;
             if (actor.world != world || actor.isDead) return new Unavailable(Reason.ACTOR_CHANGED, Optional.empty());
             return new Sampled(new CardinalPredictionStep.Environment(acceleration, friction, aiMoveSpeed,
                     actor.jumpMovementFactor, flying, equipmentFlight.flySpeed(), launch, impulse,
-                    actor.stepHeight, seed.ceilingMps(), seed.standingReference(), sprint, actor.rotationYaw,
+                    actor.stepHeight, seed.ceilingMps(), standingReference, sprint, actor.rotationYaw,
                     seed.bindingActive(), equipmentFlight));
         } catch (RuntimeException cause) {
             return new Unavailable(Reason.SAMPLING_FAILED, Optional.of(cause));

@@ -1,6 +1,7 @@
 package wi.unigrav.core.player;
 
 import dev.crlhitbox.api.geometry.Vec3d;
+import dev.crlhitbox.api.geometry.Aabb;
 import dev.crlhitbox.api.geometry.contact.CapsuleAabbContact3d.Relation;
 import java.util.Objects;
 import java.util.Optional;
@@ -111,16 +112,23 @@ final class CapsuleMoveFinalizer {
             throw new IllegalStateException("actual-touch response capture unavailable: "
                     + unavailable.reason() + ": " + unavailable.detail(), cause);
         }
-        var arithmetic = new FreeMovementExactGeometry.Arithmetic(transaction.numeric(), transaction::requireCurrent);
+        return touchingConstraints(installed, capture.boxes(), transaction.numeric(), transaction::requireCurrent);
+    }
+
+    /** Shared contact arithmetic only. The server caller above still proves actual installation. */
+    static java.util.List<FreeMovementExactGeometry.Vector> touchingConstraints(PlayerBodyPlacement placement,
+            java.util.List<Aabb> colliders, StoredDyadic.Work numeric, Runnable requireCurrent) {
+        requireCurrent.run();
+        var arithmetic = new FreeMovementExactGeometry.Arithmetic(numeric, requireCurrent);
         var constraints = new java.util.ArrayList<FreeMovementExactGeometry.Vector>();
-        var pose = CapsulePlacementMath.pose(installed, transaction.numeric());
-        for (int ordinal = 0; ordinal < capture.boxes().size(); ordinal++) {
+        var pose = CapsulePlacementMath.pose(placement, numeric);
+        for (int ordinal = 0; ordinal < colliders.size(); ordinal++) {
             var support = FreeMovementExactGeometry.support(arithmetic, ordinal, pose.capsule().centerline(),
-                    capture.boxes().get(ordinal), pose.capsule().radius());
+                    colliders.get(ordinal), pose.capsule().radius());
             if (support.isPresent() && support.orElseThrow().exactlyTouching(arithmetic))
                 constraints.add(support.orElseThrow().facet().normal());
         }
-        transaction.requireCurrent();
+        requireCurrent.run();
         return java.util.List.copyOf(constraints);
     }
 

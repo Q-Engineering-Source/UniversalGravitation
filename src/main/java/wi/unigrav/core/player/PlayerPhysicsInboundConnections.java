@@ -471,7 +471,8 @@ public final class PlayerPhysicsInboundConnections {
             PlayerPhysicsProtocol.Packet exactPacket) {
         return exactPacket != null
                 && (exactPacket.kind() == PlayerPhysicsProtocol.Kind.OWNED
-                || exactPacket.kind() == PlayerPhysicsProtocol.Kind.STATE)
+                || exactPacket.kind() == PlayerPhysicsProtocol.Kind.STATE
+                || exactPacket.kind() == PlayerPhysicsProtocol.Kind.MOTION)
                 && isCurrentScopedDecode(exactDecode, exactScope, exactPacket);
     }
 
@@ -530,8 +531,9 @@ public final class PlayerPhysicsInboundConnections {
                 if (kind == null) {
                     throw new IllegalStateException("materialized decode has no packet kind identity");
                 }
-                if (kind != PlayerPhysicsProtocol.Kind.OWNED && kind != PlayerPhysicsProtocol.Kind.STATE) {
-                    throw new IllegalStateException("only OWNED or STATE packets can finish as installed");
+                if (kind != PlayerPhysicsProtocol.Kind.OWNED && kind != PlayerPhysicsProtocol.Kind.STATE
+                        && kind != PlayerPhysicsProtocol.Kind.MOTION) {
+                    throw new IllegalStateException("only owned state or an explicit position correction can finish as installed");
                 }
                 Optional<ConnectionDecodeBudget.ScopeToken> ticketScope = ticket.scopeToken();
                 if (ticketScope.isEmpty()) {

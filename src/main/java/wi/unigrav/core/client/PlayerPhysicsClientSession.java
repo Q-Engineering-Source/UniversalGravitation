@@ -40,7 +40,7 @@ public final class PlayerPhysicsClientSession {
         private TangentViewCustody(PlayerPhysicsClientSession owner, EntityPlayer actor,
                                    PlayerBodyReference.Effective reference) {
             this.owner = owner; this.actor = actor; world = actor.world;
-            lifetime = owner.lifetime; snapshot = owner.snapshot;
+            lifetime = owner.lifetime; snapshot = owner.presentationSnapshot().orElseThrow();
             packet = owner.acceptedInstallationPacket; correction = owner.correctionGeneration;
             installation = owner.lastPublishedInstallation;
             this.reference = reference;
@@ -51,11 +51,12 @@ public final class PlayerPhysicsClientSession {
                     && session.snapshot.scope().equals(snapshot.scope());
         }
         boolean current(PlayerPhysicsClientSession session) {
-            return sameLifetime(session) && session.snapshot == snapshot
-                    && session.acceptedInstallationPacket == packet
+            // A local translation/crouch does not change the tangent frame. Do not revoke
+            // this tick's view merely because its immutable position object was replaced.
+            return sameLifetime(session) && session.acceptedInstallationPacket == packet
                     && session.lastPublishedInstallation == installation && session.drivesMotion()
-                    && session.presentationSnapshot().filter(s -> s == snapshot).isPresent()
-                    && session.acceptedEffectiveBodyReference(snapshot).filter(reference::equals).isPresent();
+                    && session.presentationSnapshot().flatMap(session::acceptedEffectiveBodyReference)
+                            .filter(reference::equals).isPresent();
         }
     }
 
@@ -291,7 +292,7 @@ public final class PlayerPhysicsClientSession {
         private final EntityPlayer actor;
         private final World world;
         private final Object lifetime;
-        private final PlayerPhysicalSnapshot accepted;
+        private final PlayerPhysicalSnapshot accepted, restorationTarget;
         private final PlayerPhysicsProtocol.Packet packet;
         private final OptionalInt correction;
         private final long correctionGeneration;
@@ -302,12 +303,14 @@ public final class PlayerPhysicsClientSession {
                 BooleanSupplier ownerCurrent) {
             this.session = session; this.actor = actor; world = actor.world;
             lifetime = session.lifetime; accepted = session.snapshot; packet = session.acceptedInstallationPacket;
+            restorationTarget = session.presentationSnapshot().orElse(accepted);
             correction = session.nativeTeleportId; correctionGeneration = session.correctionGeneration;
             installation = session.lastPublishedInstallation; restorer = session.predictedPoseRestoration;
             this.ownerCurrent = ownerCurrent;
         }
         boolean sessionCurrent() {
             return session.lifetime == lifetime && session.snapshot == accepted
+                    && session.presentationSnapshot().orElse(session.snapshot) == restorationTarget
                     && session.acceptedInstallationPacket == packet && session.nativeTeleportId.equals(correction)
                     && session.correctionGeneration == correctionGeneration
                     && session.lastPublishedInstallation == installation && session.predictedPoseRestoration == restorer;
@@ -348,8 +351,13 @@ public final class PlayerPhysicsClientSession {
         catch (Throwable cause) { failure = cause; }
         try {
             if (lease.mayRestore()) {
-                boolean restored = lease.restorer != null ? lease.restorer.getAsBoolean()
-                        : install == null ? PlayerPhysicsClientMirror.install(actor, lease.accepted) : install.test(lease.accepted);
+                // A native pose callback cannot roll current local movement back to the
+                // retained server base. An old prediction restorer owns only that old path.
+                boolean restored = lease.restorationTarget != lease.accepted
+                        ? install == null ? PlayerPhysicsClientMirror.install(actor, lease.restorationTarget)
+                            : install.test(lease.restorationTarget)
+                        : lease.restorer != null ? lease.restorer.getAsBoolean()
+                            : install == null ? PlayerPhysicsClientMirror.install(actor, lease.accepted) : install.test(lease.accepted);
                 // A false return can end its own lease by performing real retirement. It is not
                 // a rejection by an owner that no longer exists, and must not mint failure authority.
                 if (lease.mayRestore() && !restored)
@@ -567,6 +575,11 @@ public final class PlayerPhysicsClientSession {
     private PlayerPhysicsProtocol.Packet acceptedInstallationPacket;
     private PreparedInstallation activeAttempt;
     private PlayerPhysicalSnapshot snapshot;
+    // Local motion belongs to one actually installed server-state lifetime. A correction or
+    // handoff changes snapshot identity and therefore retires the old local result immediately.
+    private PlayerPhysicalSnapshot localMotionBase, localMotion;
+    private PlayerPhysicalSnapshot motionFeedbackBase;
+    private PlayerPhysicsProtocol.Packet motionFeedback;
     private Object lifetime = new Object();
     private long protocolGeneration;
     private long incomingSequence = -1;
@@ -696,7 +709,9 @@ public final class PlayerPhysicsClientSession {
     private long mobilityRequestSequence;
 
     public Optional<PlayerMobilityIntent.State> mobilityState() {
-        return acceptedInstallationPacket == null ? Optional.empty() : acceptedInstallationPacket.mobilityState();
+        var current = motionFeedbackBase == snapshot && motionFeedback != null
+                ? motionFeedback : acceptedInstallationPacket;
+        return current == null ? Optional.empty() : current.mobilityState();
     }
     public boolean requestMobility(PlayerMobilityIntent.Mode mode,
             PlayerMobilityIntent.Hover hover) {
@@ -778,7 +793,12 @@ public final class PlayerPhysicsClientSession {
     public InstallationPreparation prepareInstallation(PlayerPhysicsProtocol.Packet packet) {
         Objects.requireNonNull(packet, "packet");
         if (applying || activeAttempt != null) return rejectedPreparation(StateDisposition.ATTEMPT_FENCED);
-        if (packet.kind() != PlayerPhysicsProtocol.Kind.OWNED && packet.kind() != PlayerPhysicsProtocol.Kind.STATE)
+        boolean positionCorrection = packet.kind() == PlayerPhysicsProtocol.Kind.MOTION;
+        if (positionCorrection) {
+            var feedback = packet.positionFeedback().orElseThrow();
+            if (!feedback.correction() || feedback.correctionId() <= appliedPositionCorrectionId())
+                return rejectedPreparation(StateDisposition.NOT_STATE);
+        } else if (packet.kind() != PlayerPhysicsProtocol.Kind.OWNED && packet.kind() != PlayerPhysicsProtocol.Kind.STATE)
             return rejectedPreparation(StateDisposition.NOT_STATE);
         if (submitted == null || !submitted.scope().equals(packet.scope())
                 || submitted.offerSequence() != packet.offerSequence())
@@ -816,7 +836,9 @@ public final class PlayerPhysicsClientSession {
         InstallationDisposition disposition;
         if (snapshot != null && next.revision() <= snapshot.revision()) {
             if (!snapshot.equals(next)) return rejectedPreparation(StateDisposition.REVISION_CONFLICT);
-            disposition = InstallationDisposition.RETRANSMISSION;
+            // A new correction can intentionally restore the unchanged server base after
+            // local movement. It still needs one real installation, not retransmission handling.
+            disposition = positionCorrection ? InstallationDisposition.INSTALL : InstallationDisposition.RETRANSMISSION;
         } else {
             if (attempted != null && (packet.sequence() < attempted.sequence()
                     || packet.sequence() == attempted.sequence() && !packet.equals(attempted)))
@@ -1498,13 +1520,73 @@ public final class PlayerPhysicsClientSession {
     /** Snapshot eligible for read-only model presentation, separate from retained custody. */
     public Optional<PlayerPhysicalSnapshot> presentationSnapshot() {
         return snapshot != null && !nativeDelegated && !installationFenceActive() && !applying && !nativeCorrectionPending
-                ? Optional.of(snapshot) : Optional.empty();
+                ? Optional.of(localMotionBase == snapshot && localMotion != null ? localMotion : snapshot) : Optional.empty();
+    }
+
+    long appliedPositionCorrectionId() {
+        return motionFeedbackBase == snapshot && motionFeedback != null
+                ? motionFeedback.positionFeedback().orElseThrow().correctionId()
+                : snapshot == null ? -1 : snapshot.revision();
+    }
+
+    Optional<PlayerPhysicsProtocol.PositionFeedback> positionFeedback() {
+        return motionFeedbackBase == snapshot && motionFeedback != null
+                ? motionFeedback.positionFeedback() : Optional.empty();
+    }
+
+    /** Ordinary feedback changes rules/status, never the installed or locally simulated position. */
+    boolean acceptMotionMetadata(PlayerPhysicsProtocol.Packet packet) {
+        if (packet.kind() != PlayerPhysicsProtocol.Kind.MOTION || !drivesMotion()
+                || installationFenceActive() || applying || mutationQuarantine || nativeCorrectionPending
+                || submitted == null || !packet.scope().equals(snapshot.scope())
+                || packet.offerSequence() != submitted.offerSequence() || packet.sequence() <= incomingSequence
+                || packet.positionFeedback().orElseThrow().correctionId() != appliedPositionCorrectionId()) return false;
+        var update = prepareBodyReferenceUpdate(packet, presentationSnapshot().orElseThrow());
+        long generation = Math.incrementExact(protocolGeneration);
+        bodyReferenceReceipt = update.receipt();
+        pendingBodyReferenceIntent = update.pendingIntent();
+        bodyReferenceState = update.state();
+        motionFeedbackBase = snapshot;
+        motionFeedback = packet;
+        incomingSequence = packet.sequence();
+        protocolGeneration = generation;
+        return true;
+    }
+
+    /** Called after the actual correction installation, never when it is merely received. */
+    boolean recordInstalledMotionCorrection(PlayerPhysicsProtocol.Packet packet) {
+        if (packet.kind() != PlayerPhysicsProtocol.Kind.MOTION || !drivesMotion()
+                || installationFenceActive() || applying || packet.snapshot().orElse(null) != snapshot
+                || packet.positionFeedback().isEmpty() || !packet.positionFeedback().orElseThrow().correction()
+                || acceptedInstallationPacket != packet) return false;
+        motionFeedbackBase = snapshot;
+        motionFeedback = packet;
+        return true;
+    }
+
+    /** Publishes a real completed local installation; no transport acknowledgement authorizes a step. */
+    boolean publishLocalMotion(EntityPlayer actor, PlayerPhysicalSnapshot previous, PlayerPhysicalSnapshot next,
+            Runnable requireOwnerCurrent) {
+        Objects.requireNonNull(actor); Objects.requireNonNull(previous); Objects.requireNonNull(next);
+        Objects.requireNonNull(requireOwnerCurrent).run();
+        var base = snapshot;
+        var ownerLifetime = lifetime;
+        if (!drivesMotion() || presentationSnapshot().orElse(null) != previous
+                || !previous.scope().equals(next.scope()) || !actor.getUniqueID().equals(next.scope().playerId())
+                || actor.dimension != next.scope().dimension() || actor.isDead) return false;
+        if (!PlayerPhysicsClientMirror.matchesAcceptedPresentationGeometry(actor, next)) return false;
+        requireOwnerCurrent.run();
+        if (snapshot != base || lifetime != ownerLifetime || !drivesMotion()
+                || presentationSnapshot().orElse(null) != previous) return false;
+        localMotionBase = base;
+        localMotion = next;
+        return true;
     }
     public float physicalEyeHeight(EntityPlayer actor, float nativeHeight) {
         return drivesMotion() && actor.getUniqueID().equals(snapshot.scope().playerId())
                 && actor.dimension == snapshot.scope().dimension()
                 && (!PlayerKinematics.requiresNative(actor) || nativeMovementMustRemainGated())
-                ? (float) snapshot.placement().shape().dimensions().eyeHeight() : nativeHeight;
+                ? (float) presentationSnapshot().orElse(snapshot).placement().shape().dimensions().eyeHeight() : nativeHeight;
     }
 
     private boolean holdsNativeMovement(EntityPlayer actor) {
@@ -1683,7 +1765,8 @@ public final class PlayerPhysicsClientSession {
 
     /** Called only after the exact INPUT packet returns normally from the real network submission boundary. */
     void inputSendSucceeded(PlayerPhysicsProtocol.Packet input) {
-        if (input == null || input.kind() != PlayerPhysicsProtocol.Kind.INPUT) return;
+        if (input == null || input.kind() != PlayerPhysicsProtocol.Kind.INPUT
+                && input.kind() != PlayerPhysicsProtocol.Kind.MOVE) return;
         PlayerPhysicsProtocol.BodyReferenceAcknowledgement sent = input.bodyReferenceAcknowledgement().orElse(null);
         if (sent == null) return;
         if (nativeRestoreAcknowledgement == sent) {

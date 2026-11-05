@@ -236,7 +236,7 @@ public final class PlayerMobilityIntent {
         return hover(velocityAfterForces, effectiveAcceleration, rawAcceleration, hasReference, intent,
                 creativeGControl, brakingMps2, dt, false);
     }
-    static HoverResult hover(Vec3 velocityAfterForces, Vec3 effectiveAcceleration, Vec3 rawAcceleration,
+    public static HoverResult hover(Vec3 velocityAfterForces, Vec3 effectiveAcceleration, Vec3 rawAcceleration,
                              boolean hasReference, Hover intent, boolean creativeGControl,
                              double brakingMps2, double dt, boolean activeDrive) {
         finite(velocityAfterForces); finite(effectiveAcceleration); finite(rawAcceleration);

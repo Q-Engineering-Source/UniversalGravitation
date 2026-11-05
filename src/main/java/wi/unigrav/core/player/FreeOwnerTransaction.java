@@ -15,7 +15,7 @@ import wi.unigrav.UnigravMod;
 import wi.unigrav.core.GravityEntityBinder;
 
 /** One owner invocation, including failed queries and already debited movement. */
-final class FreeOwnerTransaction implements AutoCloseable {
+final class FreeOwnerTransaction implements AutoCloseable, CapsuleMovementContext {
     private static final ThreadLocal<NativeInstallation> NATIVE_INSTALLATION = new ThreadLocal<>();
     record NativeInstallation(FreeOwnerTransaction transaction, PlayerPhysicalSnapshot journal) { }
     private record InstalledEyeObservation(NativeInstallation installation, Object invocation,
@@ -479,7 +479,7 @@ final class FreeOwnerTransaction implements AutoCloseable {
                 && resources == expectedResources && world == expectedWorld;
     }
 
-    void requireCurrent() {
+    public void requireCurrent() {
         if (!world.isCallingFromMinecraftThread()) throw new OwnerContextChangedException("Free transaction off-thread");
         requireOwnerFence();
         boolean actorAlive = actor.isEntityAlive();
@@ -498,7 +498,12 @@ final class FreeOwnerTransaction implements AutoCloseable {
                     + "; observedNativeSize=" + actor.width + "x" + actor.height);
     }
 
-    void requireOwnerFence() {
+    @Override public WorldCollisionCandidates.Capture capture(dev.crlhitbox.api.geometry.Aabb window) {
+        return WorldCollisionCandidates.capture(this, window, CollisionQueryFootprint.QueryPolicy.CAPSULE_CONTACT,
+                new CollisionQueryFootprint.Limits(16384, 16, 4096, 4096));
+    }
+
+    public void requireOwnerFence() {
         resources.requireCurrent(resourceOwner, world, accepted.scope(), correction);
         if (closed || !ownerCurrent.getAsBoolean() || actor.world != world || actor.isDead
                 || connection == null || actor.connection != connection || connection.player != actor
@@ -787,6 +792,18 @@ final class FreeOwnerTransaction implements AutoCloseable {
         return admission;
     }
 
+    /** Only ordinary submitted translation consumes the client's validated movement window.
+     * Native resize/reference/mode conversions keep their distinct, already bounded path authority.
+     */
+    BoostMovementBudget.CenterPathAdmission reserveClientPosition(long sequence, long budgetTick) {
+        requireCurrent();
+        if (!travel.positionDriven) throw new IllegalStateException("Not a client position step");
+        if (admission != null) throw new IllegalStateException("Client center path already reserved");
+        admission = ledger.reserveValidatedCenterPath(sequence, budgetTick,
+                vector(accepted.placement().transport()), vector(accepted.placement().center()), travel.positionAllowance);
+        return admission;
+    }
+
     /** Only a tube derived from the native single-axis piston delta may request external path authority. */
     BoostMovementBudget.CenterPathAdmission reservePiston(long budgetTick, Vec3d delta) {
         requireCurrent();
@@ -810,21 +827,21 @@ final class FreeOwnerTransaction implements AutoCloseable {
         settled = true;
     }
 
-    void requireReservedPath(double pathUpper) {
+    public void requireReservedPath(double pathUpper) {
         requireCurrent();
         if (!fitsReservedPath(pathUpper))
             throw new IllegalStateException("Free path exceeds its exact reserved center-path grant");
     }
 
     /** Candidate-route admission check; rejected optional proposals must not throw as if the transaction were terminal. */
-    boolean fitsReservedPath(double pathUpper) {
+    public boolean fitsReservedPath(double pathUpper) {
         requireCurrent();
         if (!Double.isFinite(pathUpper) || pathUpper < 0)
             throw new IllegalArgumentException("invalid candidate center-path upper bound");
         return admission != null && admission.accepted() && pathUpper <= admission.grant();
     }
 
-    double remainingPathGrant(double usedUpper) {
+    public double remainingPathGrant(double usedUpper) {
         requireReservedPath(usedUpper);
         if (usedUpper == admission.grant()) return 0;
         return Math.max(0, Math.nextDown(admission.grant() - usedUpper));
@@ -844,7 +861,7 @@ final class FreeOwnerTransaction implements AutoCloseable {
             BoostMovementBudget exactLedger) {
         return actor == exactActor && accepted == exactAccepted && ledger == exactLedger;
     }
-    PlayerPhysicalSnapshot accepted() { return accepted; }
+    public PlayerPhysicalSnapshot accepted() { return accepted; }
     InstalledFreeEndpoint installedFreeEndpoint() {
         if (preparedInstallation == null) throw new IllegalStateException("Free installation has not been prepared");
         return preparedInstallation.installedEndpoint();
@@ -854,7 +871,7 @@ final class FreeOwnerTransaction implements AutoCloseable {
         return preparedInstallation == exact && exact != null && exact.transaction() == this;
     }
 
-    boolean isPreInstallationPhase() {
+    public boolean isPreInstallationPhase() {
         return installationStage == InstallationStage.NONE || installationStage == InstallationStage.PREPARED;
     }
 
@@ -908,9 +925,9 @@ final class FreeOwnerTransaction implements AutoCloseable {
                         connection, preparedInstallation.placement, preparedInstallation.journal,
                         installationStage, mutationGeometry, Optional.ofNullable(originalFailure)));
     }
-    CapsuleContactQueryBudget queries() { return queries; }
-    StoredDyadic.Work numeric() { return numeric; }
-    FreePostprocessingWork postprocessing() { return postprocessing; }
+    public CapsuleContactQueryBudget queries() { return queries; }
+    public StoredDyadic.Work numeric() { return numeric; }
+    public FreePostprocessingWork postprocessing() { return postprocessing; }
     WorldServer world() { return world; }
     EntityPlayerMP actor() { return actor; }
     long tick() { return tick; }

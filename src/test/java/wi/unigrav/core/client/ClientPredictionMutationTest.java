@@ -208,7 +208,7 @@ class ClientPredictionMutationTest {
                     actor.tail=oldTail;
                     assertTrue(session.drivesMotion(),"correction must retain custody");assertFalse(session.predictionEligible());
                 };
-                var mutation=new ClientCardinalPredictionOwner.Mutation(actor,target,()->token.current(session)&&session.predictionEligible());
+                var mutation=new PlayerPhysicsClientMirror.Mutation(actor,target,()->token.current(session)&&session.predictionEligible());
                 assertFalse(mutation.apply());assertTrue(mutation.possiblyPartial());
                 assertEquals(oldTail,actor.getEntityBoundingBox(),"callback returned before old setter tail wrote bounds");
                 assertEquals(123,actor.motionX);assertFalse(actor.onGround);assertFalse(actor.collidedHorizontally);assertEquals(3,actor.fallDistance);
@@ -225,7 +225,7 @@ class ClientPredictionMutationTest {
             var token=session.predictionLifetime();actor.motionX=321;
             var cause=new IllegalStateException("setter after field write");actor.failure=cause;
             var target=pose(actor,1,25,70);
-            var mutation=new ClientCardinalPredictionOwner.Mutation(actor,target,()->token.current(session));
+            var mutation=new PlayerPhysicsClientMirror.Mutation(actor,target,()->token.current(session));
             assertFalse(mutation.apply());assertTrue(mutation.possiblyPartial());assertSame(cause,mutation.failure());
             assertEquals(25,actor.posX);assertEquals(321,actor.motionX);
             assertTrue(session.failPrediction(token));assertTrue(session.recoveryRequest().isPresent());
@@ -236,7 +236,7 @@ class ClientPredictionMutationTest {
             var actor=new Actor(fixture.world());var initial=pose(actor,1,8,2);var session=session(actor,initial);
             var token=session.predictionLifetime();var newer=pose(actor,2,40,17);
             actor.callback=()->assertTrue(new PlayerPhysicsClientInstallationTestSupport(session,actor).install(packet(newer,PlayerPhysicsProtocol.Kind.STATE,2)));
-            var mutation=new ClientCardinalPredictionOwner.Mutation(actor,pose(actor,1,20,90),()->token.current(session));
+            var mutation=new PlayerPhysicsClientMirror.Mutation(actor,pose(actor,1,20,90),()->token.current(session));
             assertFalse(mutation.apply());assertEquals(40,actor.posX);assertEquals(17*.05,actor.motionX);
             assertFalse(session.failPrediction(token));assertFalse(session.installationFenceActive());
         }
@@ -256,7 +256,7 @@ class ClientPredictionMutationTest {
         try(var fixture=BootWorldFixture.open(path,new UUID(0,416),true)) {
             var actor=new Actor(fixture.world());var authority=pose(actor,1,8,2);var session=session(actor,authority);
             var target=pose(actor,1,23,11);
-            session.predictedPoseRestoration(()->new ClientCardinalPredictionOwner.Mutation(actor,target,session::predictionEligible).apply());
+            session.predictedPoseRestoration(()->new PlayerPhysicsClientMirror.Mutation(actor,target,session::predictionEligible).apply());
             session.runNativePose(actor,()->actor.posX=100);
             assertEquals(23,actor.posX);assertEquals(11*.05,actor.motionX);
             session.nativeCorrection(7);assertTrue(session.drivesMotion());assertFalse(session.predictionEligible());

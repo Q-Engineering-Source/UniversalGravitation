@@ -231,4 +231,56 @@ public final class PlayerPhysicsClientMirror {
         commitRemaining(boundsApplied);
         return true;
     }
+    /** Caller owns lifetime attribution and defers quarantine cleanup until this setter stack has unwound. */
+    static final class Mutation {
+        private final EntityPlayer actor;
+        private final PlayerPhysicalSnapshot projection;
+        private final java.util.function.BooleanSupplier current;
+        private boolean possiblyPartial;
+        private Throwable failure;
+        Mutation(EntityPlayer actor, PlayerPhysicalSnapshot projection, java.util.function.BooleanSupplier current) {
+            this.actor = actor; this.projection = projection; this.current = current;
+        }
+        boolean possiblyPartial() { return possiblyPartial; }
+        Throwable failure() { return failure; }
+        boolean apply() {
+            try {
+                if (!current.getAsBoolean()) return false;
+                var preparation = PlayerPhysicsClientMirror.prepare(actor, projection);
+                if (preparation.prepared().isEmpty() || !current.getAsBoolean()) return false;
+                // commitPrepared writes fields before invoking a mod-overridable setter. A throw is already partial.
+                possiblyPartial = true;
+                var bounds = PlayerPhysicsClientMirror.commitPrepared(preparation.prepared().orElseThrow());
+                if (!current.getAsBoolean()) return false;
+                PlayerPhysicsClientMirror.commitRemaining(bounds);
+                var proof = PlayerPhysicsClientMirror.proveInstalled(bounds);
+                if (!current.getAsBoolean() || proof.isEmpty()) return false;
+                var velocity = projection.worldVelocity().multiply(.05);
+                var contacts = projection.contacts().orElseThrow();
+                boolean complete = actor.motionX == velocity.x() && actor.motionY == velocity.y() && actor.motionZ == velocity.z()
+                        && actor.onGround == contacts.onGround() && actor.collidedHorizontally == contacts.horizontal()
+                        && actor.collidedVertically == contacts.vertical()
+                        && actor.collided == (contacts.horizontal() || contacts.vertical())
+                        && actor.fallDistance == contacts.fallDistance();
+                if (!complete || !current.getAsBoolean()) return false;
+                possiblyPartial = false;
+                return true;
+            } catch (Throwable cause) {
+                failure = cause;
+                return false;
+            }
+        }
+    }
+    static boolean matchesCompleteProjection(EntityPlayer actor, PlayerPhysicalSnapshot projection,
+            java.util.function.BooleanSupplier current) {
+        if (!current.getAsBoolean() || !PlayerPhysicsClientMirror.matchesAcceptedPresentationGeometry(actor, projection)
+                || !current.getAsBoolean()) return false;
+        var motion = projection.worldVelocity().multiply(.05);
+        var contact = projection.contacts().orElseThrow();
+        return actor.motionX == motion.x() && actor.motionY == motion.y() && actor.motionZ == motion.z()
+                && actor.onGround == contact.onGround() && actor.collidedHorizontally == contact.horizontal()
+                && actor.collidedVertically == contact.vertical() && actor.collided == (contact.horizontal() || contact.vertical())
+                && actor.fallDistance == contact.fallDistance() && current.getAsBoolean();
+    }
+
 }

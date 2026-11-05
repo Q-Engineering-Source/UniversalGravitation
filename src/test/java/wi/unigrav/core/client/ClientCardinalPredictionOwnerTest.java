@@ -100,14 +100,14 @@ class ClientCardinalPredictionOwnerTest {
             var owner=new ClientCardinalPredictionOwner(lifetime,actor,1,initial(authority));
             var input=owner.predict(4,controls(),environment(),box->List.of(),pose->ClientCardinalPredictionOwner.EndpointValidation.allowed()).orElseThrow();
             assertEquals(4,input.firstClientTick()); assertEquals(4,input.clientTick());
-            assertTrue(new ClientCardinalPredictionOwner.Mutation(actor,owner.predictedSnapshot(),owner::active).apply()); assertTrue(actor.posZ>8);
+            assertTrue(new PlayerPhysicsClientMirror.Mutation(actor,owner.predictedSnapshot(),owner::active).apply()); assertTrue(actor.posZ>8);
             assertFalse(PlayerPhysicsClientMirror.matchesAcceptedPresentationGeometry(actor,authority));
             assertEquals(1,owner.authority().revision());
-            assertTrue(new ClientCardinalPredictionOwner.Mutation(actor,owner.authority(),owner::active).apply());
+            assertTrue(new PlayerPhysicsClientMirror.Mutation(actor,owner.authority(),owner::active).apply());
             assertTrue(PlayerPhysicsClientMirror.matchesAcceptedPresentationGeometry(actor,authority));
-            assertTrue(new ClientCardinalPredictionOwner.Mutation(actor,owner.predictedSnapshot(),owner::active).apply()); assertTrue(actor.posZ>8);
+            assertTrue(new PlayerPhysicsClientMirror.Mutation(actor,owner.predictedSnapshot(),owner::active).apply()); assertTrue(actor.posZ>8);
             assertFalse(owner.current(new Object(),actor));
-            owner.retire("teleport"); assertFalse(new ClientCardinalPredictionOwner.Mutation(actor,owner.predictedSnapshot(),owner::active).apply());
+            owner.retire("teleport"); assertFalse(new PlayerPhysicsClientMirror.Mutation(actor,owner.predictedSnapshot(),owner::active).apply());
             assertTrue(owner.predict(5,controls(),environment(),box->List.of(),pose->ClientCardinalPredictionOwner.EndpointValidation.allowed()).isEmpty());
         }
     }

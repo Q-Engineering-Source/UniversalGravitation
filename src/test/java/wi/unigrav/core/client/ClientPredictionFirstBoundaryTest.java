@@ -105,7 +105,7 @@ class ClientPredictionFirstBoundaryTest {
             var anchoredState = new CardinalPredictionStep.State(preAnchor.placement(), ZERO, preAnchor.contacts().orElseThrow(), 0);
             assertEquals(advance(advance(anchoredState)), owner.state());
             assertSame(preAnchor, owner.authority());
-            assertTrue(new ClientCardinalPredictionOwner.Mutation(actor, owner.predictedSnapshot(), owner::active).apply());
+            assertTrue(new PlayerPhysicsClientMirror.Mutation(actor, owner.predictedSnapshot(), owner::active).apply());
             assertTrue(actor.posZ > preAnchor.placement().transport().z());
             var firstBoundary = new PlayerPhysicsProtocol.PredictionBoundary(epoch, 1, 0, 1, 92, 10, 32, 10, 0,
                     PlayerPhysicsProtocol.JumpDecision.none(), PlayerPhysicsProtocol.StepOutcome.APPLIED);

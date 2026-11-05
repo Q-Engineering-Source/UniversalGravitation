@@ -43,6 +43,7 @@ import wi.unigrav.core.BodyPhysics;
 import wi.unigrav.core.GravityEntityBinder;
 import wi.unigrav.core.GravityMode;
 import wi.unigrav.core.boost.BoostMovementBudget;
+import wi.unigrav.core.boost.MotionSpeedLimit;
 import wi.unigrav.core.boost.RemoteBoostBoundedDispatcher;
 import wi.unigrav.core.boost.RemoteBoostServer;
 import wi.unigrav.core.floor.MagneticResponseRules;
@@ -3524,10 +3525,7 @@ public final class PlayerPhysicsServer {
                                   GIntentObservation negotiated) { }
 
     private static double ordinaryCeiling() {
-        double configured = UnigravConfig.maxEntitySpeed;
-        if (!Double.isFinite(configured) || configured < 0)
-            throw new IllegalArgumentException("Invalid max_entity_speed");
-        return configured == 0 ? 500 : Math.min(configured, 500);
+        return MotionSpeedLimit.ordinaryCeiling(UnigravConfig.maxEntitySpeed);
     }
 
     private static boolean nativeNoGravity(EntityPlayerMP player, boolean observed) {
@@ -3874,7 +3872,7 @@ public final class PlayerPhysicsServer {
         boolean restoreHandoff = owner != null && owner.recoveryRestoreActive && offer.handoffSession() == session
                 && offer.handoffOwner() == owner;
         boolean recovery = handshake || restoreState || restoreHandoff;
-        if (!recovery) { outbound.accept(offer.player(), offer.packet()); return true; }
+        if (!recovery) { outbound.accept(offer.player(), positionPacket(offer.player(), offer.packet())); return true; }
         synchronized (this) {
             if (!current(session) || session.owner != owner || owner.recoveryTerminal
                     || handshake && owner.recoveryPacket != offer.packet()) return false;
@@ -3890,7 +3888,7 @@ public final class PlayerPhysicsServer {
             }
         }
         try {
-            outbound.accept(offer.player(), offer.packet());
+            outbound.accept(offer.player(), positionPacket(offer.player(), offer.packet()));
             synchronized (this) {
                 if (current(session) && session.owner == owner && owner.recoveryPacket == offer.packet()
                         && offer.packet().kind() == PlayerPhysicsProtocol.Kind.OWNED) owner.recoveryOwnedSent = true;
@@ -3989,7 +3987,7 @@ public final class PlayerPhysicsServer {
             transfer.lastAttemptTick = serverTick;
         }
         try {
-            outbound.accept(offer.player(), offer.packet());
+            outbound.accept(offer.player(), positionPacket(offer.player(), offer.packet()));
             return true;
         } catch (RuntimeException failure) {
             synchronized (this) {
@@ -5284,6 +5282,12 @@ public final class PlayerPhysicsServer {
             CardinalPredictionSeed seed, boolean initialOwned) {
         long revision = snapshot.revision();
         var context = predictionContext(session, owner);
+        if (!owner.nativeRestorePending && !owner.nativeRestoreAwaitingAcknowledgement && !owner.nativeDelegated) {
+            owner.predictionTimeline.retire();
+            return predictionPublication(new PredictionPublicationIdentity(context, snapshot,
+                    session.predictionGeneration, expectedOwnerSnapshot), new PlayerPhysicsProtocol.PredictionUnavailable(
+                    revision, PlayerPhysicsProtocol.PredictionUnavailableReason.INELIGIBLE), Optional.empty());
+        }
         var identity = new PredictionPublicationIdentity(context, snapshot, session.predictionGeneration,
                 expectedOwnerSnapshot);
         boolean stable = predictionStable(session, owner, snapshot, expectedOwnerSnapshot,
@@ -5329,6 +5333,113 @@ public final class PlayerPhysicsServer {
             return predictionPublication(identity, new PlayerPhysicsProtocol.PredictionUnavailable(revision,
                     PlayerPhysicsProtocol.PredictionUnavailableReason.INELIGIBLE), Optional.empty());
         return predictionPublication(identity, phase, phase instanceof PlayerPhysicsProtocol.Anchored ? boundary : Optional.empty());
+    }
+
+    private synchronized PlayerPhysicsProtocol.Packet positionPacket(EntityPlayerMP actor,
+            PlayerPhysicsProtocol.Packet packet) {
+        var session = actor.connection == null ? null : sessions.get(actor.connection.netManager);
+        if (session == null || session.player != actor || session.owner == null
+                || !session.scope.equals(packet.scope()) || session.proposal != packet.offerSequence()) return packet;
+        var owner = session.owner;
+        if (packet.kind() == PlayerPhysicsProtocol.Kind.OWNED && owner.positionCorrectionId < 0) {
+            var initial = packet.snapshot().orElseThrow();
+            owner.positionCorrectionId = initial.revision();
+            owner.positionInitialEndpoint = initial.placement();
+        }
+        if (packet.kind() != PlayerPhysicsProtocol.Kind.STATE) return packet;
+        if (packet.nativeTeleportId().isPresent() || packet.nativeTransfer().isPresent() || owner.nativeDelegated
+                || owner.nativeRestorePending || owner.nativeRestoreAwaitingAcknowledgement || recoveryFenced(owner)) {
+            // Native transfers retain their real installation/acknowledgement protocol. Their
+            // installed revision becomes the next result base; stale pre-transfer moves cannot apply.
+            var nativeState = packet.snapshot().orElseThrow();
+            owner.positionCorrectionId = nativeState.revision();
+            owner.positionInitialEndpoint = nativeState.placement();
+            owner.lastPosition = owner.pendingPosition = null;
+            owner.positionCorrectionOutstanding = owner.positionNeedsCorrection = false;
+            owner.positionAcceptedWorldTick = actor.world.getTotalWorldTime();
+            return packet;
+        }
+        var snapshot = packet.snapshot().orElseThrow();
+        if (owner.positionCorrectionId < 0) owner.positionCorrectionId = snapshot.revision();
+        var expectedEndpoint = owner.lastPosition == null ? owner.positionInitialEndpoint
+                : owner.lastPosition.snapshot().orElseThrow().placement();
+        if (expectedEndpoint != null || owner.positionNeedsCorrection) {
+            var expected = expectedEndpoint == null ? snapshot.placement() : expectedEndpoint;
+            var actual = snapshot.placement();
+            boolean conflict = owner.positionNeedsCorrection || !expected.shape().equals(actual.shape())
+                    || !expected.attitude().equals(actual.attitude())
+                    || !samePosition(expected.center(), actual.center());
+            if (!conflict && owner.lastPosition != null
+                    && owner.lastPosition.snapshot().orElseThrow().revision() == owner.positionCorrectionId) {
+                owner.positionCorrectionOutstanding = false;
+                owner.positionAcceptedWorldTick = actor.world.getTotalWorldTime();
+            }
+            if (conflict && !owner.positionCorrectionOutstanding) {
+                owner.positionCorrectionId = Math.incrementExact(owner.positionCorrectionId);
+                owner.positionCorrectionOutstanding = true;
+            }
+        }
+        owner.positionNeedsCorrection = false;
+        var feedback = new PlayerPhysicsProtocol.PositionFeedback(owner.positionCorrectionId,
+                owner.lastPosition == null ? 0 : owner.lastPosition.sequence(), owner.positionCorrectionOutstanding,
+                owner.travel.positionAcceleration, owner.travel.positionNativeGravity,
+                owner.travel.positionPersonalZeroG, owner.travel.positionBindingActive,
+                owner.travel.positionStandingReference, owner.budget.ceilingMps());
+        return new PlayerPhysicsProtocol.Packet(PlayerPhysicsProtocol.Kind.MOTION, packet.scope(), packet.sequence(),
+                packet.offerSequence(), Optional.empty(), packet.snapshot(), Optional.empty(), OptionalInt.empty(),
+                packet.bodyReferenceReceipt(), Optional.empty(), packet.bodyReferenceState(), Optional.empty(),
+                Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), packet.mobilityState(),
+                Optional.empty(), Optional.of(feedback));
+    }
+
+    private static boolean samePosition(Vec3d a, Vec3d b) {
+        return closePositionCoordinate(a.x(), b.x()) && closePositionCoordinate(a.y(), b.y())
+                && closePositionCoordinate(a.z(), b.z());
+    }
+    private static boolean closePositionCoordinate(double a, double b) {
+        // Binary64 construction tolerance only; this does not permit penetration or bypass collision checks.
+        return Math.abs(a - b) <= Math.max(1e-7, 8 * Math.max(Math.ulp(a), Math.ulp(b)));
+    }
+
+    private void admitPositionResult(Session session, Owned owner, PlayerPhysicalSnapshot before,
+            PlayerPhysicsProtocol.Controls controls, long worldTick) {
+        var packet = owner.pendingPosition;
+        owner.pendingPosition = null;
+        if (packet == null) return;
+        var submitted = packet.snapshot().orElseThrow();
+        if (owner.positionCorrectionId < 0) owner.positionCorrectionId = before.revision();
+        if (submitted.revision() != owner.positionCorrectionId) {
+            owner.positionNeedsCorrection = true;
+            return;
+        }
+        // Only the bounded recent server interval contributes movement allowance. Idling
+        // cannot accumulate arbitrary future teleport credit, and reported velocity grants none.
+        long elapsed = owner.positionAcceptedWorldTick == Long.MIN_VALUE ? 1
+                : Math.min(INPUT_TIMEOUT_TICKS, Math.max(1, worldTick - owner.positionAcceptedWorldTick));
+        double allowance = owner.budget.ceilingMps() * GravityEntityBinder.TICK_SECONDS * elapsed;
+        var result = PlayerPositionValidation.validate(session.player, before, submitted, controls, allowance);
+        if (!current(session) || session.owner != owner || owner.snapshot != before) return;
+        owner.lastPosition = packet;
+        if (result instanceof PlayerPositionValidation.Rejected rejected) {
+            owner.positionNeedsCorrection = true;
+            UnigravMod.LOGGER.info("ug-position-rejected scope={} submission={} reason={} detail={}",
+                    before.scope(), packet.sequence(), rejected.reason(), rejected.detail());
+            rejected.cause().ifPresent(cause -> UnigravMod.LOGGER.error("UG position validation failed", cause));
+            return;
+        }
+        var velocity = submitted.worldVelocity();
+        double speed = Math.hypot(Math.hypot(velocity.x(), velocity.y()), velocity.z());
+        if (!Double.isFinite(speed) || speed > owner.budget.ceilingMps()) {
+            owner.positionNeedsCorrection = true;
+            UnigravMod.LOGGER.info("ug-position-rejected scope={} submission={} reason=VELOCITY speed={} ceiling={}",
+                    before.scope(), packet.sequence(), speed, owner.budget.ceilingMps());
+            return;
+        }
+        // Correction acknowledgement is deferred until the committed endpoint is observed
+        // by positionPacket. A valid proposal is not proof that native installation succeeded.
+        owner.travel.positionAllowance = allowance;
+        owner.travel.submittedPosition = submitted;
+        owner.travel.positionVelocity = velocity;
     }
 
     private void advanceOwned(Session session, ArrayList<Offer> outboundStates) {
@@ -5456,6 +5567,11 @@ public final class PlayerPhysicsServer {
             return;
         }
         var before = owner.snapshot;
+        owner.travel.positionDriven = !owner.nativeRestorePending && !owner.nativeRestoreAwaitingAcknowledgement;
+        owner.travel.submittedPosition = null;
+        owner.travel.positionAllowance = 0;
+        owner.travel.positionVelocity = before.worldVelocity();
+        if (owner.travel.positionDriven) admitPositionResult(session, owner, before, stepControls, worldTick);
         boolean inputPoseCommitted = before != prePose;
         boolean freshInput = owner.inputWorldTick != Long.MIN_VALUE
                 && worldTick >= owner.inputWorldTick && worldTick - owner.inputWorldTick <= INPUT_TIMEOUT_TICKS;
@@ -6926,14 +7042,14 @@ public final class PlayerPhysicsServer {
                 return true;
             }
             if (recovering.recoveryAwaitingMirror) {
-                if (packet.kind() != PlayerPhysicsProtocol.Kind.INPUT || !recovering.recoveryOwnedSent) return false;
+                if (packet.kind() != PlayerPhysicsProtocol.Kind.INPUT && packet.kind() != PlayerPhysicsProtocol.Kind.MOVE || !recovering.recoveryOwnedSent) return false;
                 recovering.recoveryAwaitingMirror = false;
                 recovering.nativeEnvironmentFailure = null;
                 recovering.recoveryPacket = null;
                 if (recovering.nativeRestoreAwaitingAcknowledgement)
                     recovering.lastRestoreStateWorldTick = Long.MIN_VALUE;
             }
-            if (packet.kind() != PlayerPhysicsProtocol.Kind.INPUT) return false;
+            if (packet.kind() != PlayerPhysicsProtocol.Kind.INPUT && packet.kind() != PlayerPhysicsProtocol.Kind.MOVE) return false;
             if (session.owner != null && session.owner.nativeTransfer != null
                     && !session.owner.nativeTransfer.released) return false;
             Owned timingOwner = session.owner;
@@ -6943,34 +7059,8 @@ public final class PlayerPhysicsServer {
                 if (!timingOwner.travel.mobility().accept(mobilityInput.request().orElseThrow(), eligible))
                     timingOwner.lastStateTick = Long.MIN_VALUE;
             }
-            suspendChangedPredictionReference(session, timingOwner);
-            boolean predictionAccepted=false;
-            if (packet.predictionRequest().isPresent()) {
-                timingOwner.predictionTimeline.request(predictionContext(session,timingOwner),packet.predictionRequest().orElseThrow());
-            }
-            if (packet.predictionInput().isEmpty()) {
-                // In-flight ordinary INPUT predates the client learning this bootstrap. No prediction slot completed.
-                if (!timingOwner.predictionTimeline.awaitingMetadata() && !timingOwner.predictionTimeline.suspended()
-                        && !timingOwner.predictionTimeline.active()) timingOwner.predictionTimeline.retire();
-            } else if (timingOwner.predictionTimeline.suspended()) {
-                // An old prediction slot cannot revoke a current typed pause or its ordinary controls.
-            } else if (!packet.predictionInput().orElseThrow().bootstrap().equals(timingOwner.predictionTimeline.bootstrap())) {
-                // Stale prediction metadata does not revoke this owner's newer timeline or its ordinary controls.
-            } else if (!predictionStable(session, timingOwner, packet.controls().orElseThrow())) {
-                timingOwner.predictionTimeline.retire();
-            } else {
-                if (timingOwner.predictionTimeline.active() && !predictionFrameCurrent(timingOwner))
-                    timingOwner.predictionTimeline.retire();
-                // Metadata is optional prediction authority, never authority to discard valid current controls.
-                predictionAccepted=timingOwner.predictionTimeline.accept(predictionContext(session, timingOwner), packet,
-                        session.world.getTotalWorldTime());
-                if (timingOwner.predictionShape == null || timingOwner.predictionCheckpoint == null
-                        || !predictionFrameCurrent(timingOwner)) {
-                    timingOwner.predictionShape = timingOwner.snapshot.placement().shape();
-                    timingOwner.predictionAttitude = timingOwner.snapshot.placement().attitude();
-                    timingOwner.predictionReference = timingOwner.travel.cardinalReference();
-                }
-            }
+            boolean predictionAccepted = false;
+            if (packet.kind() == PlayerPhysicsProtocol.Kind.MOVE) timingOwner.pendingPosition = packet;
             session.lastIncomingSequence = packet.sequence();
             Owned owner = session.owner;
             invalidateAttitudeRequest(owner);
@@ -7499,7 +7589,7 @@ public final class PlayerPhysicsServer {
             control.lastAttemptTick = serverTick;
         }
         try {
-            outbound.accept(offer.player(), offer.packet());
+            outbound.accept(offer.player(), positionPacket(offer.player(), offer.packet()));
             return true;
         } catch (RuntimeException failure) {
             synchronized (this) {
@@ -7833,6 +7923,13 @@ public final class PlayerPhysicsServer {
     }
 
     private static final class Owned {
+        private PlayerPhysicsProtocol.Packet pendingPosition;
+        private PlayerPhysicsProtocol.Packet lastPosition;
+        private PlayerBodyPlacement positionInitialEndpoint;
+        private long positionCorrectionId = -1;
+        private boolean positionCorrectionOutstanding;
+        private boolean positionNeedsCorrection;
+        private long positionAcceptedWorldTick = Long.MIN_VALUE;
         private InputPoseCommit inputPose;
         private NativeCardinalMotionReceipt nativeCardinalMotion;
         private long nativeCardinalMotionGeneration;

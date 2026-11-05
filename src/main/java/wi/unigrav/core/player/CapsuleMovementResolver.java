@@ -106,7 +106,7 @@ final class CapsuleMovementResolver {
     /** A real limiting sweep query tied to its segment, exact near-gap support, and shared numeric work. */
     static final class SweepFacet {
         enum Kind { SAFE_GAP_SWEEP, ACTUAL_TOUCH }
-        private final FreeOwnerTransaction transaction;
+        private final CapsuleMovementContext transaction;
         private final Segment segment;
         private final Query limiter;
         private final Kind kind;
@@ -124,10 +124,10 @@ final class CapsuleMovementResolver {
         private final double bracketUpper;
         private final double sourceScale;
         private volatile ImmutableGeometryReceipt immutableGeometryReceipt;
-        private record ImmutableGeometryReceipt(FreeOwnerTransaction transaction, StoredDyadic.Work work,
+        private record ImmutableGeometryReceipt(CapsuleMovementContext transaction, StoredDyadic.Work work,
                 List<Segment> segments, List<Query> queries, List<ClipEvent> clipEvents,
                 CapsulePlacementMath.Pose finalPose) {
-            private boolean matches(SweepFacet facet, FreeOwnerTransaction exactTransaction,
+            private boolean matches(SweepFacet facet, CapsuleMovementContext exactTransaction,
                     List<Segment> exactSegments, List<Query> exactQueries,
                     List<ClipEvent> exactClipEvents, CapsulePlacementMath.Pose exactFinalPose) {
                 return transaction == exactTransaction && transaction == facet.transaction
@@ -140,7 +140,7 @@ final class CapsuleMovementResolver {
                                 || exactClipEvents.stream().anyMatch(value -> value == facet.touchEvent));
             }
         }
-        private SweepFacet(FreeOwnerTransaction transaction, Segment segment, Query limiter, Kind kind,
+        private SweepFacet(CapsuleMovementContext transaction, Segment segment, Query limiter, Kind kind,
                 FreeMovementExactGeometry.Arithmetic arithmetic, FreeMovementExactGeometry.Support support,
                 FreeMovementExactGeometry.Rational expansion,
                 FreeMovementExactGeometry.Vector originalDirection, ClipEvent touchEvent) {
@@ -148,7 +148,7 @@ final class CapsuleMovementResolver {
                     arithmetic.exact(0), arithmetic.exact(0), arithmetic.exact(0), 0, 0, 0, 1,
                     originalDirection, touchEvent);
         }
-        private SweepFacet(FreeOwnerTransaction transaction, Segment segment, Query limiter, Kind kind,
+        private SweepFacet(CapsuleMovementContext transaction, Segment segment, Query limiter, Kind kind,
                 FreeMovementExactGeometry.Arithmetic arithmetic, FreeMovementExactGeometry.Support sourceSupport,
                 FreeMovementExactGeometry.Support responseSupport, FreeMovementExactGeometry.Rational expansion,
                 FreeMovementExactGeometry.Rational radiusIncrement, FreeMovementExactGeometry.Rational cutDeviation,
@@ -169,7 +169,7 @@ final class CapsuleMovementResolver {
         FreeMovementExactGeometry.Support support() { return responseSupport; }
         FreeMovementExactGeometry.Arithmetic arithmetic() { return arithmetic; }
         FreeMovementExactGeometry.Rational expansion() { return expansion; }
-        Optional<SweepFacet> atFinalPose(FreeOwnerTransaction exactTransaction, CapsulePlacementMath.Pose finalPose) {
+        Optional<SweepFacet> atFinalPose(CapsuleMovementContext exactTransaction, CapsulePlacementMath.Pose finalPose) {
             if (transaction != exactTransaction) return Optional.empty();
             transaction.requireCurrent();
             var finalSupport = FreeMovementExactGeometry.support(arithmetic, limiter.ordinal(),
@@ -189,7 +189,7 @@ final class CapsuleMovementResolver {
                     exactFinal, expansion, radiusIncrement, cutDeviation, bracketTravel,
                     sourceFraction, bracketLower, bracketUpper, sourceScale, originalDirection, touchEvent));
         }
-        boolean matches(FreeOwnerTransaction exactTransaction, List<Segment> exactSegments,
+        boolean matches(CapsuleMovementContext exactTransaction, List<Segment> exactSegments,
                 List<Query> exactQueries, List<ClipEvent> exactClipEvents, CapsulePlacementMath.Pose finalPose) {
             ImmutableGeometryReceipt cached = immutableGeometryReceipt;
             if (cached != null && cached.matches(this, exactTransaction, exactSegments, exactQueries,
@@ -200,7 +200,7 @@ final class CapsuleMovementResolver {
                     exactSegments, exactQueries, exactClipEvents, finalPose);
             return true;
         }
-        private boolean matchesUncached(FreeOwnerTransaction exactTransaction, List<Segment> exactSegments,
+        private boolean matchesUncached(CapsuleMovementContext exactTransaction, List<Segment> exactSegments,
                 List<Query> exactQueries, List<ClipEvent> exactClipEvents, CapsulePlacementMath.Pose finalPose) {
             boolean identity = transaction == exactTransaction && exactSegments.stream().anyMatch(value -> value == segment)
                     && exactQueries.stream().anyMatch(value -> value == limiter)
@@ -347,12 +347,12 @@ final class CapsuleMovementResolver {
                    double fraction, double pathUpper, CapsulePlacementMath.Pose end) { }
     /** Exact one-coordinate support proof for one captured obstacle and one actual stored phase. */
     static final class SupportReceipt {
-        private final FreeOwnerTransaction transaction;
+        private final CapsuleMovementContext transaction;
         private final Segment segment;
         private final int ordinal;
         private final Aabb obstacle;
         private final FreeMovementExactGeometry.Support support;
-        private SupportReceipt(FreeOwnerTransaction transaction, Segment segment, int ordinal, Aabb obstacle,
+        private SupportReceipt(CapsuleMovementContext transaction, Segment segment, int ordinal, Aabb obstacle,
                                FreeMovementExactGeometry.Support support) {
             this.transaction = transaction; this.segment = segment; this.ordinal = ordinal;
             this.obstacle = obstacle; this.support = support;
@@ -361,7 +361,7 @@ final class CapsuleMovementResolver {
         int ordinal() { return ordinal; }
         Aabb obstacle() { return obstacle; }
         FreeMovementExactGeometry.Support support() { return support; }
-        boolean matches(FreeOwnerTransaction tx, Segment exactSegment, int exactOrdinal, Aabb exactObstacle) {
+        boolean matches(CapsuleMovementContext tx, Segment exactSegment, int exactOrdinal, Aabb exactObstacle) {
             return transaction == tx && segment == exactSegment && ordinal == exactOrdinal
                     && obstacle == exactObstacle && segment.capture().boxes().get(ordinal) == obstacle
                     && support.facet().ordinal() == ordinal && support.facet().obstacle() == obstacle;
@@ -370,7 +370,7 @@ final class CapsuleMovementResolver {
     /** Historical evidence minted only at an actual fraction-limiting resolver operation.
      * A separator alone is deliberately insufficient: a safe prefix can remain separated.
      * This receipt grants no installation or native callback authority. */
-    private record ActualEndpointTouchReceipt(FreeOwnerTransaction transaction, Segment segment, int ordinal,
+    private record ActualEndpointTouchReceipt(CapsuleMovementContext transaction, Segment segment, int ordinal,
             Aabb obstacle, WorldCollisionCandidates.Snapshot capture, Capsule endpointCapsule,
             Query limiter, Query observation, ContactResult contact) {
         private ActualEndpointTouchReceipt {
@@ -386,7 +386,7 @@ final class CapsuleMovementResolver {
                     || ordinal < 0 || ordinal >= capture.boxes().size() || capture.boxes().get(ordinal) != obstacle)
                 throw new IllegalArgumentException("endpoint-touch receipt is detached from its exact stored query");
         }
-        boolean matches(FreeOwnerTransaction exactTransaction, Segment exactSegment, Query exactLimiter,
+        boolean matches(CapsuleMovementContext exactTransaction, Segment exactSegment, Query exactLimiter,
                 Query exactObservation) {
             return transaction == exactTransaction && segment == exactSegment && observation == exactObservation
                     && limiter == exactLimiter
@@ -397,7 +397,7 @@ final class CapsuleMovementResolver {
         }
     }
     static final class ClipEvent {
-        private final FreeOwnerTransaction transaction;
+        private final CapsuleMovementContext transaction;
         private final Segment segment;
         private final Query limiting;
         private final CapsulePlacementMath.Translation stationaryEndpoint;
@@ -406,7 +406,7 @@ final class CapsuleMovementResolver {
         private final AxisFootProof footProof;
         private final ActualEndpointTouchReceipt endpointTouch;
         private record AxisFootProof(CapsuleFootContacts.QualifiedProducerFoot contact) { }
-        private ClipEvent(FreeOwnerTransaction transaction, Segment segment, Query limiting,
+        private ClipEvent(CapsuleMovementContext transaction, Segment segment, Query limiting,
                           CapsulePlacementMath.Translation stationaryEndpoint,
                           CapsuleTranslationPlaneProof.Certificate plane, StoredDyadic lostAxis,
                           AxisFootProof footProof, ActualEndpointTouchReceipt endpointTouch) {
@@ -450,7 +450,7 @@ final class CapsuleMovementResolver {
                     && endpointTouch.matches(transaction, segment, limiting, endpointTouch.observation());
             return originalPrefixTouch || queriedEndpointTouch;
         }
-        private static Optional<ClipEvent> observe(FreeOwnerTransaction tx, Segment segment, Query limiting,
+        private static Optional<ClipEvent> observe(CapsuleMovementContext tx, Segment segment, Query limiting,
                 Query endpointObservation) {
             tx.requireCurrent();
             var work = tx.numeric();
@@ -570,45 +570,45 @@ final class CapsuleMovementResolver {
         private final List<Plane> planes;
         private final List<SupportReceipt> supportReceipts;
         private final List<SweepFacet> sweepFacets;
-        private final FreeOwnerTransaction transaction;
+        private final CapsuleMovementContext transaction;
         private final List<Segment> segments;
         private final Set<Integer> blockedAxes;
         private final List<ClipEvent> clipEvents;
         private final CapsulePathSource source;
         private final double priorPathUpper;
         private final Optional<Stop> stop;
-        private Resolved(FreeOwnerTransaction transaction, CapsulePlacementMath.Pose end, double fraction,
+        private Resolved(CapsuleMovementContext transaction, CapsulePlacementMath.Pose end, double fraction,
                          List<Query> queries, List<Plane> planes, List<Segment> segments, Set<Integer> blockedAxes, List<ClipEvent> clipEvents) {
             this(transaction, end, fraction, queries, planes, List.of(), segments, blockedAxes, clipEvents, null, 0);
         }
-        private Resolved(FreeOwnerTransaction transaction, CapsulePlacementMath.Pose end, double fraction,
+        private Resolved(CapsuleMovementContext transaction, CapsulePlacementMath.Pose end, double fraction,
                          List<Query> queries, List<Plane> planes, List<Segment> segments, Set<Integer> blockedAxes,
                          List<ClipEvent> clipEvents, CapsulePathSource source, double priorPathUpper) {
             this(transaction, end, fraction, queries, planes, List.of(), segments, blockedAxes, clipEvents, source,
                     priorPathUpper, Optional.empty());
         }
-        private Resolved(FreeOwnerTransaction transaction, CapsulePlacementMath.Pose end, double fraction,
+        private Resolved(CapsuleMovementContext transaction, CapsulePlacementMath.Pose end, double fraction,
                          List<Query> queries, List<Plane> planes, List<SupportReceipt> supportReceipts,
                          List<Segment> segments, Set<Integer> blockedAxes, List<ClipEvent> clipEvents,
                          CapsulePathSource source, double priorPathUpper) {
             this(transaction, end, fraction, queries, planes, supportReceipts, segments, blockedAxes, clipEvents,
                     source, priorPathUpper, Optional.empty());
         }
-        private Resolved(FreeOwnerTransaction transaction, CapsulePlacementMath.Pose end, double fraction,
+        private Resolved(CapsuleMovementContext transaction, CapsulePlacementMath.Pose end, double fraction,
                          List<Query> queries, List<Plane> planes, List<Segment> segments, Set<Integer> blockedAxes,
                          List<ClipEvent> clipEvents, CapsulePathSource source, double priorPathUpper,
                          Optional<Stop> stop) {
             this(transaction, end, fraction, queries, planes, List.of(), segments, blockedAxes, clipEvents,
                     source, priorPathUpper, stop);
         }
-        private Resolved(FreeOwnerTransaction transaction, CapsulePlacementMath.Pose end, double fraction,
+        private Resolved(CapsuleMovementContext transaction, CapsulePlacementMath.Pose end, double fraction,
                          List<Query> queries, List<Plane> planes, List<SupportReceipt> supportReceipts,
                          List<Segment> segments, Set<Integer> blockedAxes, List<ClipEvent> clipEvents,
                          CapsulePathSource source, double priorPathUpper, Optional<Stop> stop) {
             this(transaction, end, fraction, queries, planes, supportReceipts, segments, blockedAxes, clipEvents,
                     source, priorPathUpper, stop, List.of());
         }
-        private Resolved(FreeOwnerTransaction transaction, CapsulePlacementMath.Pose end, double fraction,
+        private Resolved(CapsuleMovementContext transaction, CapsulePlacementMath.Pose end, double fraction,
                          List<Query> queries, List<Plane> planes, List<SupportReceipt> supportReceipts,
                          List<Segment> segments, Set<Integer> blockedAxes, List<ClipEvent> clipEvents,
                          CapsulePathSource source, double priorPathUpper, Optional<Stop> stop,
@@ -637,7 +637,7 @@ final class CapsuleMovementResolver {
         CapsulePathSource source() { return source; }
         Optional<Stop> stop() { return stop; }
         Vec3d requestedDelta() { return segments.getFirst().tube().delta(); }
-        boolean belongsTo(FreeOwnerTransaction exact) { return transaction == exact; }
+        boolean belongsTo(CapsuleMovementContext exact) { return transaction == exact; }
         static final class InstalledEvidence {
             private final Resolved movement;
             private final FreeOwnerTransaction transaction;
@@ -872,10 +872,10 @@ final class CapsuleMovementResolver {
             }
             return total;
         }
-        boolean matches(FreeOwnerTransaction exactTransaction) {
+        boolean matches(CapsuleMovementContext exactTransaction) {
             return matches(exactTransaction, false);
         }
-        private boolean matches(FreeOwnerTransaction exactTransaction, boolean predecessorValidated) {
+        private boolean matches(CapsuleMovementContext exactTransaction, boolean predecessorValidated) {
             if (transaction != exactTransaction) return false;
             transaction.requireCurrent();
             if (segments.isEmpty() || segments.size() > MAX_SEGMENTS) return false;
@@ -960,12 +960,10 @@ final class CapsuleMovementResolver {
             if (source != null && !source.current()) return false;
             return true;
         }
-        Optional<WorldCollisionCandidates.Unavailable> recaptureFailure(FreeOwnerTransaction exactTransaction) {
+        Optional<WorldCollisionCandidates.Unavailable> recaptureFailure(CapsuleMovementContext exactTransaction) {
             if (!matches(exactTransaction)) return Optional.of(changed("movement certificate context changed"));
             for (Segment segment : segments) {
-                var observed = WorldCollisionCandidates.capture(transaction,
-                        segment.capture().footprint().requestedBounds(), CollisionQueryFootprint.QueryPolicy.CAPSULE_CONTACT,
-                        new CollisionQueryFootprint.Limits(16384, 16, 4096, 4096));
+                var observed = transaction.capture(segment.capture().footprint().requestedBounds());
                 transaction.requireCurrent();
                 if (observed instanceof WorldCollisionCandidates.Unavailable unavailable) return Optional.of(unavailable);
                 if (!segment.capture().sameObservation((WorldCollisionCandidates.Snapshot) observed))
@@ -1014,13 +1012,13 @@ final class CapsuleMovementResolver {
     private CapsuleMovementResolver() { }
 
     /** At most three axis removals; each actual segment is certified afresh against every candidate. */
-    static Result resolveWithSlide(FreeOwnerTransaction transaction, CapsulePlacementMath.Translation tube,
+    static Result resolveWithSlide(CapsuleMovementContext transaction, CapsulePlacementMath.Translation tube,
                                   WorldCollisionCandidates.Snapshot capture) {
         return resolveWithSlide(transaction, tube, capture, null, 0, Double.POSITIVE_INFINITY);
     }
 
     /** Continuation retains the original actual owner and the certified arc/resize source. */
-    static Result resolveContinuationWithSlide(FreeOwnerTransaction transaction, CapsulePathSource source,
+    static Result resolveContinuationWithSlide(CapsuleMovementContext transaction, CapsulePathSource source,
             CapsulePlacementMath.Translation tube, WorldCollisionCandidates.Snapshot capture, double priorPathUpper) {
         Objects.requireNonNull(source);
         transaction.requireCurrent();
@@ -1034,7 +1032,7 @@ final class CapsuleMovementResolver {
 
     /** The movement prefix cannot borrow the conversion's separately reserved correction path.
      * Residual segments retain this exact capture and its original owner context. */
-    static Result resolveContinuationWithSlide(FreeOwnerTransaction transaction, CapsulePathSource source,
+    static Result resolveContinuationWithSlide(CapsuleMovementContext transaction, CapsulePathSource source,
             CapsulePlacementMath.Translation tube, WorldCollisionCandidates.Snapshot capture,
             double priorPathUpper, double movementAllowance) {
         Objects.requireNonNull(source, "source");
@@ -1049,7 +1047,7 @@ final class CapsuleMovementResolver {
     }
 
     /** Only a certified contained-Cardinal root can authorize this mode-conversion continuation. */
-    static Result resolveContainedCardinalContinuation(FreeOwnerTransaction transaction, CapsulePathSource source,
+    static Result resolveContainedCardinalContinuation(CapsuleMovementContext transaction, CapsulePathSource source,
             CapsulePlacementMath.Translation tube, WorldCollisionCandidates.Snapshot capture,
             double priorPathUpper, double movementAllowance) {
         Objects.requireNonNull(source, "source");
@@ -1063,7 +1061,7 @@ final class CapsuleMovementResolver {
         return resolveWithSlide(transaction, tube, capture, source, priorPathUpper, movementAllowance);
     }
 
-    private static Result resolveWithSlide(FreeOwnerTransaction transaction, CapsulePlacementMath.Translation tube,
+    private static Result resolveWithSlide(CapsuleMovementContext transaction, CapsulePlacementMath.Translation tube,
             WorldCollisionCandidates.Snapshot capture, CapsulePathSource source, double priorPathUpper,
             double movementAllowance) {
         transaction.requireReservedPath(totalPath(priorPathUpper, tube.requestedDisplacementUpper(), transaction.numeric()));
@@ -1288,7 +1286,7 @@ final class CapsuleMovementResolver {
                 && arithmetic.compare(first.z(), second.z()) == 0;
     }
 
-    private static FacetScan sweepFacets(FreeOwnerTransaction transaction, Segment segment,
+    private static FacetScan sweepFacets(CapsuleMovementContext transaction, Segment segment,
             List<Query> observations, List<ClipEvent> clipEvents, Resolved exactMovement) {
         var arithmetic = new FreeMovementExactGeometry.Arithmetic(transaction.numeric(), transaction::requireCurrent);
         var result = new ArrayList<SweepFacet>();
@@ -1369,7 +1367,7 @@ final class CapsuleMovementResolver {
         return new FacetScan(result, Optional.empty());
     }
 
-    private static List<SweepFacet> activeFacetsAt(FreeOwnerTransaction transaction,
+    private static List<SweepFacet> activeFacetsAt(CapsuleMovementContext transaction,
             CapsulePlacementMath.Pose finalPose, List<SweepFacet> candidates) {
         var active = new ArrayList<SweepFacet>(candidates.size());
         for (SweepFacet facet : candidates) {
@@ -1474,7 +1472,7 @@ final class CapsuleMovementResolver {
         values.add(new ScoredCandidate(candidate, error));
     }
 
-    private static PlannedRoute planAxisRoute(FreeOwnerTransaction transaction, CapsulePlacementMath.Pose start,
+    private static PlannedRoute planAxisRoute(CapsuleMovementContext transaction, CapsulePlacementMath.Pose start,
             Vec3d requested, WorldCollisionCandidates.Snapshot capture,
             FreeMovementExactGeometry.Arithmetic arithmetic, FreeMovementExactGeometry.Vector idealTarget,
             double priorPathUpper, double alreadyUsedPath, double movementAllowance,
@@ -1493,7 +1491,7 @@ final class CapsuleMovementResolver {
         return null;
     }
 
-    private static PlannedRoute planAxisOrder(FreeOwnerTransaction transaction, CapsulePlacementMath.Pose start,
+    private static PlannedRoute planAxisOrder(CapsuleMovementContext transaction, CapsulePlacementMath.Pose start,
             Vec3d requested, WorldCollisionCandidates.Snapshot capture,
             FreeMovementExactGeometry.Arithmetic arithmetic, FreeMovementExactGeometry.Vector idealTarget,
             List<Integer> axes, double priorPathUpper,
@@ -1558,7 +1556,7 @@ final class CapsuleMovementResolver {
         }
     }
 
-    private static boolean phaseHasSupportProof(FreeOwnerTransaction transaction,
+    private static boolean phaseHasSupportProof(CapsuleMovementContext transaction,
             CapsulePlacementMath.Translation tube, CapsulePlacementMath.Pose end,
             WorldCollisionCandidates.Snapshot capture) {
         if (!contains(capture.footprint().requestedBounds(), window(transaction.accepted(), tube))
@@ -1601,7 +1599,7 @@ final class CapsuleMovementResolver {
     }
 
     /** CHB's installed receipt may be at any certified point at or before the prefix lower bound. */
-    private static boolean installationMatchesSource(FreeOwnerTransaction transaction, Query query,
+    private static boolean installationMatchesSource(CapsuleMovementContext transaction, Query query,
             InstalledPoseReceipt installed, double sourceLower) {
         double installedFraction = installed.fraction();
         if (!Double.isFinite(installedFraction) || installedFraction < 0 || installedFraction > sourceLower)
@@ -1621,7 +1619,7 @@ final class CapsuleMovementResolver {
                         installedPose.capsule().centerline().end());
     }
 
-    private static boolean boundaryCoversSegment(FreeOwnerTransaction transaction, Query query,
+    private static boolean boundaryCoversSegment(CapsuleMovementContext transaction, Query query,
             WorldCollisionCandidates.Snapshot capture, CapsulePlacementMath.Translation tube,
             double sourceFraction, int ordinal, Aabb obstacle) {
         if (query.tube() != tube || query.capture() != capture || query.ordinal() != ordinal
@@ -1661,7 +1659,7 @@ final class CapsuleMovementResolver {
                 && Double.doubleToRawLongBits(prefix.endFraction()) == Double.doubleToRawLongBits(1.0);
     }
 
-    private static Result stopAtResolvedPrefix(FreeOwnerTransaction transaction, Resolved current,
+    private static Result stopAtResolvedPrefix(CapsuleMovementContext transaction, Resolved current,
             List<Query> queries, List<Plane> planes, List<Segment> segments, List<SupportReceipt> supportReceipts,
             Set<Integer> blockedAxes,
             List<ClipEvent> clipEvents, CapsulePathSource source, double priorPathUpper,
@@ -1670,7 +1668,7 @@ final class CapsuleMovementResolver {
                 clipEvents, source, priorPathUpper, movementAllowance, reason, limitingQuery, List.of());
     }
 
-    private static Result stopAtResolvedPrefix(FreeOwnerTransaction transaction, Resolved current,
+    private static Result stopAtResolvedPrefix(CapsuleMovementContext transaction, Resolved current,
             List<Query> queries, List<Plane> planes, List<Segment> segments, List<SupportReceipt> supportReceipts,
             Set<Integer> blockedAxes, List<ClipEvent> clipEvents, CapsulePathSource source, double priorPathUpper,
             double movementAllowance, String reason, Query limitingQuery, List<SweepFacet> responseFacets) {
@@ -1692,7 +1690,7 @@ final class CapsuleMovementResolver {
         return prefix;
     }
 
-    static Result resolve(FreeOwnerTransaction transaction, CapsulePlacementMath.Translation tube,
+    static Result resolve(CapsuleMovementContext transaction, CapsulePlacementMath.Translation tube,
                           WorldCollisionCandidates.Snapshot capture) {
         Objects.requireNonNull(transaction); Objects.requireNonNull(tube); Objects.requireNonNull(capture);
         if (tube.start().placement() != transaction.accepted().placement())
@@ -1700,7 +1698,7 @@ final class CapsuleMovementResolver {
         return resolveSegment(transaction, tube, capture);
     }
 
-    private static Result resolveSegment(FreeOwnerTransaction transaction, CapsulePlacementMath.Translation tube,
+    private static Result resolveSegment(CapsuleMovementContext transaction, CapsulePlacementMath.Translation tube,
                                         WorldCollisionCandidates.Snapshot capture) {
         transaction.requireCurrent();
         transaction.requireReservedPath(tube.requestedDisplacementUpper());
@@ -1885,7 +1883,7 @@ final class CapsuleMovementResolver {
     }
 
     private static Optional<FreeMovementExactGeometry.Support> monotoneSupport(
-            FreeOwnerTransaction transaction, CapsulePlacementMath.Translation tube, int ordinal,
+            CapsuleMovementContext transaction, CapsulePlacementMath.Translation tube, int ordinal,
             Aabb obstacle, CapsulePlacementMath.Pose storedEnd) {
         Vec3d delta = tube.delta();
         int changingAxes = (delta.x() == 0 ? 0 : 1) + (delta.y() == 0 ? 0 : 1) + (delta.z() == 0 ? 0 : 1);
@@ -1907,7 +1905,7 @@ final class CapsuleMovementResolver {
     }
 
     /** Full actual-shape source-prefix proof for a finite cut; only separate real-touch receipts create events. */
-    private static Result resolveOriginalPrefixCandidate(FreeOwnerTransaction tx, CapsulePlacementMath.Translation tube,
+    private static Result resolveOriginalPrefixCandidate(CapsuleMovementContext tx, CapsulePlacementMath.Translation tube,
             WorldCollisionCandidates.Snapshot capture, List<Query> limiting, List<Query> history, List<Plane> planes,
             double maximumFraction) {
         var candidates = new LinkedHashSet<Double>();
@@ -2045,7 +2043,7 @@ final class CapsuleMovementResolver {
                 Math.max(actual.max().y(), swept.max().y()), Math.max(actual.max().z(), swept.max().z())));
     }
 
-    private static BoundaryResult query(FreeOwnerTransaction transaction, CapsulePlacementMath.Translation tube,
+    private static BoundaryResult query(CapsuleMovementContext transaction, CapsulePlacementMath.Translation tube,
             CapsulePlacementMath.Pose end, double fraction, Aabb box) {
         // CHB checks exact radius identity. Its installed receipt refers to the padded capsule;
         // atPrefix independently encloses the actual stored geometry, which is queried afterwards.

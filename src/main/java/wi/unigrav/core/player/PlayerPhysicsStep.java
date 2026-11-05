@@ -149,6 +149,27 @@ public final class PlayerPhysicsStep {
             equipmentFlight = parameters;
         }
         private int jumpTicks;
+        // Client result validation supplies displacement; normal server ticks do not integrate it again.
+        boolean positionDriven;
+        PlayerPhysicalSnapshot submittedPosition;
+        double positionAllowance;
+        Vec3d positionVelocity;
+        Vec3d positionAcceleration = new Vec3d(0, 0, 0);
+        boolean positionNativeGravity;
+        boolean positionPersonalZeroG;
+        boolean positionBindingActive, positionStandingReference;
+
+        Vec3d positionDelta(PlayerPhysicalSnapshot source) {
+            if (!positionDriven) throw new IllegalStateException("Not a client-position movement");
+            if (submittedPosition == null || !submittedPosition.placement().shape().equals(source.placement().shape()))
+                return new Vec3d(0, 0, 0);
+            return submittedPosition.placement().center().subtract(source.placement().center());
+        }
+        void positionEnvironment(Vec3 acceleration, boolean nativeGravity, boolean personalZeroG) {
+            positionAcceleration = new Vec3d(acceleration.x(), acceleration.y(), acceleration.z());
+            positionNativeGravity = nativeGravity;
+            positionPersonalZeroG = personalZeroG;
+        }
         private long nativeOverlapDiagnosticTick = Long.MIN_VALUE;
         private final PlayerMobilityIntent.Owner mobility = new PlayerMobilityIntent.Owner();
         private PlayerMobilityIntent.HoverStatus hoverStatus = PlayerMobilityIntent.HoverStatus.OFF;
@@ -533,22 +554,26 @@ public final class PlayerPhysicsStep {
         boolean nativeGravity = !sample.personalZeroG() && !travel.nativeNoGravity
                 && sample.bindingMode().filter(mode -> mode == GravityMode.REPLACE).isEmpty() && !flying;
         Vec3 acceleration = travel.mobility.blocksCapture() ? sample.detachedAcceleration() : sample.environmentAcceleration();
+        travel.positionEnvironment(acceleration, !sample.personalZeroG() && !travel.nativeNoGravity
+                && sample.bindingMode().filter(mode -> mode == GravityMode.REPLACE).isEmpty(), sample.personalZeroG());
+        travel.positionBindingActive = sample.bindingActive();
+        travel.positionStandingReference = false;
         if (nativeGravity) acceleration = acceleration.add(new Vec3(0, water ? -8 : -32, 0));
         Vec3d acceptedVelocity = accepted.worldVelocity();
         Vec3 velocity = new Vec3(acceptedVelocity.x(), acceptedVelocity.y(), acceptedVelocity.z());
         double dt = GravityEntityBinder.TICK_SECONDS;
         sample.observation().requireForceCurrent();
-        if (!propulsion && !flying) velocity = velocity.add(acceleration.scale(dt));
-        NativeFlightMotion flightMotion = flying ? nativeFlightMotion(actor, velocity, controls, transaction, travel) : null;
+        if (!travel.positionDriven && !propulsion && !flying) velocity = velocity.add(acceleration.scale(dt));
+        NativeFlightMotion flightMotion = flying && !travel.positionDriven ? nativeFlightMotion(actor, velocity, controls, transaction, travel) : null;
         if (flightMotion != null) velocity = flightMotion.velocity();
         Vec3 rawAcceleration = sample.rawFields().gravityAcceleration().add(sample.rawFields().magneticAcceleration());
         boolean rawNativeGravity = !travel.nativeNoGravity
                 && sample.bindingMode().filter(mode -> mode == GravityMode.REPLACE).isEmpty()
                 && !actor.capabilities.isFlying;
         if (rawNativeGravity) rawAcceleration = rawAcceleration.add(new Vec3(0, -32, 0));
-        PropulsionMotion propulsionMotion = propulsion ? freePropulsionMotion(velocity, controls, budget, actor.posY, dt) : null;
+        FreeTravelKernel.Propulsion propulsionMotion = propulsion && !travel.positionDriven ? freePropulsionMotion(velocity, controls, budget, actor.posY, dt) : null;
         if (propulsionMotion != null) velocity = propulsionMotion.velocity();
-        ProneLocomotion.WaterMotion waterMotion = water && !propulsion && !flying
+        ProneLocomotion.WaterMotion waterMotion = !travel.positionDriven && water && !propulsion && !flying
                 && !travel.mobility.blocksCapture()
                 ? ProneLocomotion.waterMotion(transaction, controls, velocity,
                         ProneLocomotion.waterUp(accepted.placement())) : null;
@@ -604,12 +629,15 @@ public final class PlayerPhysicsStep {
                 nearFootActiveDrive || flying && nativeFlightDrive(controls)
                         || propulsionMotion != null && propulsionMotion.activeDrive());
         travel.hoverStatus = hover.status(); travel.hoverReason = hover.reason();
-        velocity = hover.velocity();
+        if (!travel.positionDriven) velocity = hover.velocity();
         double speed = Math.hypot(Math.hypot(velocity.x(), velocity.y()), velocity.z());
         if (!Double.isFinite(speed)) return unavailable("non-finite Free integrated velocity");
         if (speed > budget.ceilingMps()) velocity = velocity.scale(budget.ceilingMps() / speed);
         if (flightMotion != null) flightMotion = new NativeFlightMotion(velocity, velocity.y() * dt);
-        Vec3d delta = new Vec3d(velocity.x() * dt, velocity.y() * dt, velocity.z() * dt);
+        if (travel.positionDriven && travel.positionVelocity != null)
+            velocity = new Vec3(travel.positionVelocity.x(), travel.positionVelocity.y(), travel.positionVelocity.z());
+        Vec3d delta = travel.positionDriven ? travel.positionDelta(accepted)
+                : new Vec3d(velocity.x() * dt, velocity.y() * dt, velocity.z() * dt);
         Optional<FreeReferenceModePrepared.Selection> reverseSelection;
         FreeStandingProposal standingProposal;
         try {
@@ -797,7 +825,9 @@ public final class PlayerPhysicsStep {
         CapsulePlacementMath.Pose startPose = CapsulePlacementMath.pose(accepted.placement(), transaction.numeric());
         CapsulePlacementMath.Translation tube = CapsulePlacementMath.translationTube(startPose, delta, transaction.numeric());
         double requestedPath = tube.requestedDisplacementUpper();
-        var admission = transaction.reserve(transaction.nextLedgerSequence(), budgetTick, requestedPath);
+        var admission = travel.positionDriven
+                ? transaction.reserveClientPosition(transaction.nextLedgerSequence(), budgetTick)
+                : transaction.reserve(transaction.nextLedgerSequence(), budgetTick, requestedPath);
         if (!admission.accepted()) return unavailable("Free center-path grant rejected: " + admission.failure());
         if (requestedPath > admission.grant()) {
             double scale = requestedPath == 0 ? 0 : Math.nextDown(admission.grant() / requestedPath);
@@ -1042,30 +1072,11 @@ public final class PlayerPhysicsStep {
         }
     }
 
-    private record PropulsionMotion(Vec3 velocity, boolean activeDrive) { }
-    /** Shared accepted-velocity propulsion arithmetic for an existing Free owner and its first conversion tick. */
-    private static PropulsionMotion freePropulsionMotion(Vec3 velocity, PlayerPhysicsProtocol.Controls controls,
+    /** Existing server sampling wrapper; both sides use the same propulsion arithmetic. */
+    private static FreeTravelKernel.Propulsion freePropulsionMotion(Vec3 velocity, PlayerPhysicsProtocol.Controls controls,
             BoostMovementBudget budget, double feetY, double seconds) {
-        double acceleration = UnigravConfig.sixDofDriftAcceleration;
-        double limit = UnigravConfig.sixDofDriftSpeedLimit;
-        if (!Double.isFinite(acceleration) || acceleration < 0 || !Double.isFinite(limit) || limit < 0)
-            throw new IllegalArgumentException("Invalid Free drift tuning");
-        Vec3d input = controls.translation();
-        Vec3 drive = new Vec3(input.x(), input.y(), input.z());
-        velocity = velocity.add(MotionSpeedLimit.deltaVelocity(velocity, drive.scale(acceleration * seconds), limit));
-        boolean active = acceleration > 0 && drive.normSquared() > 0;
-        if (controls.boost()) {
-            double target = RemoteBoostCorridor.propulsionTarget(BoostGearProfile.speedMps(controls.boostGear()),
-                    budget.ceilingMps(), RemoteBoostCorridor.isRestricted(feetY));
-            if (target > 0) {
-                Vec3d forward = controls.forward();
-                Vec3 delta = new Vec3(forward.x(), forward.y(), forward.z())
-                        .scale(BoostGearProfile.accelerationMps2(controls.boostGear()) * seconds);
-                velocity = velocity.add(MotionSpeedLimit.deltaVelocity(velocity, delta, target));
-                active = true;
-            }
-        }
-        return new PropulsionMotion(velocity, active);
+        return FreeTravelKernel.propel(velocity, controls, UnigravConfig.sixDofDriftAcceleration,
+                UnigravConfig.sixDofDriftSpeedLimit, budget.ceilingMps(), feetY, seconds);
     }
 
     private record NativeFlightMotion(Vec3 velocity, double verticalBlocksPerTick) { }
@@ -1091,32 +1102,23 @@ public final class PlayerPhysicsStep {
         var flight = EquipmentFlightSampling.sample(actor, controls);
         transaction.requireCurrent();
         travel.recordEquipmentFlight(transaction.accepted(), transaction.tick(), flight);
-        Vec3d equippedMotion = flight.beforeTravel(new Vec3d(acceptedVelocity.x() * dt,
-                acceptedVelocity.y() * dt, acceptedVelocity.z() * dt), actor.onGround, controls);
-        Vec3 tickVelocity = new Vec3(Math.abs(equippedMotion.x()) < .003D ? 0 : equippedMotion.x(),
-                Math.abs(equippedMotion.y()) < .003D ? 0 : equippedMotion.y(),
-                Math.abs(equippedMotion.z()) < .003D ? 0 : equippedMotion.z());
-        double vertical = CardinalTravelKernel.flightInput(tickVelocity.y(),
-                controls.sneak(), controls.jump(), flight.flySpeed());
-        float coefficient = flight.flySpeed() * (actor.isSprinting() ? 2 : 1);
+        var driven = FreeTravelKernel.fly(flight, acceptedVelocity, controls, actor.onGround,
+                actor.isSprinting(), actor.rotationYaw, dt);
         transaction.requireCurrent();
-        var driven = CardinalTravelKernel.accelerate(new Vec3d(tickVelocity.x(), vertical, tickVelocity.z()), new CardinalTravelKernel.Input(CardinalFrame.Y_POS,
-                controls.translation(), controls.keyboardTravelGain(), controls.sneak(), controls.jump(), actor.rotationYaw),
-                coefficient, true);
-        transaction.requireCurrent();
-        return new NativeFlightMotion(new Vec3(driven.x() / dt, driven.y() / dt, driven.z() / dt), vertical);
+        return new NativeFlightMotion(driven.velocity(), driven.verticalBlocksPerTick());
     }
+
     private static PlayerPhysicalSnapshot finishNativeFlight(FreeOwnerTransaction transaction,
             PlayerPhysicalSnapshot installed, NativeFlightMotion flight, Vec3 acceleration) {
         transaction.requireCurrent();
         if (transaction.installedPlacement().orElse(null) != installed.placement())
             throw new IllegalStateException("native Free flight lost its exact installed journal");
         var actor = transaction.actor();
-        var post = CardinalTravelKernel.finish(new Vec3d(actor.motionX, actor.motionY, actor.motionZ),
-                CardinalFrame.Y_POS, new Vec3d(acceleration.x(), acceleration.y(), acceleration.z()),
-                GravityEntityBinder.TICK_SECONDS, .91F, actor.motionY);
+        var post = FreeTravelKernel.finishFlight(new Vec3d(actor.motionX, actor.motionY, actor.motionZ),
+                new Vec3d(acceleration.x(), acceleration.y(), acceleration.z()),
+                GravityEntityBinder.TICK_SECONDS, flight.verticalBlocksPerTick());
         transaction.requireCurrent();
-        actor.motionX = post.x(); actor.motionY = flight.verticalBlocksPerTick() * .6D; actor.motionZ = post.z();
+        actor.motionX = post.x(); actor.motionY = post.y(); actor.motionZ = post.z();
         actor.fallDistance = 0;
         actor.clearElytraFlying();
         transaction.requireCurrent();
@@ -1260,6 +1262,10 @@ public final class PlayerPhysicsStep {
         boolean gliding = !propulsion && !fluid && actor.isElytraFlying();
         boolean nativeGravity = !sample.personalZeroG() && !travel.nativeNoGravity
                 && sample.bindingMode().filter(mode -> mode == GravityMode.REPLACE).isEmpty() && !flying;
+        travel.positionEnvironment(acceleration, !sample.personalZeroG() && !travel.nativeNoGravity
+                && sample.bindingMode().filter(mode -> mode == GravityMode.REPLACE).isEmpty(), sample.personalZeroG());
+        travel.positionBindingActive = sample.bindingActive();
+        travel.positionStandingReference = false;
         if (nativeGravity) acceleration = acceleration.add(new Vec3(0, fluid ? -8 : -32, 0));
         travel.proneTransitionRejection = null;
         if (free != null) {
@@ -1336,7 +1342,7 @@ public final class PlayerPhysicsStep {
             if (boostCarrier) applyCorridor(budget, budgetTick, accepted.placement().transport().y());
             Vec3 integrated = new Vec3(accepted.worldVelocity().x(), accepted.worldVelocity().y(), accepted.worldVelocity().z())
                     .add(flying || propulsion ? Vec3.ZERO : acceleration.scale(seconds));
-            PropulsionMotion propulsionMotion = propulsion
+            FreeTravelKernel.Propulsion propulsionMotion = propulsion
                     ? freePropulsionMotion(integrated, controls, budget, actor.posY, seconds) : null;
             if (propulsionMotion != null) integrated = propulsionMotion.velocity();
             NativeFlightMotion flight = flying ? nativeFlightMotion(actor, integrated, controls, free, travel) : null;
@@ -1436,6 +1442,11 @@ public final class PlayerPhysicsStep {
         Vec3 bootAcceleration = standing.authoritativeForce()
                 .map(StandingConstraints.ForceSample::bootAcceleration).orElse(Vec3.ZERO);
         acceleration = acceleration.add(bootAcceleration);
+        // Cache the complete selected field/boot force for local steps; the client adds
+        // the separately indicated native term once, using its current flight/fluid state.
+        travel.positionEnvironment(nativeGravity ? acceleration.add(new Vec3(0, fluid ? 8 : 32, 0)) : acceleration,
+                !sample.personalZeroG() && !travel.nativeNoGravity
+                        && sample.bindingMode().filter(mode -> mode == GravityMode.REPLACE).isEmpty(), sample.personalZeroG());
         Optional<CardinalFrame> environmentReference = standing.targetReference()
                 .filter(target -> hasEnvironmentReference(sample.evidence(), target));
         Optional<CardinalFrame> naturalReference = standing.targetReference().filter(target -> environmentReference.isEmpty());
@@ -1575,11 +1586,23 @@ public final class PlayerPhysicsStep {
                 ? Optional.empty() : Optional.of(requested);
         boolean standingReference = nativeGravity
                 || requestedReference.isPresent() && requestedReference.orElseThrow() == frame;
+        travel.positionStandingReference = standingReference;
         boolean freeDrift = sample.bindingActive() && !propulsion && !flying && !fluid && !gliding && !nativeGravity
                 && standing.presence() == StandingConstraints.ConstraintPresence.ABSENT
                 && desiredSource == PlayerBodyReference.Source.SAFE_NATIVE && !actor.isOnLadder();
         boolean nearFootLocomotion = false;
         Vec3 velocity = new Vec3(v.x(), v.y(), v.z());
+        if (travel.positionDriven) {
+            // Environment/reference selection above remains authoritative. A submitted result
+            // goes directly to the existing collision/tail; do not integrate its input again.
+            if (travel.positionVelocity != null)
+                velocity = new Vec3(travel.positionVelocity.x(), travel.positionVelocity.y(), travel.positionVelocity.z());
+            return moveCardinal(actor, accepted, controls, budget, budgetTick, boostCarrier, travel, free,
+                    world, tick, correctionRevision, stepSuccessorRevision, sample, standing, frame,
+                    velocity, acceleration, .91F, 0, Math.hypot(v.x() * dt, v.z() * dt),
+                    freeDrift, standingReference, false, referenceAdopted,
+                    propulsion, flying, water, lava, gliding, null);
+        }
         var equipmentFlight = flying ? EquipmentFlightSampling.sample(actor, controls) : null;
         if (free != null) free.requireCurrent();
         travel.recordEquipmentFlight(accepted, tick, equipmentFlight);
@@ -1836,10 +1859,18 @@ public final class PlayerPhysicsStep {
         var dimensions = accepted.placement().shape().dimensions();
         double speed = Math.hypot(Math.hypot(velocity.x(), velocity.y()), velocity.z());
         if (!Double.isFinite(speed)) return unavailable("non-finite integrated velocity");
-        if (speed > budget.ceilingMps()) velocity = velocity.scale(budget.ceilingMps() / speed);
+        if (!travel.positionDriven && speed > budget.ceilingMps())
+            velocity = velocity.scale(budget.ceilingMps() / speed);
         Vec3d start = accepted.placement().transport();
-        var admission = budget.prepareClipped(Math.incrementExact(budget.lastSequence()), budgetTick,
-                new Vec3(start.x(), start.y(), start.z()).add(velocity.scale(dt)));
+        var destination = travel.positionDriven && travel.submittedPosition != null
+                ? new Vec3(travel.submittedPosition.placement().transport().x(),
+                        travel.submittedPosition.placement().transport().y(),
+                        travel.submittedPosition.placement().transport().z())
+                : new Vec3(start.x(), start.y(), start.z()).add(velocity.scale(dt));
+        var admission = travel.positionDriven
+                ? budget.prepareValidatedPosition(Math.incrementExact(budget.lastSequence()), budgetTick,
+                        destination, travel.positionAllowance)
+                : budget.prepareClipped(Math.incrementExact(budget.lastSequence()), budgetTick, destination);
         if (!admission.accepted()) return unavailable("budget: " + admission.failure());
         var boundary = new CommitBoundary(actor, accepted, budget, admission, travel, correctionRevision,
                 stepSuccessorRevision, standing, frame, free == null ? null : free.pendingCardinalPose());
@@ -1966,7 +1997,11 @@ public final class PlayerPhysicsStep {
             double verticalMotion = !propulsion && !gliding && !fluid && actor.collidedHorizontally && actor.isOnLadder()
                     ? 0.2D : actualVelocity.y();
             Vec3d postDrag;
-            if (preintegrated && !flying) {
+            if (travel.positionDriven) {
+                // The validated client velocity was installed before the native tail. Keep
+                // its actual collision/block response; neither integrate nor overwrite it again.
+                postDrag = applied.observedMotionBlocksPerTick();
+            } else if (preintegrated && !flying) {
                 postDrag = applied.observedMotionBlocksPerTick();
             } else if (preintegrated) {
                 // Match the existing Free native-flight tail, including its one horizontal drag.
@@ -1987,7 +2022,7 @@ public final class PlayerPhysicsStep {
             actor.motionY = postDrag.y();
             actor.motionZ = postDrag.z();
             // EntityPlayer.travel restores the pre-move vertical flight velocity even after a collision.
-            if (flying) actor.motionY = flightVerticalMotion * 0.6D;
+            if (flying && !travel.positionDriven) actor.motionY = flightVerticalMotion * 0.6D;
             if (gliding) {
                 if (actor.collidedHorizontally) {
                     float damage = (float) ((glideHorizontalSpeed - Math.hypot(actor.motionX, actor.motionZ)) * 10.0D - 3.0D);
@@ -2002,7 +2037,7 @@ public final class PlayerPhysicsStep {
                 actor.fallDistance = 0;
                 applyOwnedPoseFlags(actor, free, actor.isSneaking(), true);
             }
-            if(fluid && actor.collidedHorizontally) {
+            if(!travel.positionDriven && fluid && actor.collidedHorizontally) {
                 try(var nativeScope=free==null?null:CardinalNativeBoundary.open(boundary,actor,
                         free.resources().environmentObservationWork(),boundary::requireInstalledPhase)) {
                     var escapeBox=actor.getEntityBoundingBox().offset(actor.motionX,
@@ -2708,34 +2743,9 @@ public final class PlayerPhysicsStep {
 
     /** Native elytra aerodynamics in blocks/tick, with the one sampled environment replacing fixed -0.08. */
     private static Vec3 glide(EntityPlayerMP actor, Vec3 velocity, Vec3 acceleration, double dt) {
-        double x = velocity.x() * dt, y = velocity.y() * dt, z = velocity.z() * dt;
-        if (y > -0.5D) actor.fallDistance = 1.0F;
+        if (velocity.y() * dt > -.5D) actor.fallDistance = 1.0F;
         var look = actor.getLookVec();
-        float pitch = actor.rotationPitch * (float) (Math.PI / 180.0D);
-        double lookHorizontal = Math.sqrt(look.x * look.x + look.z * look.z);
-        double horizontal = Math.sqrt(x * x + z * z);
-        float lift = MathHelper.cos(pitch);
-        lift = (float) (lift * (lift * Math.min(1.0D, look.length() / 0.4D)));
-        x += acceleration.x() * dt * dt;
-        y += acceleration.y() * dt * dt + lift * 0.06D;
-        z += acceleration.z() * dt * dt;
-        if (y < 0 && lookHorizontal > 0) {
-            double dive = y * -0.1D * lift;
-            y += dive;
-            x += look.x * dive / lookHorizontal;
-            z += look.z * dive / lookHorizontal;
-        }
-        if (pitch < 0 && lookHorizontal > 0) {
-            double climb = horizontal * -MathHelper.sin(pitch) * 0.04D;
-            y += climb * 3.2D;
-            x -= look.x * climb / lookHorizontal;
-            z -= look.z * climb / lookHorizontal;
-        }
-        if (lookHorizontal > 0) {
-            x += (look.x / lookHorizontal * horizontal - x) * 0.1D;
-            z += (look.z / lookHorizontal * horizontal - z) * 0.1D;
-        }
-        return new Vec3(x * (double) 0.99F / dt, y * (double) 0.98F / dt, z * (double) 0.99F / dt);
+        return FreeTravelKernel.glide(velocity, acceleration, look, actor.rotationPitch, dt);
     }
 
     /** Preserve the transferred envelope and its existing credit; G-off does not erase reentry decay. */

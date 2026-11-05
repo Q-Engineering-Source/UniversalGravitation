@@ -5,18 +5,19 @@ import dev.crlhitbox.api.geometry.Vec3d;
 import dev.crlhitbox.api.geometry.contact.CapsuleAabbContact3d.Relation;
 import java.util.Optional;
 import net.minecraft.entity.player.EntityPlayerMP;
+import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.enchantment.EnchantmentHelper;
 import wi.unigrav.api.math.Vec3;
 import wi.unigrav.core.GravityEntityBinder;
 
 /** Same-owner prone selection and drive. Geometry admission and installation stay in the existing mode pipeline. */
-final class ProneLocomotion {
+public final class ProneLocomotion {
     private ProneLocomotion() { }
 
     record Choice(Optional<ProneTransitionRequest> request, boolean blocksStanding) {
         static final Choice NONE = new Choice(Optional.empty(), false);
     }
-    record WaterMotion(Vec3 velocity, double tangentDrag, double normalDrag, Vec3d up) { }
+    public record WaterMotion(Vec3 velocity, double tangentDrag, double normalDrag, Vec3d up) { }
 
     record StandingProfile(FreeOwnerTransaction transaction, NativeCardinalBodyProfile.Value body,
             ProneBodyProducer producer, ProneBodyProducer.Input input) {
@@ -177,7 +178,7 @@ final class ProneLocomotion {
     }
 
     /** Keep the existing fluid input/damping axis without claiming an environmental reference. */
-    static Vec3d waterUp(PlayerBodyPlacement placement) {
+    public static Vec3d waterUp(PlayerBodyPlacement placement) {
         return placement.shape() instanceof PlayerBodyShape.FreeCapsule free
                 ? free.pronePose().flatMap(PlayerBodyShape.PronePose::referenceFrame)
                     .orElse(CardinalFrame.Y_POS).up() : placement.bodyUp();
@@ -185,7 +186,13 @@ final class ProneLocomotion {
 
     static WaterMotion waterMotion(FreeOwnerTransaction tx, PlayerPhysicsProtocol.Controls controls,
             Vec3 velocity, Vec3d up) {
-        var actor = tx.actor();
+        return waterMotion(tx.actor(), controls, velocity, up, tx::requireCurrent);
+    }
+
+    /** Real local/server actor samples share the same existing swim drive, without owner-specific integration. */
+    public static WaterMotion waterMotion(EntityPlayer actor, PlayerPhysicsProtocol.Controls controls,
+            Vec3 velocity, Vec3d up, Runnable requireCurrent) {
+        requireCurrent.run();
         float drag = controls.sprint() ? .9F : actor.getWaterSlowDown();
         float coefficient = .02F;
         float depth = Math.min(3, EnchantmentHelper.getDepthStriderModifier(actor));
@@ -194,7 +201,7 @@ final class ProneLocomotion {
             drag += (.54600006F - drag) * depth / 3;
             coefficient += (actor.getAIMoveSpeed() - coefficient) * depth / 3;
         }
-        tx.requireCurrent();
+        requireCurrent.run();
         double dt = GravityEntityBinder.TICK_SECONDS;
         var input = controls.translation();
         var driven = velocity.add(new Vec3(input.x(), input.y(), input.z()).scale(coefficient / dt));
@@ -203,7 +210,7 @@ final class ProneLocomotion {
         return new WaterMotion(driven, drag, .8, up);
     }
 
-    static Vec3 dampWater(Vec3 velocity, WaterMotion motion) {
+    public static Vec3 dampWater(Vec3 velocity, WaterMotion motion) {
         var up = motion.up();
         double normal = velocity.x() * up.x() + velocity.y() * up.y() + velocity.z() * up.z();
         var perpendicular = new Vec3(up.x(), up.y(), up.z()).scale(normal);

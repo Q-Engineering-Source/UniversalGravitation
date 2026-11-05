@@ -72,6 +72,27 @@ public final class BoostMovementBudget {
         return pendingCenter;
     }
 
+    /** Cumulative client-result path under a server-validated finite movement window. */
+    public CenterPathAdmission reserveValidatedCenterPath(long sequence, long serverTick,
+            Vec3 expectedTransportOrigin, Vec3 centerOrigin, double maximumPath) {
+        if (hasPending()) {
+            lastDiagnosticFailure = DiagnosticFailure.PENDING;
+            return deniedCenter(sequence, serverTick, expectedTransportOrigin, centerOrigin, Failure.PENDING);
+        }
+        if (!BoostProtocol.finite(expectedTransportOrigin) || !BoostProtocol.finite(centerOrigin)
+                || !finitePath(maximumPath) || !position.equals(expectedTransportOrigin)
+                || confirmedCenter != null && !confirmedCenter.equals(centerOrigin)) {
+            lastDiagnosticFailure = DiagnosticFailure.INVALID_INPUT;
+            return deniedCenter(sequence, serverTick, expectedTransportOrigin, centerOrigin, Failure.INVALID_INPUT);
+        }
+        if (!precheck(sequence, serverTick, expectedTransportOrigin))
+            return deniedCenter(sequence, serverTick, expectedTransportOrigin, centerOrigin,
+                    lastDenied(sequence, expectedTransportOrigin).failure());
+        pendingCenter = new CenterPathAdmission(sequence, serverTick, position, centerOrigin, maximumPath, Failure.NONE);
+        lastDiagnosticFailure = DiagnosticFailure.NONE;
+        return pendingCenter;
+    }
+
     /**
      * Commits one already-spent path reservation. The supplied upper bound must include all
      * actual segments; checking its net-distance lower bound cannot reconstruct a folded path.
@@ -194,6 +215,26 @@ public final class BoostMovementBudget {
         }
         pending = new Admission(sequence, position, candidate, candidateDistance, Failure.NONE);
         debit(candidateDistance);
+        pendingReserved = true;
+        lastDiagnosticFailure = DiagnosticFailure.NONE;
+        return pending;
+    }
+
+    /**
+     * Reserves a client position result after the server has checked elapsed time/capabilities.
+     * It is already a cumulative displacement, so the old one-tick proposal clip must not run
+     * again. Collision/lifetime validation and the one native commit remain the caller's job.
+     */
+    public Admission prepareValidatedPosition(long sequence, long serverTick, Vec3 destination,
+            double maximumDisplacement) {
+        if (!BoostProtocol.finite(destination) || !Double.isFinite(maximumDisplacement)
+                || maximumDisplacement < 0)
+            return denied(sequence, position, Failure.INVALID_INPUT, DiagnosticFailure.INVALID_INPUT);
+        double distance = distanceFromPosition(destination);
+        if (!Double.isFinite(distance) || distance > maximumDisplacement)
+            return denied(sequence, position, Failure.INVALID_INPUT, DiagnosticFailure.INVALID_INPUT);
+        if (!precheck(sequence, serverTick, destination)) return lastDenied(sequence, destination);
+        pending = new Admission(sequence, position, destination, distance, Failure.NONE);
         pendingReserved = true;
         lastDiagnosticFailure = DiagnosticFailure.NONE;
         return pending;

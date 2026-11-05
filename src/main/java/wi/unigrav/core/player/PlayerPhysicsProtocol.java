@@ -18,8 +18,8 @@ import wi.unigrav.core.GravityMode;
 /** Independent physical-owner messages; positions are metres and velocities m/s. */
 public final class PlayerPhysicsProtocol {
     public static final String CHANNEL = "ugmotion1";
-    // V24 carries an optional ordinary-pose sample on INPUT; both peers must use this version.
-    public static final int VERSION = 24;
+    // V25 adds client-computed MOVE results. MOVE never carries prediction history or replay metadata.
+    public static final int VERSION = 25;
     // The V11 maximum includes a boundary; its Anchored phase adds present(1), tag(1), revision(8), bootstrap(16).
     // V14 combines the V13 request marker with accepted mobility state (present byte + 22 bytes).
     // V15 adds one canonical transfer-presence byte. V16 reuses that union for TP completion controls.
@@ -32,7 +32,7 @@ public final class PlayerPhysicsProtocol {
     private static final int PROFILED_FREE_CAPSULE_PLACEMENT_TAG = 2;
     private static final int PRONE_FREE_CAPSULE_PLACEMENT_TAG = 3;
     private PlayerPhysicsProtocol() {}
-    public enum Kind { OFFER, APPLY, OWNED, INPUT, STATE, NATIVE, RECOVER, NATIVE_MOTION, NATIVE_ACK, NATIVE_MOTION_ACK, NATIVE_CORRECTION_COMPLETE, NATIVE_CORRECTION_ACK }
+    public enum Kind { OFFER, APPLY, OWNED, INPUT, STATE, NATIVE, RECOVER, NATIVE_MOTION, NATIVE_ACK, NATIVE_MOTION_ACK, NATIVE_CORRECTION_COMPLETE, NATIVE_CORRECTION_ACK, MOVE, MOTION }
     public record OperationId(long nonce, long epoch, long serial, BoostProtocol.Operation operation) {
         public OperationId {
             Objects.requireNonNull(operation, "operation");
@@ -431,6 +431,17 @@ public final class PlayerPhysicsProtocol {
                 Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.of(transfer));
     }
 
+    /** Server observations are not permission for the next client step. No input history is acknowledged. */
+    public record PositionFeedback(long correctionId, long submissionSequence, boolean correction,
+                                   Vec3d acceleration, boolean nativeGravity, boolean personalZeroG,
+                                   boolean bindingActive, boolean standingReference, double ceilingMps) {
+        public PositionFeedback {
+            requireFinite(acceleration);
+            if (correctionId < 0 || submissionSequence < 0 || !Double.isFinite(ceilingMps) || ceilingMps <= 0)
+                throw new IllegalArgumentException("Invalid position feedback");
+        }
+    }
+
     public record Packet(Kind kind, PlayerPhysicalSnapshot.Scope scope, long sequence,
                          long offerSequence, Optional<ApplicationId> application,
                          Optional<PlayerPhysicalSnapshot> snapshot, Optional<Controls> controls,
@@ -441,7 +452,22 @@ public final class PlayerPhysicsProtocol {
                           Optional<PredictionInput> predictionInput, Optional<PredictionBoundary> predictionBoundary,
                           Optional<CardinalPredictionSeed> predictionSeed, Optional<PredictionPhase> predictionPhase,
                           Optional<PredictionRequest> predictionRequest, Optional<PlayerMobilityIntent.State> mobilityState,
+                          Optional<NativeTransfer> nativeTransfer, Optional<PositionFeedback> positionFeedback) {
+        public Packet(Kind kind, PlayerPhysicalSnapshot.Scope scope, long sequence,
+                         long offerSequence, Optional<ApplicationId> application,
+                         Optional<PlayerPhysicalSnapshot> snapshot, Optional<Controls> controls,
+                         OptionalInt nativeTeleportId,
+                          Optional<BodyReferenceReceipt> bodyReferenceReceipt,
+                          Optional<BodyReferenceAcknowledgement> bodyReferenceAcknowledgement,
+                          Optional<PlayerBodyReference.State> bodyReferenceState,
+                          Optional<PredictionInput> predictionInput, Optional<PredictionBoundary> predictionBoundary,
+                          Optional<CardinalPredictionSeed> predictionSeed, Optional<PredictionPhase> predictionPhase,
+                          Optional<PredictionRequest> predictionRequest, Optional<PlayerMobilityIntent.State> mobilityState,
                           Optional<NativeTransfer> nativeTransfer) {
+            this(kind, scope, sequence, offerSequence, application, snapshot, controls, nativeTeleportId,
+                    bodyReferenceReceipt, bodyReferenceAcknowledgement, bodyReferenceState, predictionInput, predictionBoundary,
+                    predictionSeed, predictionPhase, predictionRequest, mobilityState, nativeTransfer, Optional.empty());
+        }
         public Packet(Kind kind, PlayerPhysicalSnapshot.Scope scope, long sequence, long offerSequence,
                 Optional<ApplicationId> application, Optional<PlayerPhysicalSnapshot> snapshot, Optional<Controls> controls,
                 OptionalInt nativeTeleportId, Optional<BodyReferenceReceipt> bodyReferenceReceipt,
@@ -530,6 +556,9 @@ public final class PlayerPhysicsProtocol {
                     bodyReferenceReceipt, bodyReferenceAcknowledgement, Optional.empty());
         }
         public Packet {
+            Objects.requireNonNull(positionFeedback, "positionFeedback");
+            if (positionFeedback.isPresent() != (kind == Kind.MOTION))
+                throw new IllegalArgumentException("Position feedback kind mismatch");
             Objects.requireNonNull(kind, "kind");
             Objects.requireNonNull(scope, "scope");
             Objects.requireNonNull(application, "application");
@@ -561,8 +590,12 @@ public final class PlayerPhysicsProtocol {
                     throw new IllegalArgumentException("Native recovery STATE coherence");
             }
             Objects.requireNonNull(mobilityState, "mobilityState");
-            if (mobilityState.isPresent() && kind != Kind.OWNED && kind != Kind.STATE)
+            if (mobilityState.isPresent() && kind != Kind.OWNED && kind != Kind.STATE && kind != Kind.MOTION)
                 throw new IllegalArgumentException("Mobility state does not match packet kind");
+            if ((kind == Kind.MOVE || kind == Kind.MOTION) && (predictionInput.isPresent()
+                    || predictionBoundary.isPresent() || predictionSeed.isPresent() || predictionPhase.isPresent()
+                    || predictionRequest.isPresent()))
+                throw new IllegalArgumentException("Position-result transport cannot carry prediction history/qualification");
             validatePredictionPhase(kind, snapshot.map(PlayerPhysicalSnapshot::revision), predictionSeed, predictionBoundary, predictionPhase);
             if (predictionSeed.isPresent() && kind != Kind.OWNED && kind != Kind.STATE)
                 throw new IllegalArgumentException("Prediction seed does not match packet kind");
@@ -570,12 +603,12 @@ public final class PlayerPhysicsProtocol {
             if (nativeTeleportId.isPresent() && (kind != Kind.STATE || nativeTeleportId.getAsInt() < 0))
                 throw new IllegalArgumentException("Invalid native correction identity");
             if (sequence < 0 || offerSequence < 0) throw new IllegalArgumentException("Negative sequence");
-            boolean state = kind == Kind.OWNED || kind == Kind.STATE;
-            if (snapshot.isPresent() != state || controls.isPresent() != (kind == Kind.INPUT)
+            boolean state = kind == Kind.OWNED || kind == Kind.STATE || kind == Kind.MOVE || kind == Kind.MOTION;
+            if (snapshot.isPresent() != state || controls.isPresent() != (kind == Kind.INPUT || kind == Kind.MOVE)
                     || (application.isPresent() && kind != Kind.APPLY && kind != Kind.OWNED)
-                    || bodyReferenceReceipt.isPresent() && kind != Kind.STATE
-                    || bodyReferenceState.isPresent() && kind != Kind.OWNED && kind != Kind.STATE
-                    || bodyReferenceAcknowledgement.isPresent() && kind != Kind.INPUT) {
+                    || bodyReferenceReceipt.isPresent() && kind != Kind.STATE && kind != Kind.MOTION
+                    || bodyReferenceState.isPresent() && kind != Kind.OWNED && kind != Kind.STATE && kind != Kind.MOTION
+                    || bodyReferenceAcknowledgement.isPresent() && kind != Kind.INPUT && kind != Kind.MOVE) {
                 throw new IllegalArgumentException("Payload does not match packet kind");
             }
             snapshot.ifPresent(value -> {
@@ -600,7 +633,24 @@ public final class PlayerPhysicsProtocol {
                 }
             });
         }
-        public boolean clientbound() { return kind == Kind.OFFER || kind == Kind.OWNED || kind == Kind.STATE || kind == Kind.NATIVE || kind == Kind.NATIVE_MOTION || kind == Kind.NATIVE_CORRECTION_COMPLETE; }
+        public boolean clientbound() { return kind == Kind.OFFER || kind == Kind.OWNED || kind == Kind.STATE || kind == Kind.NATIVE || kind == Kind.NATIVE_MOTION || kind == Kind.NATIVE_CORRECTION_COMPLETE || kind == Kind.MOTION; }
+    }
+
+    /** One movement result. Sequence only orders submissions; there is no retained input timeline. */
+    public static Packet movement(Packet input, PlayerPhysicalSnapshot result) {
+        return movement(input, result, result.revision());
+    }
+
+    public static Packet movement(Packet input, PlayerPhysicalSnapshot result, long appliedCorrectionId) {
+        if (appliedCorrectionId < 0) throw new IllegalArgumentException("Negative applied correction identity");
+        result = new PlayerPhysicalSnapshot(result.scope(), appliedCorrectionId, result.placement(),
+                result.worldVelocity(), result.contacts());
+        if (input.kind() != Kind.INPUT) throw new IllegalArgumentException("Movement requires current controls");
+        if (!input.scope().equals(result.scope())) throw new IllegalArgumentException("Movement scope differs from current controls");
+        return new Packet(Kind.MOVE, input.scope(), input.sequence(), input.offerSequence(), Optional.empty(),
+                Optional.of(result), input.controls(), OptionalInt.empty(), Optional.empty(),
+                input.bodyReferenceAcknowledgement(), Optional.empty(), Optional.empty(), Optional.empty(),
+                Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
     }
 
     public static byte[] encode(Packet packet) {
@@ -635,15 +685,15 @@ public final class PlayerPhysicsProtocol {
                     FreeCapsulePlacementV1.RawQuaternion.from(q)));
             putMobilityInput(out, controls.mobility());
         });
-        if (packet.kind() == Kind.STATE) {
+        if (packet.kind() == Kind.STATE || packet.kind() == Kind.MOTION) {
             out.put((byte) (packet.bodyReferenceReceipt().isPresent() ? 1 : 0));
             packet.bodyReferenceReceipt().ifPresent(receipt -> putBodyReferenceReceipt(out, receipt));
         }
-        if (packet.kind() == Kind.OWNED || packet.kind() == Kind.STATE) {
+        if (packet.kind() == Kind.OWNED || packet.kind() == Kind.STATE || packet.kind() == Kind.MOTION) {
             out.put((byte) (packet.bodyReferenceState().isPresent() ? 1 : 0));
             packet.bodyReferenceState().ifPresent(state -> putBodyReferenceState(out, state));
         }
-        if (packet.kind() == Kind.INPUT) {
+        if (packet.kind() == Kind.INPUT || packet.kind() == Kind.MOVE) {
             out.put((byte) (packet.bodyReferenceAcknowledgement().isPresent() ? 1 : 0));
             packet.bodyReferenceAcknowledgement().ifPresent(acknowledgement -> out
                     .putLong(acknowledgement.stateSequence()).putLong(acknowledgement.snapshotRevision()));
@@ -673,12 +723,19 @@ public final class PlayerPhysicsProtocol {
             out.put((byte)value.action().ordinal()).put((byte)value.origin().ordinal()).put((byte)(value.refusal().isPresent()?1:0));
             value.refusal().ifPresent(refusal->out.put((byte)refusal.reason().ordinal()).put((byte)refusal.stage().ordinal()));
         });
-        if (packet.kind() == Kind.OWNED || packet.kind() == Kind.STATE) {
+        if (packet.kind() == Kind.OWNED || packet.kind() == Kind.STATE || packet.kind() == Kind.MOTION) {
             out.put((byte) (packet.mobilityState().isPresent() ? 1 : 0));
             packet.mobilityState().ifPresent(value -> putMobilityState(out, value));
         }
         out.put((byte) (packet.nativeTransfer().isPresent() ? 1 : 0));
         packet.nativeTransfer().ifPresent(value -> putNativeTransfer(out, value));
+        packet.positionFeedback().ifPresent(value -> {
+            out.putLong(value.correctionId()).putLong(value.submissionSequence()).put((byte) (value.correction() ? 1 : 0));
+            putVector(out, value.acceleration());
+            out.put((byte) (value.nativeGravity() ? 1 : 0)).put((byte) (value.personalZeroG() ? 1 : 0));
+            out.put((byte) (value.bindingActive() ? 1 : 0)).put((byte) (value.standingReference() ? 1 : 0));
+            out.putDouble(value.ceilingMps());
+        });
         return Arrays.copyOf(out.array(), out.position());
     }
 
@@ -762,8 +819,14 @@ public final class PlayerPhysicsProtocol {
                                 Optional<PlayerBodyReference.State> bodyReferenceState, Optional<PredictionInput> predictionInput,
                                 Optional<PredictionBoundary> predictionBoundary,
                                 Optional<CardinalPredictionSeed> predictionSeed, Optional<PredictionPhase> predictionPhase,
-                                Optional<PredictionRequest> predictionRequest, Optional<PlayerMobilityIntent.State> mobilityState, Optional<NativeTransfer> nativeTransfer, int encodedPacketBytes) {
+                                Optional<PredictionRequest> predictionRequest, Optional<PlayerMobilityIntent.State> mobilityState, Optional<NativeTransfer> nativeTransfer, Optional<PositionFeedback> positionFeedback, int encodedPacketBytes) {
         private void validateBeforeProofRestore() {
+            if ((kind == Kind.MOVE || kind == Kind.MOTION) && (predictionInput.isPresent()
+                    || predictionBoundary.isPresent() || predictionSeed.isPresent() || predictionPhase.isPresent()
+                    || predictionRequest.isPresent()))
+                throw new IllegalArgumentException("Position-result transport cannot carry prediction history/qualification");
+            if (positionFeedback.isPresent() != (kind == Kind.MOTION))
+                throw new IllegalArgumentException("Position feedback does not match packet kind");
             validatePredictionRequest(kind, predictionInput, predictionRequest);
             validatePredictionKind(kind, predictionInput, predictionBoundary);
             validatePredictionPhase(kind, snapshot.map(frame -> frame instanceof CardinalSnapshotFrame cardinal
@@ -785,11 +848,11 @@ public final class PlayerPhysicsProtocol {
             if (nativeTeleportId.isPresent() && (kind != Kind.STATE || nativeTeleportId.getAsInt() < 0)) {
                 throw new IllegalArgumentException("Invalid native correction identity");
             }
-            boolean state = kind == Kind.OWNED || kind == Kind.STATE;
-            if (snapshot.isPresent() != state || controls.isPresent() != (kind == Kind.INPUT)
-                    || bodyReferenceReceipt.isPresent() && kind != Kind.STATE
+            boolean state = kind == Kind.OWNED || kind == Kind.STATE || kind == Kind.MOVE || kind == Kind.MOTION;
+            if (snapshot.isPresent() != state || controls.isPresent() != (kind == Kind.INPUT || kind == Kind.MOVE)
+                    || bodyReferenceReceipt.isPresent() && kind != Kind.STATE && kind != Kind.MOTION
                     || bodyReferenceState.isPresent() && !state
-                    || bodyReferenceAcknowledgement.isPresent() && kind != Kind.INPUT) {
+                    || bodyReferenceAcknowledgement.isPresent() && kind != Kind.INPUT && kind != Kind.MOVE) {
                 throw new IllegalArgumentException("Payload does not match packet kind");
             }
             snapshot.ifPresent(frame -> {
@@ -821,7 +884,7 @@ public final class PlayerPhysicsProtocol {
             Optional<Controls> restoredControls = controls.map(input -> input.materialize(budget,
                     bodyReferenceAcknowledgement.isPresent()));
             return new Packet(kind, scope, sequence, offerSequence, application, restoredSnapshot, restoredControls,
-                    nativeTeleportId, bodyReferenceReceipt, bodyReferenceAcknowledgement.map(RawAcknowledgement::materialize), bodyReferenceState, predictionInput, predictionBoundary, predictionSeed, predictionPhase, predictionRequest, mobilityState, nativeTransfer);
+                    nativeTeleportId, bodyReferenceReceipt, bodyReferenceAcknowledgement.map(RawAcknowledgement::materialize), bodyReferenceState, predictionInput, predictionBoundary, predictionSeed, predictionPhase, predictionRequest, mobilityState, nativeTransfer, positionFeedback);
         }
     }
 
@@ -894,12 +957,12 @@ public final class PlayerPhysicsProtocol {
             }
             OptionalInt nativeTeleportId = OptionalInt.empty();
             Optional<SnapshotFrame> snapshot = Optional.empty();
-            if (kind == Kind.OWNED || kind == Kind.STATE) {
+            if (kind == Kind.OWNED || kind == Kind.STATE || kind == Kind.MOVE || kind == Kind.MOTION) {
                 if (getBoolean(in)) nativeTeleportId = OptionalInt.of(in.getInt());
                 snapshot = Optional.of(getSnapshotFrame(in, scope));
             }
             Optional<RawInputFrame> controls = Optional.empty();
-            if (kind == Kind.INPUT) {
+            if (kind == Kind.INPUT || kind == Kind.MOVE) {
                 var translation = getRawVector(in);
                 var forward = getRawVector(in);
                 int flags = Byte.toUnsignedInt(in.get());
@@ -921,12 +984,12 @@ public final class PlayerPhysicsProtocol {
                 controls = Optional.of(new RawInputFrame(translation, forward, flags, gear, gainBits, intent, attitude, mobility));
             }
             Optional<BodyReferenceReceipt> receipt = Optional.empty();
-            if (kind == Kind.STATE && getBoolean(in)) receipt = Optional.of(getBodyReferenceReceipt(in));
+            if ((kind == Kind.STATE || kind == Kind.MOTION) && getBoolean(in)) receipt = Optional.of(getBodyReferenceReceipt(in));
             Optional<PlayerBodyReference.State> referenceState = Optional.empty();
-            if ((kind == Kind.OWNED || kind == Kind.STATE) && getBoolean(in))
+            if ((kind == Kind.OWNED || kind == Kind.STATE || kind == Kind.MOTION) && getBoolean(in))
                 referenceState = Optional.of(getBodyReferenceState(in));
             Optional<RawAcknowledgement> acknowledgement = Optional.empty();
-            if (kind == Kind.INPUT && getBoolean(in))
+            if ((kind == Kind.INPUT || kind == Kind.MOVE) && getBoolean(in))
                 acknowledgement = Optional.of(new RawAcknowledgement(in.getLong(), in.getLong()));
             Optional<PredictionInput> predictionInput = getBoolean(in)
                     ? Optional.of(getPredictionInput(in)) : Optional.empty();
@@ -950,14 +1013,17 @@ public final class PlayerPhysicsProtocol {
                 }
                 predictionRequest=Optional.of(new PredictionRequest(id,bootstrap,PredictionRequestAction.values()[action],refusal,PredictionSuspensionOrigin.values()[origin]));
             }
-            Optional<PlayerMobilityIntent.State> mobilityState = (kind == Kind.OWNED || kind == Kind.STATE) && getBoolean(in)
+            Optional<PlayerMobilityIntent.State> mobilityState = (kind == Kind.OWNED || kind == Kind.STATE || kind == Kind.MOTION) && getBoolean(in)
                     ? Optional.of(getMobilityState(in)) : Optional.empty();
             Optional<NativeTransfer> nativeTransfer = getBoolean(in) ? Optional.of(getNativeTransfer(in, kind)) : Optional.empty();
             validateNativeTransfer(kind, nativeTransfer);
             validateEnvironmentRecovery(scope, nativeTransfer);
+            Optional<PositionFeedback> positionFeedback = kind == Kind.MOTION
+                    ? Optional.of(new PositionFeedback(in.getLong(), in.getLong(), getBoolean(in), getVector(in),
+                        getBoolean(in), getBoolean(in), getBoolean(in), getBoolean(in), in.getDouble())) : Optional.empty();
             if (in.hasRemaining()) throw new IllegalArgumentException("Trailing physics bytes");
             ParsedPacket parsed = new ParsedPacket(kind, scope, sequence, offerSequence, application, snapshot,
-                    controls, nativeTeleportId, receipt, acknowledgement, referenceState, predictionInput, predictionBoundary, predictionSeed, predictionPhase, predictionRequest, mobilityState, nativeTransfer, bytes.length);
+                    controls, nativeTeleportId, receipt, acknowledgement, referenceState, predictionInput, predictionBoundary, predictionSeed, predictionPhase, predictionRequest, mobilityState, nativeTransfer, positionFeedback, bytes.length);
             parsed.validateBeforeProofRestore();
             return parsed;
         } catch (BufferUnderflowException cause) {
@@ -1153,7 +1219,7 @@ public final class PlayerPhysicsProtocol {
 
     private static void validatePredictionKind(Kind kind, Optional<PredictionInput> input,
                                                Optional<PredictionBoundary> boundary) {
-        if (input.isPresent() && kind != Kind.INPUT || boundary.isPresent() && kind != Kind.OWNED && kind != Kind.STATE)
+        if (input.isPresent() && kind != Kind.INPUT || boundary.isPresent() && kind != Kind.OWNED && kind != Kind.STATE && kind != Kind.MOTION)
             throw new IllegalArgumentException("Prediction payload does not match packet kind");
     }
     private static void putPredictionBoundary(ByteBuffer out, PredictionBoundary value) {

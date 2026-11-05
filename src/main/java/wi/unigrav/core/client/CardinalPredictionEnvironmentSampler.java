@@ -58,26 +58,56 @@ public final class CardinalPredictionEnvironmentSampler {
     public static Result samplePlayer(EntityPlayer actor, World world, CardinalPredictionStep.State state,
                                       PlayerPhysicsProtocol.Controls controls, CardinalPredictionSeed.Ready seed,
                                       boolean currentPersonalZeroG) {
+        return samplePlayer(actor, world, state, controls, seed, currentPersonalZeroG, true);
+    }
+
+    /** Current local world and cached force parameters; no server seed/revision qualifies a step. */
+    public static Result sampleLocal(EntityPlayer actor, World world, CardinalPredictionStep.State state,
+            PlayerPhysicsProtocol.Controls controls, Vec3d environmentAcceleration, boolean nativeGravity,
+            boolean standingReference, boolean bindingActive, double ceilingMps) {
+        return sampleCurrent(actor, world, state, controls, environmentAcceleration, nativeGravity,
+                standingReference, bindingActive, ceilingMps);
+    }
+
+    private static Result samplePlayer(EntityPlayer actor, World world, CardinalPredictionStep.State state,
+            PlayerPhysicsProtocol.Controls controls, CardinalPredictionSeed.Ready seed, boolean currentPersonalZeroG,
+            boolean predictionQualification) {
         Objects.requireNonNull(actor); Objects.requireNonNull(world); Objects.requireNonNull(state);
         Objects.requireNonNull(controls); Objects.requireNonNull(seed);
-        try {
-            if (actor.world != world || actor.isDead) return new Unavailable(Reason.ACTOR_CHANGED, Optional.empty());
-            if (!(state.placement().shape() instanceof PlayerBodyShape.Cardinal cardinal)
-                    || cardinal.frame() != seed.frame()) return new Unsupported(Reason.UNSUPPORTED_SHAPE);
-            if (currentPersonalZeroG != seed.personalZeroG()) return new Unsupported(Reason.PERSONAL_G_MISMATCH,
+        if (!(state.placement().shape() instanceof PlayerBodyShape.Cardinal cardinal)
+                || cardinal.frame() != seed.frame()) return new Unsupported(Reason.UNSUPPORTED_SHAPE);
+        if (predictionQualification && currentPersonalZeroG != seed.personalZeroG())
+            return new Unsupported(Reason.PERSONAL_G_MISMATCH,
                     "sampledPersonalZeroG=" + currentPersonalZeroG + ",seedPersonalZeroG=" + seed.personalZeroG()
                             + ",seedSnapshotRevision=" + seed.snapshotRevision() + ",seedWorldTick=" + seed.worldTick(),
                     PlayerPhysicsProtocol.PredictionRefusalStage.SAMPLE);
-            // Ready is issued only after the server excludes qualified magnetic boots and
-            // their active contact memory. Ordinary armor in FEET is not a magnetic boot.
+        try {
+            if (predictionQualification && (actor.noClip || actor.isRiding() || actor.isSpectator() || actor.isInWater()
+                    || actor.isInLava() || actor.isElytraFlying() || actor.isOnLadder()
+                    || PlayerBoostEligibility.propulsionAllowed(currentPersonalZeroG, actor.capabilities.isCreativeMode)))
+                return new Unsupported(Reason.UNSUPPORTED_STATE);
+        } catch (RuntimeException cause) {
+            return new Unavailable(Reason.SAMPLING_FAILED, Optional.of(cause));
+        }
+        boolean nativeGravity = !seed.personalZeroG() && !seed.savedNativeNoGravity()
+                && seed.bindingMode().filter(mode -> mode == GravityMode.REPLACE).isEmpty();
+        return sampleCurrent(actor, world, state, controls, seed.environmentAcceleration(), nativeGravity,
+                seed.standingReference(), seed.bindingActive(), seed.ceilingMps());
+    }
+
+    private static Result sampleCurrent(EntityPlayer actor, World world, CardinalPredictionStep.State state,
+            PlayerPhysicsProtocol.Controls controls, Vec3d environmentAcceleration, boolean nativeGravityEnabled,
+            boolean standingReferenceEnabled, boolean bindingActive, double ceilingMps) {
+        Objects.requireNonNull(actor); Objects.requireNonNull(world); Objects.requireNonNull(state);
+        Objects.requireNonNull(controls); Objects.requireNonNull(environmentAcceleration);
+        try {
+            if (actor.world != world || actor.isDead) return new Unavailable(Reason.ACTOR_CHANGED, Optional.empty());
+            if (!(state.placement().shape() instanceof PlayerBodyShape.Cardinal cardinal))
+                return new Unsupported(Reason.UNSUPPORTED_SHAPE);
             var bounds = box(state.placement().bounds());
             if (!world.isAreaLoaded(new BlockPos(bounds.minX, bounds.minY, bounds.minZ),
                     new BlockPos(bounds.maxX, bounds.maxY, bounds.maxZ)))
                 return new Unavailable(Reason.WORLD_UNAVAILABLE, Optional.empty());
-            if (actor.noClip || actor.isRiding() || actor.isSpectator() || actor.isInWater() || actor.isInLava()
-                    || actor.isElytraFlying() || actor.isOnLadder()
-                    || PlayerBoostEligibility.propulsionAllowed(currentPersonalZeroG, actor.capabilities.isCreativeMode))
-                return new Unsupported(Reason.UNSUPPORTED_STATE);
             boolean flying = actor.capabilities.isFlying;
             float friction = .91F;
             if (state.contacts().onGround()) {
@@ -101,20 +131,19 @@ public final class CardinalPredictionEnvironmentSampler {
                 launch += (actor.getActivePotionEffect(MobEffects.JUMP_BOOST).getAmplifier() + 1) * .1F;
             Vec3d impulse = CardinalTravelKernel.jumpSprintImpulse(cardinal.frame(), controls.forward(),
                     state.placement().attitude().basisZ());
-            Vec3d acceleration = seed.environmentAcceleration();
-            boolean nativeGravity = !seed.personalZeroG() && !seed.savedNativeNoGravity()
-                    && seed.bindingMode().filter(mode -> mode == GravityMode.REPLACE).isEmpty() && !flying;
+            Vec3d acceleration = environmentAcceleration;
+            boolean nativeGravity = nativeGravityEnabled && !flying;
             if (nativeGravity)
                 acceleration = acceleration.add(new Vec3d(0, -GravityEntityBinder.VANILLA_PLAYER_GRAVITY, 0));
             // A locally accepted flight exit precedes the next STATE seed. Its ordinary Y+
             // gravity and walking/jump qualification must describe this same input slot.
-            boolean standingReference = seed.standingReference()
+            boolean standingReference = standingReferenceEnabled
                     || nativeGravity && cardinal.frame() == CardinalFrame.Y_POS;
             if (actor.world != world || actor.isDead) return new Unavailable(Reason.ACTOR_CHANGED, Optional.empty());
             return new Sampled(new CardinalPredictionStep.Environment(acceleration, friction, aiMoveSpeed,
                     actor.jumpMovementFactor, flying, equipmentFlight.flySpeed(), launch, impulse,
-                    actor.stepHeight, seed.ceilingMps(), standingReference, sprint, actor.rotationYaw,
-                    seed.bindingActive(), equipmentFlight,
+                    actor.stepHeight, ceilingMps, standingReference, sprint, actor.rotationYaw,
+                    bindingActive, equipmentFlight,
                     NativeCardinalPoseProducer.sample(actor, state.placement())));
         } catch (RuntimeException cause) {
             return new Unavailable(Reason.SAMPLING_FAILED, Optional.of(cause));

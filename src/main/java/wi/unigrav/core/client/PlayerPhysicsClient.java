@@ -156,7 +156,7 @@ public final class PlayerPhysicsClient {
         final PlayerPhysicsClientSession.PredictionLifetime lifetime;
         final ClientCardinalPredictionOwner predictionOwner;
         final long successfulSerial;
-        ClientCardinalPredictionOwner.Mutation mutation;
+        PlayerPhysicsClientMirror.Mutation mutation;
         PredictionMutationContext(AcceptedOfferContext owner, ClientCardinalPredictionOwner predictionOwner) {
             this.owner = owner; scope = scopeHandle; this.predictionOwner = predictionOwner;
             lifetime = owner.session.predictionLifetime(); successfulSerial = successfulInstallSerial;
@@ -562,6 +562,31 @@ public final class PlayerPhysicsClient {
                 || !receiving.currentAcceptedOfferIdentity(ownerContext.offer)
                 || !packet.scope().equals(ownerContext.offer.scope())) {
             rejectDecode(exactDecode);
+            return;
+        }
+        if (packet.kind() == PlayerPhysicsProtocol.Kind.MOTION) {
+            if (!isCurrentScopedContext(exactDecode, exactScope, exactHandler, receiving, ownerContext, packet, mc)) {
+                rejectDecode(exactDecode);
+                return;
+            }
+            var feedback = packet.positionFeedback().orElseThrow();
+            long appliedCorrection = receiving.appliedPositionCorrectionId();
+            if (feedback.correctionId() == appliedCorrection) {
+                // Repeated outstanding correction IDs are metadata too: never teleport the
+                // player again just because the server has not seen its next MOVE yet.
+                boolean accepted = receiving.acceptMotionMetadata(packet);
+                PlayerPhysicsInboundConnections.INSTANCE.finishDecode(exactDecode, accepted
+                        ? PlayerPhysicsInboundConnections.DecodeOutcome.PROOF_ACCEPTED
+                        : PlayerPhysicsInboundConnections.DecodeOutcome.REJECTED);
+            } else if (feedback.correction() && feedback.correctionId() > appliedCorrection) {
+                installTypedState(exactDecode, exactScope, exactHandler, receiving, ownerContext, packet, mc);
+                if (session == receiving && acceptedOfferContext == ownerContext) {
+                    boolean recorded = receiving.recordInstalledMotionCorrection(packet);
+                    if (!recorded && receiving.drivesMotion()
+                            && receiving.snapshot().orElse(null) == packet.snapshot().orElseThrow())
+                        throw new IllegalStateException("Installed position correction lost its correction identity");
+                }
+            } else rejectDecode(exactDecode);
             return;
         }
         if (packet.kind() == PlayerPhysicsProtocol.Kind.OWNED || packet.kind() == PlayerPhysicsProtocol.Kind.STATE) {
@@ -1535,7 +1560,7 @@ public final class PlayerPhysicsClient {
                 || INSTANCE.session.presentationSnapshot().orElse(null) != exact.authority()) return Optional.empty();
         var projection = exact.predictedSnapshot();
         long serial = INSTANCE.successfulInstallSerial;
-        if (!ClientCardinalPredictionOwner.matchesCompleteProjection(actor, projection,
+        if (!PlayerPhysicsClientMirror.matchesCompleteProjection(actor, projection,
                 () -> INSTANCE.prediction == exact && INSTANCE.successfulInstallSerial == serial
                         && INSTANCE.session != null && INSTANCE.session.predictionEligible()
                         && INSTANCE.acceptedOwnerLifetimeCurrent(context, Minecraft.getMinecraft())
@@ -2436,7 +2461,7 @@ public final class PlayerPhysicsClient {
         if (owner == null || prediction != exactPrediction || !owner.session.predictionEligible()
                 || !acceptedOwnerLifetimeCurrent(owner, Minecraft.getMinecraft())) return false;
         PredictionMutationContext context = new PredictionMutationContext(owner, exactPrediction);
-        context.mutation = new ClientCardinalPredictionOwner.Mutation(owner.actor, projection, context::current);
+        context.mutation = new PlayerPhysicsClientMirror.Mutation(owner.actor, projection, context::current);
         predictionMutations.addLast(context);
         boolean applied;
         try {

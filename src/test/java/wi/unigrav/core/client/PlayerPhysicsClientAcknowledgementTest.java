@@ -535,7 +535,7 @@ final class PlayerPhysicsClientAcknowledgementTest {
             var b=cardinalSnapshot(scope,2,CardinalFrame.Y_POS,9,71,8);
             assertNotNull(install(session,state(PlayerPhysicsProtocol.Kind.STATE,2,b,null,null),owner,actor,presentation,()->{}));
             var token=session.predictionLifetime();
-            var mutation=new ClientCardinalPredictionOwner.Mutation(actor,session.presentationSnapshot().orElseThrow(),()->token.current(session));
+            var mutation=new PlayerPhysicsClientMirror.Mutation(actor,session.presentationSnapshot().orElseThrow(),()->token.current(session));
             assertTrue(session.completePredictionSuspension(token,mutation::apply));
             assertTrue(PlayerPhysicsClientMirror.matchesAcceptedPresentationGeometry(actor,b));
             assertFalse(PlayerPhysicsClientMirror.matchesAcceptedPresentationGeometry(actor,a));

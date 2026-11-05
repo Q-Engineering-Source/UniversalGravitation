@@ -5,6 +5,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Function;
 
 import dev.crlhitbox.api.geometry.Aabb;
 import dev.crlhitbox.api.geometry.Vec3d;
@@ -41,6 +42,11 @@ public final class WorldCollisionCandidates {
     private WorldCollisionCandidates() {
     }
 
+    // Client callers enter through the client tick owner; common code never links a client class.
+    private static boolean onWorldThread(World world) {
+        return !(world instanceof WorldServer server) || server.isCallingFromMinecraftThread();
+    }
+
     public enum Reason {
         ACTOR_SCOPE, DEFERRED_WORLD, QUERY_FOOTPRINT, MISSING_CHUNK, CHUNK_NOT_READY,
         ROOT_ENTITY_LIMIT, CANDIDATE_LIMIT, CONTEXT_CHANGED, MALFORMED_COLLIDER, NATIVE_QUERY_FAILED,
@@ -56,7 +62,7 @@ public final class WorldCollisionCandidates {
 
     /** Immutable geometry observation; retained world/chunk references are scoped to the caller's transaction. */
     public static final class Snapshot implements Capture {
-        private final WorldServer world;
+        private final World world;
         private final Entity actor;
         private final long tick;
         private final CollisionQueryFootprint footprint;
@@ -70,7 +76,7 @@ public final class WorldCollisionCandidates {
         private final BorderContext borderBefore;
         private final BorderContext borderAfter;
 
-        private Snapshot(WorldServer world, Entity actor, long tick, CollisionQueryFootprint footprint,
+        private Snapshot(World world, Entity actor, long tick, CollisionQueryFootprint footprint,
                          ActorGeometry actorGeometry, List<Chunk> chunks, long rootEntities, List<Aabb> boxes,
                          boolean outsideBorderBefore, boolean outsideBorderAfter,
                          BorderContext borderBefore, BorderContext borderAfter,
@@ -156,7 +162,7 @@ public final class WorldCollisionCandidates {
         Optional<Unavailable> capsuleContextFailure(PlayerPhysicalSnapshot accepted, Aabb exactExpectedWindow) {
             Objects.requireNonNull(accepted, "accepted");
             Objects.requireNonNull(exactExpectedWindow, "exactExpectedWindow");
-            if (!world.isCallingFromMinecraftThread()) {
+            if (!onWorldThread(world)) {
                 throw new IllegalStateException("capsule contacts require the server thread");
             }
             if (actor.world != world || !actor.isEntityAlive()
@@ -192,7 +198,7 @@ public final class WorldCollisionCandidates {
         Optional<Unavailable> strictNativeContextFailure(PlayerPhysicalSnapshot accepted, Aabb exactExpectedWindow) {
             Objects.requireNonNull(accepted, "accepted");
             Objects.requireNonNull(exactExpectedWindow, "exactExpectedWindow");
-            if (!world.isCallingFromMinecraftThread()) {
+            if (!onWorldThread(world)) {
                 throw new IllegalStateException("native strict observation requires the server thread");
             }
             if (actor.world != world || !actor.isEntityAlive()
@@ -241,7 +247,7 @@ public final class WorldCollisionCandidates {
                 PlayerBodyPlacement exactTarget) {
             Objects.requireNonNull(installed, "installed");
             Objects.requireNonNull(exactTarget, "exactTarget");
-            if (!world.isCallingFromMinecraftThread())
+            if (!onWorldThread(world))
                 throw new IllegalStateException("installed target observation requires the server thread");
             if (actor.world != world || !actor.isEntityAlive()
                     || !actor.getUniqueID().equals(installed.scope().playerId())
@@ -394,12 +400,20 @@ public final class WorldCollisionCandidates {
         }
     }
 
-    public static Capture capture(WorldServer world, Entity actor, Aabb requestedBounds, Limits limits) {
+    public static Capture capture(World world, Entity actor, Aabb requestedBounds, Limits limits) {
         return capture(world, actor, requestedBounds, QueryPolicy.CAPSULE_CONTACT, limits);
     }
 
-    public static Capture capture(WorldServer world, Entity actor, Aabb requestedBounds, QueryPolicy policy, Limits limits) {
+    public static Capture capture(World world, Entity actor, Aabb requestedBounds, QueryPolicy policy, Limits limits) {
         return captureInternal(world, actor, requestedBounds, policy, limits, null);
+    }
+
+    /** Current client scene: native terrain plus the installed dynamic-scene contributor. */
+    public static Capture captureLocal(World world, Entity actor, Aabb requestedBounds, Limits limits,
+            Function<AxisAlignedBB, List<AxisAlignedBB>> currentCollisions) {
+        if (!world.isRemote) throw new IllegalArgumentException("Local scene capture requires the client world");
+        return captureInternal(world, actor, requestedBounds, QueryPolicy.CAPSULE_CONTACT, limits,
+                null, null, null, Objects.requireNonNull(currentCollisions));
     }
 
     /** Native collision capture charged to the existing owner tick resources. */
@@ -437,19 +451,19 @@ public final class WorldCollisionCandidates {
         return captureInternal(transaction.world(), transaction.actor(), requestedBounds, policy, limits, transaction, work);
     }
 
-    private static Capture captureInternal(WorldServer world, Entity actor, Aabb requestedBounds,
+    private static Capture captureInternal(World world, Entity actor, Aabb requestedBounds,
                                            QueryPolicy policy, Limits limits,
                                            FreeOwnerTransaction transaction) {
         return captureInternal(world, actor, requestedBounds, policy, limits, transaction, null);
     }
 
-    public static Capture capture(WorldServer world, Entity actor, Aabb requestedBounds,
+    public static Capture capture(World world, Entity actor, Aabb requestedBounds,
             QueryPolicy policy, Limits limits, EnvironmentObservationWork work) {
         Objects.requireNonNull(work).requireCurrent(actor);
         return captureInternal(world, actor, requestedBounds, policy, limits, null, work);
     }
 
-    private static Capture captureInternal(WorldServer world, Entity actor, Aabb requestedBounds,
+    private static Capture captureInternal(World world, Entity actor, Aabb requestedBounds,
             QueryPolicy policy, Limits limits, FreeOwnerTransaction transaction, EnvironmentObservationWork work) {
         return captureInternal(world, actor, requestedBounds, policy, limits, transaction, work, null);
     }
@@ -464,9 +478,17 @@ public final class WorldCollisionCandidates {
     }
 
     /** Native callbacks are handed only to this synchronous cardinal calculation, never the stored Snapshot. */
-    private static Capture captureInternal(WorldServer world, Entity actor, Aabb requestedBounds,
+    private static Capture captureInternal(World world, Entity actor, Aabb requestedBounds,
             QueryPolicy policy, Limits limits, FreeOwnerTransaction transaction, EnvironmentObservationWork work,
             SynchronousNativeColliders nativeSink) {
+        return captureInternal(world, actor, requestedBounds, policy, limits, transaction, work, nativeSink, null);
+    }
+
+    private static Capture captureInternal(World world, Entity actor, Aabb requestedBounds,
+            QueryPolicy policy, Limits limits, FreeOwnerTransaction transaction, EnvironmentObservationWork work,
+            SynchronousNativeColliders nativeSink, Function<AxisAlignedBB, List<AxisAlignedBB>> localCollisions) {
+        if (localCollisions != null && (!world.isRemote || transaction != null || nativeSink != null))
+            throw new IllegalArgumentException("Client scene cannot replace server native provenance");
         if (nativeSink != null && transaction != null)
             throw new IllegalArgumentException("Native callback capture is cardinal-only");
         Objects.requireNonNull(world, "world");
@@ -474,7 +496,7 @@ public final class WorldCollisionCandidates {
         Objects.requireNonNull(requestedBounds, "requestedBounds");
         Objects.requireNonNull(policy, "policy");
         Objects.requireNonNull(limits, "limits");
-        if (!world.isCallingFromMinecraftThread()) throw new IllegalStateException("collision capture requires the server thread");
+        if (!onWorldThread(world)) throw new IllegalStateException("collision capture requires the server thread");
         if (actor.world != world || actor.isDead) return unavailable(Reason.ACTOR_SCOPE, "actor is not live in this world");
         if (deferred(world)) return unavailable(Reason.DEFERRED_WORLD, "block snapshot capture/restore is active");
         CollisionQueryFootprint footprint;
@@ -508,7 +530,8 @@ public final class WorldCollisionCandidates {
             List<AxisAlignedBB> nativeBoxes;
             NativeCollisionProvenance.Observation provenance = null;
             if (transaction == null) {
-                nativeBoxes = world.getCollisionBoxes(actor, nativeQuery);
+                nativeBoxes = localCollisions == null ? world.getCollisionBoxes(actor, nativeQuery)
+                        : Objects.requireNonNull(localCollisions.apply(nativeQuery), "local collision scene");
             } else {
                 var observationWork = transaction.resources().environmentObservationWork();
                 try (var scope = NativeCollisionProvenance.open(transaction, nativeQuery, observationWork,
@@ -599,14 +622,14 @@ public final class WorldCollisionCandidates {
      * Per-query scan limits and whole-kernel limits are independent and cumulative
      * root callback cost remains subject to the public native API's stated limits.
      */
-    public static CardinalObservation resolveCardinal(WorldServer world, EntityPlayer actor,
+    public static CardinalObservation resolveCardinal(World world, EntityPlayer actor,
                                                        PlayerPhysicalSnapshot accepted,
                                                        CardinalMovementResolver.Request request, Limits scanLimits,
                                                        CardinalMovementResolver.Limits movementLimits) {
         return resolveCardinal(world, actor, accepted, request, scanLimits, movementLimits, false);
     }
 
-    public static CardinalObservation resolveCardinal(WorldServer world, EntityPlayer actor,
+    public static CardinalObservation resolveCardinal(World world, EntityPlayer actor,
             PlayerPhysicalSnapshot accepted, CardinalMovementResolver.Request request, Limits scanLimits,
             CardinalMovementResolver.Limits movementLimits, EnvironmentObservationWork work) {
         Objects.requireNonNull(work).requireCurrent(actor);
@@ -619,7 +642,7 @@ public final class WorldCollisionCandidates {
      * server's strict block-collision observation unavailable. All actor, scope, geometry,
      * tick, radius, query and snapshot consistency fences remain active.
      */
-    public static CardinalObservation resolveCardinalForNativeRestore(WorldServer world, EntityPlayer actor,
+    public static CardinalObservation resolveCardinalForNativeRestore(World world, EntityPlayer actor,
                                                                        PlayerPhysicalSnapshot accepted,
                                                                        CardinalMovementResolver.Request request,
                                                                        Limits scanLimits,
@@ -627,7 +650,7 @@ public final class WorldCollisionCandidates {
         return resolveCardinal(world, actor, accepted, request, scanLimits, movementLimits, true);
     }
 
-    private static CardinalObservation resolveCardinal(WorldServer world, EntityPlayer actor,
+    private static CardinalObservation resolveCardinal(World world, EntityPlayer actor,
                                                         PlayerPhysicalSnapshot accepted,
                                                         CardinalMovementResolver.Request request, Limits scanLimits,
                                                         CardinalMovementResolver.Limits movementLimits,
@@ -635,7 +658,7 @@ public final class WorldCollisionCandidates {
         return resolveCardinal(world, actor, accepted, request, scanLimits, movementLimits, nativeRestore, null);
     }
 
-    private static CardinalObservation resolveCardinal(WorldServer world, EntityPlayer actor,
+    private static CardinalObservation resolveCardinal(World world, EntityPlayer actor,
             PlayerPhysicalSnapshot accepted, CardinalMovementResolver.Request request, Limits scanLimits,
             CardinalMovementResolver.Limits movementLimits, boolean nativeRestore, EnvironmentObservationWork work) {
         Objects.requireNonNull(world, "world");
@@ -644,7 +667,7 @@ public final class WorldCollisionCandidates {
         Objects.requireNonNull(request, "request");
         Objects.requireNonNull(scanLimits, "scanLimits");
         Objects.requireNonNull(movementLimits, "movementLimits");
-        if (!world.isCallingFromMinecraftThread()) throw new IllegalStateException("cardinal query requires the server thread");
+        if (!onWorldThread(world)) throw new IllegalStateException("cardinal query requires the server thread");
         List<Snapshot> snapshots = new ArrayList<>();
         if (actor.world != world || actor.isDead || actor.noClip && !nativeRestore) {
             return rejectCardinal(accepted, request, null, snapshots,
@@ -748,16 +771,16 @@ public final class WorldCollisionCandidates {
         }
     }
 
-    private static ObservedChunks preflight(WorldServer world, CollisionQueryFootprint footprint, Limits limits) {
+    private static ObservedChunks preflight(World world, CollisionQueryFootprint footprint, Limits limits) {
         return preflight(world, footprint, limits, null);
     }
 
-    private static ObservedChunks preflight(WorldServer world, CollisionQueryFootprint footprint, Limits limits,
+    private static ObservedChunks preflight(World world, CollisionQueryFootprint footprint, Limits limits,
                                             FreeOwnerTransaction transaction) {
         return preflight(world, footprint, limits, transaction, null);
     }
 
-    private static ObservedChunks preflight(WorldServer world, CollisionQueryFootprint footprint, Limits limits,
+    private static ObservedChunks preflight(World world, CollisionQueryFootprint footprint, Limits limits,
             FreeOwnerTransaction transaction, EnvironmentObservationWork work) {
         List<Chunk> chunks = new ArrayList<>(footprint.columns().size());
         long roots = 0;

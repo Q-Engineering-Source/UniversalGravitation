@@ -6,6 +6,13 @@ import wi.unigrav.api.math.Vec3;
 public final class MotionSpeedLimit {
     private MotionSpeedLimit() { }
 
+    /** Shared existing ordinary-player envelope, independent of any transport acknowledgement. */
+    public static double ordinaryCeiling(double configured) {
+        if (!Double.isFinite(configured) || configured < 0)
+            throw new IllegalArgumentException("Invalid max_entity_speed");
+        return configured == 0 ? 500 : Math.min(configured, 500);
+    }
+
     public static Vec3 deltaVelocity(Vec3 current, Vec3 delta, double limit) {
         if (!BoostProtocol.finite(current) || !BoostProtocol.finite(delta)
                 || !Double.isFinite(limit) || limit < 0) return Vec3.ZERO;

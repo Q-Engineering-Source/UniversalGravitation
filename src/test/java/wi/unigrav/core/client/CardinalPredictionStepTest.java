@@ -17,6 +17,26 @@ import java.util.function.Function;
 import static org.junit.jupiter.api.Assertions.*;
 
 class CardinalPredictionStepTest {
+    @Test void airborneCrouchChangesOnlyThePoseAnchorAndDoesNotInventVerticalMotion() {
+        var frame = CardinalFrame.Y_POS;
+        var start = state(frame, new Vec3d(.1, .2, 0), false);
+        var old = env(frame);
+        var profile = new wi.unigrav.core.player.NativeCardinalPoseProducer.Profile(
+                start.placement().shape().dimensions(), new PlayerBodyShape.Dimensions(.6, 1.5, 1.27), 1.62F, true);
+        var sampled = new CardinalPredictionStep.Environment(old.worldAcceleration(), old.friction(), old.aiMoveSpeed(),
+                old.airFactor(), old.flying(), old.flySpeed(), old.jumpLaunch(), old.jumpSprintImpulse(),
+                old.stepHeight(), old.ceilingMps(), old.standingReference(), old.sprintAllowed(), old.yawDegrees(),
+                old.bindingActive(), old.equipmentFlight(), java.util.Optional.of(profile));
+        var input = controls(frame, false, false, true);
+        var ordinary = step(start, frame, input, box -> List.of(), ledger());
+        var crouched = assertInstanceOf(CardinalPredictionStep.Predicted.class,
+                CardinalPredictionStep.step(start, sampled, input, CardinalPredictionStep.Mode.NORMAL_DRY,
+                        box -> List.of(), ledger()));
+        assertEquals(ordinary.pose().placement().physicalFeet(), crouched.pose().placement().physicalFeet());
+        assertEquals(ordinary.pose().motionBlocksPerTick(), crouched.pose().motionBlocksPerTick());
+        assertEquals(profile.crouching(), crouched.pose().placement().shape().dimensions());
+        assertEquals(ordinary.pose().jumpTicks(), crouched.pose().jumpTicks());
+    }
     private static final Vec3d ZERO = new Vec3d(0, 0, 0);
     private static CardinalPredictionStep.WorkLedger ledger() {
         return new CardinalPredictionStep.WorkLedger(new CardinalMovementResolver.Limits(512, 16384, 100000));

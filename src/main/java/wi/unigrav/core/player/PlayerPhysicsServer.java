@@ -615,6 +615,105 @@ public final class PlayerPhysicsServer {
     }
 
     /** Observe the collision-checked native pose operation, never infer a resize from an arbitrary later write. */
+    private record InputPoseCommit(PlayerPhysicalSnapshot before, PlayerBodyPlacement placement,
+                                   BooleanSupplier current) { }
+
+    public synchronized boolean controlsOrdinaryCardinalPose(EntityPlayerMP player) {
+        if (!drivesMotion(player)) return false;
+        var session = sessions.get(player.connection.netManager);
+        return session.owner.pendingCardinalPose == null;
+    }
+
+    /** Ordinary Aqua pose conversion is part of this consumed input, before its travel. */
+    private boolean applyInputCardinalPose(Session session, Owned owner, PlayerPhysicalSnapshot before,
+            PlayerPhysicsProtocol.Controls controls, Optional<OwnedPredictionTimeline.Frozen> slot, long tick) {
+        var reference = owner.travel.ownerReference();
+        long correction = owner.travel.correctionRevision();
+        var connection = session.connectionHandle;
+        var scope = session.scopeHandle;
+        long proposal = session.proposal;
+        BooleanSupplier currentPose = () -> current(session) && session.owner == owner && owner.snapshot == before
+                && session.connectionHandle == connection && session.scopeHandle == scope && session.proposal == proposal
+                && owner.travel.ownerReference() == reference && owner.travel.correctionRevision() == correction
+                && session.world.getTotalWorldTime() == tick && !owner.teleportPending && !recoveryFenced(owner);
+        var profile = NativeCardinalPoseProducer.sample(session.player, before.placement());
+        if (!currentPose.getAsBoolean()) return false;
+        var expectedPose = slot.flatMap(value -> value.packet().predictionInput().orElseThrow().nativePose());
+        boolean poseMatches = expectedPose.equals(profile) || expectedPose.isPresent() && profile.isPresent()
+                && expectedPose.orElseThrow().sameForInput(profile.orElseThrow(), controls.sneak());
+        if (slot.isPresent() && !poseMatches) {
+            owner.predictionTimeline.suspendUnmapped(predictionContext(session, owner), slot.orElseThrow().packet().sequence());
+            UnigravMod.LOGGER.info("ug-input-pose-unavailable scope={} reason=PROFILE_CHANGED inputSequence={}"
+                            + " expected={} actual={} acknowledgementCreated=false", before.scope(),
+                    slot.orElseThrow().packet().sequence(), slot.orElseThrow().packet().predictionInput().orElseThrow().nativePose(), profile);
+            return false;
+        }
+        if (owner.pendingCardinalPose != null && slot.isPresent()) {
+            owner.predictionTimeline.suspendUnmapped(predictionContext(session, owner), slot.orElseThrow().packet().sequence());
+            return false;
+        }
+        if (profile.isEmpty() || owner.pendingCardinalPose != null) return true;
+        PlayerBodyPlacement placement;
+        try {
+            placement = NativeCardinalPoseProducer.resolve(before.placement(), profile.orElseThrow(), controls.sneak(), box -> {
+                var captured = WorldCollisionCandidates.capture(session.world, session.player,
+                        new Aabb(new Vec3d(box.minX, box.minY, box.minZ), new Vec3d(box.maxX, box.maxY, box.maxZ)),
+                        CollisionQueryFootprint.QueryPolicy.NATIVE_STRICT, POSE_SCAN);
+                if (!currentPose.getAsBoolean()) throw new ClientCollisionScenes.SceneUnavailableException("POSE_OWNER_CHANGED");
+                if (captured instanceof WorldCollisionCandidates.Unavailable failure) {
+                    if (failure.cause().isPresent()
+                            && !(failure.cause().orElseThrow() instanceof ClientCollisionScenes.SceneUnavailableException))
+                        throw failure.cause().orElseThrow();
+                    throw new ClientCollisionScenes.SceneUnavailableException("POSE_QUERY_" + failure.reason(),
+                            failure.cause().orElse(null));
+                }
+                return ((WorldCollisionCandidates.Snapshot) captured).boxes().stream().map(bounds ->
+                        new AxisAlignedBB(bounds.min().x(), bounds.min().y(), bounds.min().z(),
+                                bounds.max().x(), bounds.max().y(), bounds.max().z())).toList();
+            });
+        } catch (ClientCollisionScenes.SceneUnavailableException failure) {
+            if (currentPose.getAsBoolean()) {
+                if (slot.isPresent()) owner.predictionTimeline.suspendUnmapped(predictionContext(session, owner),
+                        slot.orElseThrow().packet().sequence());
+                UnigravMod.LOGGER.info("ug-input-pose-unavailable scope={} reason={} acknowledgementCreated=false",
+                        before.scope(), failure.reason());
+            }
+            return false;
+        }
+        if (!currentPose.getAsBoolean()) return false;
+        if (placement == before.placement()) return true;
+        if (!(session.player instanceof NativePoseEyeProducer.OwnedCardinalMirror mirror))
+            throw new IllegalStateException("Ordinary pose producer lacks its controlled eye mirror");
+        var capability = new InputPoseCommit(before, placement, currentPose);
+        owner.inputPose = capability;
+        try {
+            runNativePose(session.player, () -> {
+                if (!currentPose.getAsBoolean() || owner.inputPose != capability)
+                    throw new IllegalStateException("Input pose lost its owner before installation");
+                mirror.unigrav$installCardinalEye(new NativePoseEyeProducer.CardinalEyeWrite(session.player,
+                        profile.orElseThrow().rawStandingEye(), (float) placement.shape().dimensions().eyeHeight(), () -> {
+                            if (!currentPose.getAsBoolean() || owner.inputPose != capability)
+                                throw new IllegalStateException("Input pose eye lost its installation owner");
+                        }));
+                installPoseGeometry(session.player, placement);
+            });
+        } finally {
+            if (owner.inputPose == capability) owner.inputPose = null;
+        }
+        if (!current(session) || session.owner != owner || session.connectionHandle != connection
+                || session.scopeHandle != scope || session.proposal != proposal
+                || owner.travel.ownerReference() != reference || owner.travel.correctionRevision() != correction
+                || session.world.getTotalWorldTime() != tick || owner.teleportPending || recoveryFenced(owner)) return false;
+        if (!owner.snapshot.placement().equals(placement) || !matchesPhysicalGeometry(session.player, owner.snapshot)) {
+            if (slot.isPresent()) owner.predictionTimeline.suspendUnmapped(predictionContext(session, owner),
+                    slot.orElseThrow().packet().sequence());
+            return false;
+        }
+        // Only this fully checked, same-input conversion may advance the mapped shape fence.
+        if (slot.isPresent() && owner.predictionTimeline.active()) owner.predictionShape = placement.shape();
+        return true;
+    }
+
     public synchronized void runNativePose(EntityPlayerMP player, Runnable original) {
         Objects.requireNonNull(original, "original");
         if (!drivesMotion(player)) { original.run(); return; }
@@ -850,7 +949,14 @@ public final class PlayerPhysicsServer {
         boolean completedGrowth = growth != null && actual.position().equals(growth.position())
                 && actual.bounds().equals(growth.bounds()) && actual.width() == growth.width()
                 && actual.height() == growth.height();
-        if (!actual.position().equals(ownerSnapshot.placement().transport()) && !completedGrowth) return;
+        var inputPose = owner.inputPose;
+        boolean completedInputPose = inputPose != null && inputPose.current().getAsBoolean()
+                && inputPose.before() == ownerSnapshot && inputPose.placement().bounds().equals(actual.bounds())
+                && inputPose.placement().transport().equals(actual.position())
+                && inputPose.placement().shape().dimensions().width() == actual.width()
+                && inputPose.placement().shape().dimensions().height() == actual.height()
+                && inputPose.placement().shape().dimensions().eyeHeight() == observedEyeHeight;
+        if (!actual.position().equals(ownerSnapshot.placement().transport()) && !completedGrowth && !completedInputPose) return;
         if (!(ownerSnapshot.placement().shape() instanceof PlayerBodyShape.Cardinal shape)) return;
         var dimensions = new PlayerBodyShape.Dimensions(actual.width(), actual.height(), observedEyeHeight);
         PendingCardinalPose previousPending = owner.pendingCardinalPose;
@@ -871,7 +977,7 @@ public final class PlayerPhysicsServer {
             owner.nativeCardinalMotion = continuation;
             return;
         }
-        var placement = shape.frame() == CardinalFrame.Y_POS || completedGrowth
+        var placement = completedInputPose ? inputPose.placement() : shape.frame() == CardinalFrame.Y_POS || completedGrowth
                 ? PlayerBodyPlacement.fromCardinalBounds(actual.bounds(), actual.position(),
                         ownerSnapshot.placement().attitude(), new PlayerBodyShape.Cardinal(shape.frame(), dimensions))
                 : ownerSnapshot.placement().proposeDimensionsAtFeet(dimensions);
@@ -3035,8 +3141,8 @@ public final class PlayerPhysicsServer {
                 requireBase();
                 actor.width = (float) dimensions.width();
                 actor.height = (float) dimensions.height();
-                if (actor instanceof NativePoseEyeProducer.OwnedStandingMirror mirror) {
-                    mirror.unigrav$installStandingEye(new NativePoseEyeProducer.StandingEyeWrite(actor,
+                if (actor instanceof NativePoseEyeProducer.OwnedCardinalMirror mirror) {
+                    mirror.unigrav$installCardinalEye(new NativePoseEyeProducer.CardinalEyeWrite(actor,
                             input.standingRawEyeHeight(), (float) dimensions.eyeHeight(), this::requireBase));
                 } else FreeOwnerTransaction.installEffectiveEyeHeight(actor, dimensions.eyeHeight());
                 requireBase();
@@ -3659,6 +3765,11 @@ public final class PlayerPhysicsServer {
             oldSession.dispatcher.invalidate();
             oldSession.pending = null;
             sessions.put(session.manager, session);
+            owner.travel.mobility().rotateInputScope();
+            owner.latestAdmittedInput = null;
+            owner.latestAdmittedPredictionAccepted = false;
+            owner.controls = IDLE;
+            owner.inputWorldTick = Long.MIN_VALUE / 2;
             // Only the committed successor can clear this retained owner's old-scope publication identity.
             owner.predictionOwnedSequence = -1;
             owner.snapshot = new PlayerPhysicalSnapshot(scope, recoverySource.revision(),
@@ -5316,8 +5427,8 @@ public final class PlayerPhysicsServer {
         var source = intent.observe(session.player);
         owner.boostCarrier |= source.map(GIntentObservation::active).orElse(false)
                 && session.player.interactionManager.isCreative();
-        var before = owner.snapshot;
-        if (owner.travel.mobility().blocksCapture() || before.placement().shape() instanceof PlayerBodyShape.FreeCapsule)
+        var prePose = owner.snapshot;
+        if (owner.travel.mobility().blocksCapture() || prePose.placement().shape() instanceof PlayerBodyShape.FreeCapsule)
             owner.predictionTimeline.suspendMobility(predictionContext(session, owner));
         if (owner.predictionTimeline.active() && owner.latestAdmittedInput!=null && !owner.latestAdmittedPredictionAccepted)
             owner.predictionTimeline.suspendUnmapped(predictionContext(session,owner),owner.latestAdmittedInput.sequence());
@@ -5326,20 +5437,26 @@ public final class PlayerPhysicsServer {
                 || !predictionFrameCurrent(owner))) owner.predictionTimeline.retire();
         Optional<OwnedPredictionTimeline.Frozen> predictionSlot = Optional.empty();
         if (owner.predictionTimeline.active()) {
-            predictionSlot = owner.predictionTimeline.freeze(predictionContext(session, owner), before.revision(),
+            predictionSlot = owner.predictionTimeline.freeze(predictionContext(session, owner), prePose.revision(),
                     worldTick, INPUT_TIMEOUT_TICKS, IDLE);
             owner.predictionTimeline.expiredPending().ifPresent(expired ->
                     UnigravMod.LOGGER.info("ug-prediction-mapping-expired reason=PENDING_INPUT_EXPIRED scope={}"
                                     + " proposal={} revision={} bootstrap={} expired={} headAgeTicks={}"
                                     + " latestAdmittedSequence={} latestReceivedWorldTick={} latestAgeTicks={}"
                                     + " latestControls={} action=SUSPEND_REARM acknowledgementCreated=false",
-                            before.scope(), session.proposal, before.revision(), owner.predictionTimeline.bootstrap(),
+                            prePose.scope(), session.proposal, prePose.revision(), owner.predictionTimeline.bootstrap(),
                             expired, worldTick - expired.receivedWorldTick(),
                             owner.latestAdmittedInput == null ? -1 : owner.latestAdmittedInput.sequence(),
                             owner.inputWorldTick, worldTick - owner.inputWorldTick, owner.controls));
         }
         PlayerPhysicsProtocol.Controls stepControls = predictionSlot.map(OwnedPredictionTimeline.Frozen::controls)
                 .orElse(worldTick - owner.inputWorldTick <= INPUT_TIMEOUT_TICKS ? owner.controls : IDLE);
+        if (!applyInputCardinalPose(session, owner, prePose, stepControls, predictionSlot, worldTick)) {
+            if (current(session) && session.owner == owner) publishAccepted(session, outboundStates);
+            return;
+        }
+        var before = owner.snapshot;
+        boolean inputPoseCommitted = before != prePose;
         boolean freshInput = owner.inputWorldTick != Long.MIN_VALUE
                 && worldTick >= owner.inputWorldTick && worldTick - owner.inputWorldTick <= INPUT_TIMEOUT_TICKS;
         int detachThreshold = UnigravConfig.longSpaceDetachTicks;
@@ -5777,6 +5894,12 @@ public final class PlayerPhysicsServer {
             return;
         }
         if (result instanceof PlayerPhysicsStep.Unavailable failure) {
+            if (inputPoseCommitted && owner.predictionTimeline.active()) {
+                // The pose is already real, but travel did not complete. Publish that authority
+                // through a real rebase; never acknowledge the unexecuted movement input.
+                owner.predictionTimeline.suspendUnmapped(predictionContext(session, owner), stepInputSequence);
+                predictionSlot = Optional.empty();
+            }
             if (failure.cause().orElse(null) instanceof ClientCollisionScenes.SceneUnavailableException unavailable
                     && owner.predictionTimeline.active()) {
                 owner.predictionTimeline.suspendUnmapped(predictionContext(session, owner), stepInputSequence);
@@ -7710,6 +7833,7 @@ public final class PlayerPhysicsServer {
     }
 
     private static final class Owned {
+        private InputPoseCommit inputPose;
         private NativeCardinalMotionReceipt nativeCardinalMotion;
         private long nativeCardinalMotionGeneration;
         private FreeTickResources.Store freeResources = new FreeTickResources.Store();

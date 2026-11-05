@@ -29,6 +29,7 @@ public interface IProxy {
     default void runLegacyMotion(EntityLivingBase actor, Runnable original) { original.run(); }
 
     default void runNativePose(EntityLivingBase actor, Runnable original) { original.run(); }
+    default boolean controlsOrdinaryCardinalPose(EntityPlayer actor) { return false; }
 
     /** Read-only accepted/journal geometry for precise native adapter ownership. */
     default Optional<PlayerPhysicalSnapshot> ownedPhysicalBody(EntityPlayer actor) { return Optional.empty(); }

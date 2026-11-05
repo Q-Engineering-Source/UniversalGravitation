@@ -19,6 +19,22 @@ import wi.unigrav.core.GravityMode;
 import static org.junit.jupiter.api.Assertions.*;
 
 class PlayerPhysicsProtocolTest {
+    @Test void ordinaryPoseInputRoundTripsBothRealProfilesAndRejectsThePreviousWireVersion() {
+        var profile = new NativeCardinalPoseProducer.Profile(
+                new PlayerBodyShape.Dimensions(.6F, 1.8F, 1.62F),
+                new PlayerBodyShape.Dimensions(.6F, 1.5F, 1.27F), 1.62F, true);
+        var identity = new PlayerPhysicsProtocol.PredictionInput(3, 92, 92, 1,
+                Optional.of(new PlayerPhysicsProtocol.PredictionBootstrap(7, 13)), Optional.of(profile));
+        var packet = new PlayerPhysicsProtocol.Packet(PlayerPhysicsProtocol.Kind.INPUT, SCOPE, 10, 1,
+                Optional.empty(), Optional.empty(), Optional.of(controls(new Vec3d(0, 0, 0), new Vec3d(0, 0, 1), 1)),
+                OptionalInt.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
+                Optional.of(identity), Optional.empty(), Optional.empty());
+        byte[] wire = PlayerPhysicsProtocol.encode(packet);
+        assertEquals(packet, decodeForTest(wire));
+        assertTrue(wire.length <= PlayerPhysicsProtocol.MAX_BYTES);
+        wire[0] = 23;
+        assertThrows(IllegalArgumentException.class, () -> decodeForTest(wire));
+    }
     @Test void serverEnvironmentRecoveryOfferHasExactBoundedWireAndStrictOriginKind() {
         var successor = new PlayerPhysicalSnapshot.Scope(SCOPE.playerId(), new UUID(71, 72),
                 SCOPE.dimension(), SCOPE.worldEpoch() + 1);

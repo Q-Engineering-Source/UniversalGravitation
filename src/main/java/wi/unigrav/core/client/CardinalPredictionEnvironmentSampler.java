@@ -19,6 +19,7 @@ import wi.unigrav.core.player.CardinalTravelKernel;
 import wi.unigrav.core.player.PlayerBodyShape;
 import wi.unigrav.core.player.PlayerBoostEligibility;
 import wi.unigrav.core.player.PlayerPhysicsProtocol;
+import wi.unigrav.core.player.NativeCardinalPoseProducer;
 
 import java.util.Objects;
 import java.util.Optional;
@@ -113,7 +114,8 @@ public final class CardinalPredictionEnvironmentSampler {
             return new Sampled(new CardinalPredictionStep.Environment(acceleration, friction, aiMoveSpeed,
                     actor.jumpMovementFactor, flying, equipmentFlight.flySpeed(), launch, impulse,
                     actor.stepHeight, seed.ceilingMps(), standingReference, sprint, actor.rotationYaw,
-                    seed.bindingActive(), equipmentFlight));
+                    seed.bindingActive(), equipmentFlight,
+                    NativeCardinalPoseProducer.sample(actor, state.placement())));
         } catch (RuntimeException cause) {
             return new Unavailable(Reason.SAMPLING_FAILED, Optional.of(cause));
         }

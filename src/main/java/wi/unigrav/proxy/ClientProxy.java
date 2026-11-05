@@ -52,6 +52,11 @@ public class ClientProxy extends CommonProxy {
                 ? PlayerPhysicsClient.nativeInLava(player, original) : super.nativeInLava(actor, original);
     }
 
+    @Override public boolean controlsOrdinaryCardinalPose(EntityPlayer actor) {
+        return actor.world.isRemote ? PlayerPhysicsClient.acceptedPresentation(actor).isPresent()
+                : super.controlsOrdinaryCardinalPose(actor);
+    }
+
     @Override public void runNativePose(EntityLivingBase actor, Runnable original) {
         if (actor.world.isRemote && actor instanceof EntityPlayerSP player)
             PlayerPhysicsClient.runNativePose(player, original);

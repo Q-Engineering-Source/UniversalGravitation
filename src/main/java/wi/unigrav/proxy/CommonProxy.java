@@ -44,6 +44,10 @@ public class CommonProxy implements IProxy {
         if (actor instanceof EntityPlayerMP player && !actor.world.isRemote) physics.runNativePose(player, original);
         else original.run();
     }
+    @Override public boolean controlsOrdinaryCardinalPose(EntityPlayer actor) {
+        return actor instanceof EntityPlayerMP player && !actor.world.isRemote
+                && physics.controlsOrdinaryCardinalPose(player);
+    }
 
     @Override public Optional<PlayerPhysicalSnapshot> ownedPhysicalBody(EntityPlayer actor) {
         return actor instanceof EntityPlayerMP player && !actor.world.isRemote

@@ -199,6 +199,21 @@ public final class PlayerMobilityIntent {
             generation = Math.incrementExact(generation);
             release(); detached = false; detachedPress = 0;
         }
+        /** A committed successor scope has a new wire-input domain, but spends the same world tick. */
+        void rotateInputScope() {
+            generation = Math.incrementExact(generation);
+            accepted = null;
+            acceptedRequestId = highestRequestId = 0;
+            press = consumedPress = 0;
+            lastSequence = -1;
+            release();
+            detached = false;
+            detachedPress = 0;
+            clearReleaseRetry();
+            requestReason = controlEligible ? Reason.NONE : Reason.CONTROL_UNAVAILABLE;
+            // lastTick is a simulation-time fence, not a packet identity. Retaining it prevents
+            // recovery within one world tick from granting another jump or long-press tick.
+        }
         long nextRequestId() { return Math.incrementExact(highestRequestId); }
         long generation() { return generation; }
         long inputSequence() { return lastSequence; }

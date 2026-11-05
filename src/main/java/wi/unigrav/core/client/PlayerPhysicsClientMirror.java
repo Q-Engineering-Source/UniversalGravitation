@@ -6,6 +6,7 @@ import net.minecraft.util.math.AxisAlignedBB;
 import wi.unigrav.core.GravityEntityBinder;
 import wi.unigrav.core.player.PlayerBodyShape;
 import wi.unigrav.core.player.PlayerPhysicalSnapshot;
+import wi.unigrav.core.player.NativeCardinalPoseProducer;
 
 /** Minecraft field projection only; the caller owns side, connection and physical lifetime checks. */
 public final class PlayerPhysicsClientMirror {
@@ -132,6 +133,8 @@ public final class PlayerPhysicsClientMirror {
         float height = (float) dimensions.height();
         float eyeHeight = (float) dimensions.eyeHeight();
         if (player.isSneaking() || height == 1.65F) eyeHeight += .08F;
+        var nativePose = NativeCardinalPoseProducer.sample(player, placement);
+        if (nativePose.isPresent()) eyeHeight = nativePose.orElseThrow().rawStandingEye();
 
         var accepted = placement.bounds();
         var bounds = new AxisAlignedBB(accepted.min().x(), accepted.min().y(), accepted.min().z(),

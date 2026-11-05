@@ -22,17 +22,17 @@ public interface NativePoseEyeProducer {
         void unigrav$completeNativeEyeWrite();
     }
 
-    /** A real native adapter may mirror a proved standing successor during its owner mutation. */
-    interface OwnedStandingMirror extends NativeWriteCompletion {
-        void unigrav$installStandingEye(StandingEyeWrite write);
+    /** A real native adapter may mirror a proved Cardinal pose during its owner mutation. */
+    interface OwnedCardinalMirror extends NativeWriteCompletion {
+        void unigrav$installCardinalEye(CardinalEyeWrite write);
     }
 
-    final class StandingEyeWrite {
+    final class CardinalEyeWrite {
         private final EntityPlayerMP actor;
         private final float rawEye;
         private final float effectiveEye;
         private final Runnable fence;
-        StandingEyeWrite(EntityPlayerMP actor, float rawEye, float effectiveEye, Runnable fence) {
+        CardinalEyeWrite(EntityPlayerMP actor, float rawEye, float effectiveEye, Runnable fence) {
             this.actor = actor; this.rawEye = rawEye; this.effectiveEye = effectiveEye; this.fence = fence;
         }
         public void requireCurrent(EntityPlayer actor) {

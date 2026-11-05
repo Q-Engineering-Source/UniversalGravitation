@@ -1216,19 +1216,19 @@ final class FreeOwnerTransaction implements AutoCloseable {
         }
         if (accepted.placement().shape() instanceof PlayerBodyShape.FreeCapsule source && source.pronePose().isPresent()
                 && placement.shape() instanceof PlayerBodyShape.Cardinal
-                && actor instanceof NativePoseEyeProducer.OwnedStandingMirror mirror) {
+                && actor instanceof NativePoseEyeProducer.OwnedCardinalMirror mirror) {
             var profile = ProneLocomotion.standingProfileForInstallation(this);
             if (!profile.dimensions().equals(placement.shape().dimensions()))
                 throw new IllegalStateException("Standing eye mirror does not match its proved full native target");
             var exactPrepared = preparedInstallation;
-            var write = new NativePoseEyeProducer.StandingEyeWrite(actor, profile.input().standingRawEyeHeight(),
+            var write = new NativePoseEyeProducer.CardinalEyeWrite(actor, profile.input().standingRawEyeHeight(),
                     (float) effectiveEyeHeight, () -> {
                         requireOwnerFence();
                         if (installationStage != InstallationStage.MUTATING || preparedInstallation != exactPrepared
                                 || exactPrepared == null || exactPrepared.placement() != placement || !profile.current())
                             throw new IllegalStateException("Standing eye mirror lost its exact owner mutation");
                     });
-            mirror.unigrav$installStandingEye(write);
+            mirror.unigrav$installCardinalEye(write);
             requireOwnerFence();
             if (Float.floatToIntBits(actor.getEyeHeight()) != Float.floatToIntBits((float) effectiveEyeHeight))
                 throw new IllegalStateException("Standing eye mirror did not round-trip exactly");

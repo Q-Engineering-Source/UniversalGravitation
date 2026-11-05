@@ -11,9 +11,11 @@ import wi.unigrav.core.player.PlayerBodyShape;
 import wi.unigrav.core.player.PlayerPhysicalSnapshot;
 import wi.unigrav.core.player.PlayerPhysicsProtocol;
 import wi.unigrav.core.player.NativeFlightParameters;
+import wi.unigrav.core.player.NativeCardinalPoseProducer;
 
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.function.Function;
 
 /** Local calculation only: no entity installation, accepted revision, network or native callbacks. */
@@ -35,7 +37,16 @@ public final class CardinalPredictionStep {
                               float airFactor, boolean flying, float flySpeed, double jumpLaunch,
                               Vec3d jumpSprintImpulse, double stepHeight, double ceilingMps,
                               boolean standingReference, boolean sprintAllowed, float yawDegrees, boolean bindingActive,
-                              NativeFlightParameters equipmentFlight) {
+                              NativeFlightParameters equipmentFlight, Optional<NativeCardinalPoseProducer.Profile> nativePose) {
+        public Environment(Vec3d worldAcceleration, float friction, float aiMoveSpeed, float airFactor,
+                           boolean flying, float flySpeed, double jumpLaunch, Vec3d jumpSprintImpulse,
+                           double stepHeight, double ceilingMps, boolean standingReference,
+                           boolean sprintAllowed, float yawDegrees, boolean bindingActive,
+                           NativeFlightParameters equipmentFlight) {
+            this(worldAcceleration, friction, aiMoveSpeed, airFactor, flying, flySpeed, jumpLaunch,
+                    jumpSprintImpulse, stepHeight, ceilingMps, standingReference, sprintAllowed, yawDegrees,
+                    bindingActive, equipmentFlight, Optional.empty());
+        }
         public Environment(Vec3d worldAcceleration, float friction, float aiMoveSpeed, float airFactor,
                            boolean flying, float flySpeed, double jumpLaunch, Vec3d jumpSprintImpulse,
                            double stepHeight, double ceilingMps, boolean standingReference,
@@ -54,6 +65,7 @@ public final class CardinalPredictionStep {
         public Environment {
             Objects.requireNonNull(worldAcceleration); Objects.requireNonNull(jumpSprintImpulse);
             Objects.requireNonNull(equipmentFlight);
+            Objects.requireNonNull(nativePose);
             if (Float.floatToIntBits(flySpeed) != Float.floatToIntBits(equipmentFlight.flySpeed()))
                 throw new IllegalArgumentException("Flight speed differs from retained equipment sample");
             if (!Double.isFinite(ceilingMps) || ceilingMps <= 0 || !Double.isFinite(stepHeight) || stepHeight < 0
@@ -74,6 +86,12 @@ public final class CardinalPredictionStep {
         private int queries, candidates, offsets;
         public WorkLedger(CardinalMovementResolver.Limits limits) { this.limits = Objects.requireNonNull(limits); }
         public CardinalMovementResolver.Work spent() { return new CardinalMovementResolver.Work(queries, candidates, offsets); }
+        private List<AxisAlignedBB> poseQuery(Function<AxisAlignedBB, List<AxisAlignedBB>> query, AxisAlignedBB box) {
+            queries++;
+            var result = query.apply(box);
+            candidates += result.size();
+            return result;
+        }
         private CardinalMovementResolver.Result resolve(CardinalMovementResolver.Request request,
                 Function<AxisAlignedBB, List<AxisAlignedBB>> query) {
             var result = CardinalMovementResolver.resolve(request, query, limits);
@@ -88,6 +106,15 @@ public final class CardinalPredictionStep {
         Objects.requireNonNull(state); Objects.requireNonNull(environment); Objects.requireNonNull(controls);
         Objects.requireNonNull(mode); Objects.requireNonNull(query); Objects.requireNonNull(ledger);
         if (mode != Mode.NORMAL_DRY) return new Unsupported(mode);
+        if (environment.nativePose().isPresent()) {
+            try {
+                var placement = NativeCardinalPoseProducer.resolve(state.placement(),
+                        environment.nativePose().orElseThrow(), controls.sneak(), box -> ledger.poseQuery(query, box));
+                state = new State(placement, state.motionBlocksPerTick(), state.contacts(), state.jumpTicks());
+            } catch (RuntimeException failure) {
+                return new Rejected("native input pose unavailable", failure, ledger.spent());
+            }
+        }
         if (!(state.placement().shape() instanceof PlayerBodyShape.Cardinal shape)) return new Unsupported(Mode.FREE);
         var frame = shape.frame();
         var bounds = box(state.placement().bounds());

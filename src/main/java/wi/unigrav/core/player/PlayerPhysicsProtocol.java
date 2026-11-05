@@ -3,6 +3,7 @@ package wi.unigrav.core.player;
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
@@ -17,13 +18,14 @@ import wi.unigrav.core.GravityMode;
 /** Independent physical-owner messages; positions are metres and velocities m/s. */
 public final class PlayerPhysicsProtocol {
     public static final String CHANNEL = "ugmotion1";
-    // V23 adds the typed server-bootstrap suspension origin; packet layout and maximum stay unchanged.
-    public static final int VERSION = 23;
+    // V24 carries an optional ordinary-pose sample on INPUT; both peers must use this version.
+    public static final int VERSION = 24;
     // The V11 maximum includes a boundary; its Anchored phase adds present(1), tag(1), revision(8), bootstrap(16).
     // V14 combines the V13 request marker with accepted mobility state (present byte + 22 bytes).
     // V15 adds one canonical transfer-presence byte. V16 reuses that union for TP completion controls.
     // Transfer/control-only frames are shorter than the maximal STATE; the actual maximum fixture verifies this cap.
     // V22 adds kind/reference-frame bytes to the profiled Free body for swim/crawl semantics.
+    // V24 adds 54 bytes only to INPUT; it remains smaller than the maximal STATE.
     public static final int MAX_BYTES = 631;
     private static final int CARDINAL_PLACEMENT_TAG = 0;
     private static final int FREE_CAPSULE_PLACEMENT_TAG = 1;
@@ -282,12 +284,18 @@ public final class PlayerPhysicsProtocol {
         }
     }
     public record PredictionInput(long epoch, long firstClientTick, long clientTick, long jumpEdgeId,
-                                  Optional<PredictionBootstrap> bootstrap) {
+                                  Optional<PredictionBootstrap> bootstrap,
+                                  Optional<NativeCardinalPoseProducer.Profile> nativePose) {
+        public PredictionInput(long epoch, long firstClientTick, long clientTick, long jumpEdgeId,
+                               Optional<PredictionBootstrap> bootstrap) {
+            this(epoch, firstClientTick, clientTick, jumpEdgeId, bootstrap, Optional.empty());
+        }
         public PredictionInput(long epoch, long firstClientTick, long clientTick, long jumpEdgeId) {
             this(epoch, firstClientTick, clientTick, jumpEdgeId, Optional.empty());
         }
         public PredictionInput {
             Objects.requireNonNull(bootstrap, "bootstrap");
+            Objects.requireNonNull(nativePose, "nativePose");
             if (epoch <= 0 || firstClientTick < 0 || clientTick < firstClientTick || jumpEdgeId < 0)
                 throw new IllegalArgumentException("Invalid prediction input identity");
         }
@@ -646,6 +654,12 @@ public final class PlayerPhysicsProtocol {
         packet.predictionInput().ifPresent(value -> {
             out.put((byte) (value.bootstrap().isPresent() ? 1 : 0));
             value.bootstrap().ifPresent(bootstrap -> putPredictionBootstrap(out, bootstrap));
+            out.put((byte) (value.nativePose().isPresent() ? 1 : 0));
+            value.nativePose().ifPresent(profile -> {
+                for (var dimensions : List.of(profile.standing(), profile.crouching()))
+                    out.putDouble(dimensions.width()).putDouble(dimensions.height()).putDouble(dimensions.eyeHeight());
+                out.putFloat(profile.rawStandingEye()).put((byte) (profile.crouchAllowed() ? 1 : 0));
+            });
         });
         out.put((byte) (packet.predictionBoundary().isPresent() ? 1 : 0));
         packet.predictionBoundary().ifPresent(value -> putPredictionBoundary(out, value));
@@ -1029,8 +1043,13 @@ public final class PlayerPhysicsProtocol {
 
     private static PredictionInput getPredictionInput(ByteBuffer in) {
         long epoch = in.getLong(), first = in.getLong(), tick = in.getLong(), edge = in.getLong();
-        return new PredictionInput(epoch, first, tick, edge,
-                getBoolean(in) ? Optional.of(getPredictionBootstrap(in)) : Optional.empty());
+        var bootstrap = getBoolean(in) ? Optional.of(getPredictionBootstrap(in)) : Optional.<PredictionBootstrap>empty();
+        Optional<NativeCardinalPoseProducer.Profile> pose = Optional.empty();
+        if (getBoolean(in)) pose = Optional.of(new NativeCardinalPoseProducer.Profile(
+                new PlayerBodyShape.Dimensions(in.getDouble(), in.getDouble(), in.getDouble()),
+                new PlayerBodyShape.Dimensions(in.getDouble(), in.getDouble(), in.getDouble()),
+                in.getFloat(), getBoolean(in)));
+        return new PredictionInput(epoch, first, tick, edge, bootstrap, pose);
     }
     private static void putPredictionBootstrap(ByteBuffer out, PredictionBootstrap value) {
         out.putLong(value.generation()).putLong(value.correctionRevision());

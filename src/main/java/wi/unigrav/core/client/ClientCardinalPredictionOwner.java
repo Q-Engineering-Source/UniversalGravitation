@@ -144,7 +144,7 @@ final class ClientCardinalPredictionOwner {
         long nextFirstTick = firstTick < 0 ? clientTick : firstTick;
         long nextJumpEdge = controls.jump() && !jumpHeld ? Math.incrementExact(jumpEdge) : jumpEdge;
         var identity = new PlayerPhysicsProtocol.PredictionInput(epoch, nextFirstTick, clientTick,
-                controls.jump() ? nextJumpEdge : 0, Optional.of(bootstrap));
+                controls.jump() ? nextJumpEdge : 0, Optional.of(bootstrap), environment.nativePose());
         if (controls.jump()) jumpTracePending = true;
         var next = calculate(state, controls, environment, collisions, clientTick, collisionScene);
         if (next == null) return Optional.empty();

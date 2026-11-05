@@ -6,6 +6,34 @@ import wi.unigrav.api.math.Vec3;
 import static org.junit.jupiter.api.Assertions.*;
 
 class PlayerMobilityIntentTest {
+    @Test void successorScopeAcceptsSmallSequencesWithoutRepeatingTheCurrentWorldTick() {
+        var owner = qualifiedOwner();
+        owner.advance(100, 3331, held(7), true, 20);
+        owner.rotateInputScope();
+        assertEquals(-1, owner.inputSequence());
+        assertFalse(owner.heldCurrent(held(7), 100));
+        assertEquals(PlayerMobilityIntent.Tick.NONE, owner.advance(100, 3, held(1), true, 20));
+        assertTrue(owner.advance(101, 3, held(1), true, 20).shortJump());
+        assertTrue(owner.heldCurrent(held(1), 101));
+        assertFalse(owner.advance(102, 2, held(1), true, 20).shortJump());
+        assertFalse(owner.heldCurrent(held(1), 102), "old sequences remain invalid within the new domain");
+    }
+
+    @Test void successorScopeRetainsPreferencesButRetiresOldRequestsAndPresses() {
+        var owner = qualifiedOwner();
+        assertTrue(owner.accept(new PlayerMobilityIntent.Request(9,
+                PlayerMobilityIntent.Mode.FLIGHT, PlayerMobilityIntent.Hover.OFF)));
+        owner.advance(10, 3331, held(7), true, 20);
+        long generation = owner.generation();
+        owner.rotateInputScope();
+        assertTrue(owner.generation() > generation);
+        assertEquals(PlayerMobilityIntent.Mode.FLIGHT, owner.mode());
+        assertEquals(PlayerMobilityIntent.Hover.OFF, owner.hover());
+        assertEquals(0, owner.state(PlayerMobilityIntent.EffectiveMode.FREE,
+                PlayerMobilityIntent.HoverStatus.OFF, PlayerMobilityIntent.Reason.NONE).acceptedRequest());
+        assertTrue(owner.accept(new PlayerMobilityIntent.Request(1,
+                PlayerMobilityIntent.Mode.WALK, PlayerMobilityIntent.Hover.OFF)));
+    }
     private static PlayerMobilityIntent.Input held(long id) {
         return new PlayerMobilityIntent.Input(Optional.empty(), id, true, true);
     }

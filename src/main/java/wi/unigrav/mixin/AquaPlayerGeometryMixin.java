@@ -18,6 +18,7 @@ import wi.unigrav.core.player.ProneBodyProducer;
 import wi.unigrav.core.player.PlayerPhysicalSnapshot;
 import wi.unigrav.core.player.PlayerBodyShape;
 import wi.unigrav.core.player.AquaCardinalPoseClearance;
+import wi.unigrav.core.player.NativeCardinalPoseProducer;
 import com.fuzs.aquaacrobatics.entity.Pose;
 import com.fuzs.aquaacrobatics.entity.player.IPlayerResizeable;
 import java.util.Optional;
@@ -29,8 +30,8 @@ import com.mojang.authlib.GameProfile;
 
 /** Uses Aqua's verified merged methods; call-site injection must outrank their merge priority. */
 @Mixin(value = EntityPlayer.class, priority = 1001)
-abstract class AquaPlayerGeometryMixin implements NativePoseEyeProducer.OwnedStandingMirror, NativeBodyProfileProducer,
-        ProneBodyProducer {
+abstract class AquaPlayerGeometryMixin implements NativePoseEyeProducer.OwnedCardinalMirror, NativeBodyProfileProducer,
+        ProneBodyProducer, NativeCardinalPoseProducer {
     @Shadow(remap = false) private float playerEyeHeight;
     @Shadow(remap = false) private float previousEyeHeight;
     @Shadow(remap = false) private float findEyeScaleFactor() { throw new AssertionError(); }
@@ -70,7 +71,7 @@ abstract class AquaPlayerGeometryMixin implements NativePoseEyeProducer.OwnedSta
                 aqua.isForcingCrawling(), aqua.getEyesInWaterPlayer()));
     }
 
-    @Override public void unigrav$installStandingEye(NativePoseEyeProducer.StandingEyeWrite write) {
+    @Override public void unigrav$installCardinalEye(NativePoseEyeProducer.CardinalEyeWrite write) {
         EntityPlayer actor = (EntityPlayer) (Object) this;
         write.requireCurrent(actor);
         actor.eyeHeight = write.rawEye();
@@ -108,15 +109,45 @@ abstract class AquaPlayerGeometryMixin implements NativePoseEyeProducer.OwnedSta
         return Optional.of(AquaCardinalPoseClearance.standingBodyProfile(actor, standing.width, standing.height));
     }
 
+    @Override public Optional<NativeCardinalPoseProducer.Profile> unigrav$cardinalPoseProfile() {
+        EntityPlayer actor = (EntityPlayer) (Object) this;
+        var aqua = (IPlayerResizeable) this;
+        // A different native raw-eye producer or special pose keeps its existing adoption path.
+        if (!(unigrav$constructedBodyHeight > 0) || actor.eyeHeight != unigrav$constructedEyeHeight
+                || !aqua.isResizingAllowed() || aqua.isForcingCrawling() || aqua.isSwimming()
+                || aqua.getPose() != Pose.STANDING && aqua.getPose() != Pose.CROUCHING) return Optional.empty();
+        var standing = aqua.getSize(Pose.STANDING);
+        var crouching = aqua.getSize(Pose.CROUCHING);
+        var full = AquaCardinalPoseClearance.standingBodyProfile(actor, standing.width, standing.height);
+        var shortBody = AquaCardinalPoseClearance.standingBodyProfile(actor, crouching.width, crouching.height);
+        float eyeScale = findEyeScaleFactor();
+        float fullEye = aqua.getStandingEyeHeight(Pose.STANDING, standing) * eyeScale;
+        float shortEye = aqua.getStandingEyeHeight(Pose.CROUCHING, crouching) * eyeScale;
+        return Optional.of(new NativeCardinalPoseProducer.Profile(
+                new PlayerBodyShape.Dimensions(full.diameter(), full.length(), fullEye),
+                new PlayerBodyShape.Dimensions(shortBody.diameter(), shortBody.length(), shortEye),
+                unigrav$constructedEyeHeight, !actor.capabilities.isFlying));
+    }
+
     @WrapMethod(method = "recalculateSize()V", remap = false, require = 1, allow = 1)
     private void unigrav$aquaResize(Operation<Void> original) {
         if (unigrav$ownedProneBody().isPresent()) return;
+        var ordinary = unigrav$ownedBody().flatMap(body -> NativeCardinalPoseProducer.sample(
+                (EntityPlayer) (Object) this, body.placement()));
+        // The consumed input owns this conversion. Native updateSize must not commit a newer
+        // sneak key ahead of the server's queued input or overwrite a local predicted pose.
+        if (ordinary.isPresent() && UnigravMod.proxy != null
+                && UnigravMod.proxy.controlsOrdinaryCardinalPose((EntityPlayer) (Object) this)) return;
         if (UnigravMod.proxy == null) original.call();
         else UnigravMod.proxy.runNativePose((EntityPlayer) (Object) this, () -> original.call());
     }
 
     @WrapMethod(method = "getEyeHeight()F", require = 1, allow = 1)
     private float unigrav$proneEye(Operation<Float> original) {
+        var ordinary = unigrav$ownedBody().filter(body -> NativeCardinalPoseProducer.sample(
+                (EntityPlayer) (Object) this, body.placement()).isPresent());
+        if (((EntityPlayer) (Object) this).world.isRemote && ordinary.isPresent())
+            return (float) ordinary.orElseThrow().placement().shape().dimensions().eyeHeight();
         if (Float.isFinite(unigrav$standingEyeMirror)) {
             if (unigrav$ownedBody().isPresent()) return unigrav$standingEyeMirror;
             unigrav$standingEyeMirror = Float.NaN;
@@ -127,6 +158,15 @@ abstract class AquaPlayerGeometryMixin implements NativePoseEyeProducer.OwnedSta
 
     @WrapMethod(method = "recalculateEyeHeight()V", remap = false, require = 1, allow = 1)
     private void unigrav$proneEyeCache(Operation<Void> original) {
+        var ordinary = unigrav$ownedBody().filter(body -> NativeCardinalPoseProducer.sample(
+                (EntityPlayer) (Object) this, body.placement()).isPresent());
+        if (ordinary.isPresent() && UnigravMod.proxy != null
+                && UnigravMod.proxy.controlsOrdinaryCardinalPose((EntityPlayer) (Object) this)) {
+            unigrav$standingEyeMirror = (float) ordinary.orElseThrow().placement().shape().dimensions().eyeHeight();
+            previousEyeHeight = ((EntityPlayer) (Object) this).eyeHeight;
+            unigrav$eyeProfileRevision = Math.incrementExact(unigrav$eyeProfileRevision);
+            return;
+        }
         var prone = unigrav$ownedProneBody();
         if (prone.isEmpty()) {
             unigrav$standingEyeMirror = Float.NaN;
